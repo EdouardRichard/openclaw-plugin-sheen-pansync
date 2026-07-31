@@ -1046,17 +1046,17 @@ Start with valid stored credentials. Submit an invalid `client_secret` or mismat
 - existing Vault contents are unchanged;
 - the access key remains usable so the user can correct the form.
 
-- [ ] **Step 4: Write failing browser-script contract tests**
+- [ ] **Step 4: Write failing browser behavior tests**
 
-Parse `ui/setup.js` as text and assert it:
+Run the real page scripts in a browser-compatible test environment and assert observable behavior:
 
-- reads `location.hash`;
-- calls `history.replaceState` before the first fetch;
-- stores only the page access key in `sessionStorage`;
-- uses `autocomplete="off"` and text inputs for all three fields;
-- never writes credentials to `localStorage`, URL, console, analytics, or error text;
-- clears form values on `pagehide`;
-- asks for a second confirmation before DELETE.
+- opening `/#<access-key>` removes the fragment before the first network request;
+- a reload in the same tab restores only the page access key from `sessionStorage`;
+- all API requests send `Authorization: PanSyncSetup <access-key>`;
+- Client ID、Client Secret、Refresh Token use non-masked text inputs with autocomplete disabled;
+- credentials never enter `localStorage`、request URL、console output or rendered error details;
+- `pagehide` clears all three form values;
+- the first Clear click only opens a second confirmation, and DELETE is sent only after confirmation.
 
 - [ ] **Step 5: Run the admin tests and confirm failure**
 
