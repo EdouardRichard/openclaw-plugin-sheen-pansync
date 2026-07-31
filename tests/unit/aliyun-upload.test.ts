@@ -4,13 +4,21 @@ import type { Socket } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { CloudDriveProvider, RemoteDirectory } from "../../src/contracts.js";
 import type { ResolvedWorkspaceFile } from "../../src/workspace/path-guard.js";
 import { PanSyncError } from "../../src/errors.js";
+import { ProviderRegistry } from "../../src/provider-registry.js";
 import { AliyunHttpClient } from "../../src/providers/aliyun/http.js";
 import { AliyunProvider } from "../../src/providers/aliyun/provider.js";
+import type { AliyunFetch } from "../../src/providers/aliyun/types.js";
 
 const MIB = 1024 * 1024;
 const NOW = Date.parse("2026-07-31T12:00:00.000Z");
+const REMOTE_DIRECTORY: RemoteDirectory = {
+  id: "folder-1",
+  path: "/openClawShare",
+  providerState: { driveId: "drive-default" },
+};
 const cleanups: Array<() => Promise<void>> = [];
 
 type RecordedRequest = {
@@ -23,6 +31,8 @@ type UploadServer = {
   baseUrl: string;
   requests: RecordedRequest[];
   putSizes: Map<number, number>;
+  putBodies: Map<number, Buffer>;
+  abortedParts: Set<number>;
   events: string[];
   maxConcurrentPuts: () => number;
   close(): Promise<void>;
@@ -32,19 +42,29 @@ type UploadServerOptions = {
   createResponses?: Array<{ status: number; body: unknown }>;
   completeName?: string;
   failPutPart?: number;
+  immediateFailPutPart?: number;
+  immediateFailStatus?: number;
   delayPuts?: boolean;
+  holdPutsMs?: number;
 };
 
 afterEach(async () => {
   await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
 });
 
-async function requestBuffer(request: IncomingMessage): Promise<Buffer> {
+async function requestBuffer(request: IncomingMessage): Promise<{
+  body: Buffer;
+  aborted: boolean;
+}> {
   const chunks: Buffer[] = [];
-  for await (const chunk of request) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  try {
+    for await (const chunk of request) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+  } catch {
+    return { body: Buffer.concat(chunks), aborted: true };
   }
-  return Buffer.concat(chunks);
+  return { body: Buffer.concat(chunks), aborted: request.aborted };
 }
 
 async function startUploadServer(
@@ -52,6 +72,8 @@ async function startUploadServer(
 ): Promise<UploadServer> {
   const requests: RecordedRequest[] = [];
   const putSizes = new Map<number, number>();
+  const putBodies = new Map<number, Buffer>();
+  const abortedParts = new Set<number>();
   const events: string[] = [];
   const sockets = new Set<Socket>();
   const createResponses = [...(options.createResponses ?? [])];
@@ -61,19 +83,51 @@ async function startUploadServer(
 
   const server: Server = createServer(async (request, response) => {
     const requestUrl = new URL(request.url ?? "/", baseUrl);
-    const bodyBuffer = await requestBuffer(request);
     const partMatch = /^\/signed\/(?:refreshed-)?(\d+)$/.exec(requestUrl.pathname);
     if (request.method === "PUT" && partMatch !== null) {
       const partNumber = Number(partMatch[1]);
       activePuts += 1;
       maximumPuts = Math.max(maximumPuts, activePuts);
       events.push(`put-${partNumber}-start`);
-      putSizes.set(partNumber, bodyBuffer.length);
+      request.once("aborted", () => abortedParts.add(partNumber));
+      response.once("close", () => {
+        if (!response.writableEnded) {
+          abortedParts.add(partNumber);
+        }
+      });
+      if (options.immediateFailPutPart === partNumber) {
+        await new Promise<void>((resolve) => {
+          request.once("data", () => resolve());
+          request.once("aborted", () => resolve());
+        });
+        response.writeHead(options.immediateFailStatus ?? 500);
+        response.end("signed-url-secret-CANARY");
+        request.resume();
+        activePuts -= 1;
+        events.push(`put-${partNumber}-end`);
+        return;
+      }
+      const read = await requestBuffer(request);
+      putSizes.set(partNumber, read.body.length);
+      putBodies.set(partNumber, read.body);
+      if (read.aborted) {
+        abortedParts.add(partNumber);
+      }
       if (options.delayPuts === true) {
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
+      if (options.holdPutsMs !== undefined) {
+        await Promise.race([
+          new Promise((resolve) => setTimeout(resolve, options.holdPutsMs)),
+          new Promise((resolve) => response.once("close", resolve)),
+        ]);
+      }
       activePuts -= 1;
       events.push(`put-${partNumber}-end`);
+      if (response.destroyed) {
+        abortedParts.add(partNumber);
+        return;
+      }
       if (options.failPutPart === partNumber) {
         response.writeHead(500);
         response.end("signed-url-secret-CANARY");
@@ -84,6 +138,7 @@ async function startUploadServer(
       return;
     }
 
+    const { body: bodyBuffer } = await requestBuffer(request);
     const body = bodyBuffer.length === 0
       ? undefined
       : JSON.parse(bodyBuffer.toString("utf8")) as unknown;
@@ -92,6 +147,15 @@ async function startUploadServer(
       path: requestUrl.pathname,
       body,
     });
+
+    if (requestUrl.pathname.endsWith("/user/getDriveInfo")) {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        user_id: "contract-user-id",
+        default_drive_id: "drive-default",
+      }));
+      return;
+    }
 
     if (requestUrl.pathname.endsWith("/openFile/create")) {
       const queued = createResponses.shift();
@@ -174,6 +238,8 @@ async function startUploadServer(
     baseUrl,
     requests,
     putSizes,
+    putBodies,
+    abortedParts,
     events,
     maxConcurrentPuts: () => maximumPuts,
     async close() {
@@ -212,6 +278,7 @@ function provider(
   options: {
     forceRefresh?: (token?: string) => Promise<string>;
     clock?: () => number;
+    fetch?: AliyunFetch;
   } = {},
 ): AliyunProvider {
   return new AliyunProvider({
@@ -221,6 +288,7 @@ function provider(
       forceRefresh: options.forceRefresh ?? (async () => "access-new"),
     },
     clock: options.clock ?? (() => NOW),
+    ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
   });
 }
 
@@ -241,14 +309,21 @@ describe("Aliyun multipart upload", () => {
   it("streams a 45 MiB descriptor in 20 MiB parts before completing with the server-resolved name", async () => {
     const server = await startUploadServer({ delayPuts: true });
     const file = await sparseFile(45 * MIB);
+    const sentinels = [
+      [0, "A"],
+      [20 * MIB - 1, "B"],
+      [20 * MIB, "C"],
+      [40 * MIB - 1, "D"],
+      [40 * MIB, "E"],
+      [45 * MIB - 1, "F"],
+    ] as const;
+    for (const [position, value] of sentinels) {
+      await file.handle.write(Buffer.from(value), 0, 1, position);
+    }
 
     const result = await provider(server).uploadFile({
       accessToken: "access-old",
-      remoteDirectory: {
-        id: "folder-1",
-        path: "/openClawShare",
-        driveId: "drive-default",
-      },
+      remoteDirectory: REMOTE_DIRECTORY,
       file,
     });
 
@@ -261,6 +336,7 @@ describe("Aliyun multipart upload", () => {
       name: "report.bin",
       type: "file",
       check_name_mode: "auto_rename",
+      parallel_upload: true,
       size: 45 * MIB,
       part_info_list: [
         { part_number: 1 },
@@ -274,12 +350,19 @@ describe("Aliyun multipart upload", () => {
         [2, 20 * MIB],
         [3, 5 * MIB],
       ]);
+    expect(server.putBodies.get(1)?.subarray(0, 1).toString()).toBe("A");
+    expect(server.putBodies.get(1)?.subarray(-1).toString()).toBe("B");
+    expect(server.putBodies.get(2)?.subarray(0, 1).toString()).toBe("C");
+    expect(server.putBodies.get(2)?.subarray(-1).toString()).toBe("D");
+    expect(server.putBodies.get(3)?.subarray(0, 1).toString()).toBe("E");
+    expect(server.putBodies.get(3)?.subarray(-1).toString()).toBe("F");
     expect(server.events.at(-1)).toBe("complete");
     expect(server.events.filter((event) => event.endsWith("-end"))).toHaveLength(3);
     expect(result).toEqual({
       remoteName: "report (1).bin",
       size: 45 * MIB,
     });
+    await expect(file.handle.stat()).resolves.toMatchObject({ size: 45 * MIB });
   });
 
   it("limits concurrent part PUTs to three", async () => {
@@ -288,16 +371,61 @@ describe("Aliyun multipart upload", () => {
 
     await provider(server).uploadFile({
       accessToken: "access-old",
-      remoteDirectory: {
-        id: "folder-1",
-        path: "/openClawShare",
-        driveId: "drive-default",
-      },
+      remoteDirectory: REMOTE_DIRECTORY,
       file,
     });
 
     expect(server.putSizes.size).toBe(4);
     expect(server.maxConcurrentPuts()).toBe(3);
+  });
+
+  it("cancels in-flight PUTs and schedules no new parts after the first failure", async () => {
+    const server = await startUploadServer({
+      immediateFailPutPart: 1,
+      immediateFailStatus: 429,
+      holdPutsMs: 2_000,
+    });
+    const file = await sparseFile(85 * MIB);
+    const startedAt = Date.now();
+    const abortedSignedPuts = new Set<string>();
+    const trackingFetch: AliyunFetch = async (input, init) => {
+      const requestUrl = new URL(
+        input instanceof Request ? input.url : input.toString(),
+      );
+      const signal = init?.signal;
+      if (init?.method === "PUT" && signal != null) {
+        const markAborted = () => abortedSignedPuts.add(requestUrl.pathname);
+        if (signal.aborted) {
+          markAborted();
+        } else {
+          signal.addEventListener("abort", markAborted, { once: true });
+        }
+      }
+      return globalThis.fetch(input, init);
+    };
+
+    const error = await rejectedPanSyncError(() =>
+      provider(server, { fetch: trackingFetch }).uploadFile({
+        accessToken: "access-old",
+        remoteDirectory: REMOTE_DIRECTORY,
+        file,
+      })
+    );
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(error.code).toBe("RATE_LIMITED");
+    expect(elapsedMs).toBeLessThan(1_500);
+    expect(
+      server.events.filter((event) => event.endsWith("-start")).sort(),
+    ).toEqual(["put-1-start", "put-2-start", "put-3-start"]);
+    expect(abortedSignedPuts.size).toBe(3);
+    expect(server.events).not.toContain("complete");
+    expect(
+      server.requests.some(({ path: requestPath }) =>
+        requestPath.endsWith("/openFile/complete")
+      ),
+    ).toBe(false);
+    await expect(file.handle.stat()).resolves.toMatchObject({ size: 85 * MIB });
   });
 
   it("raises part size so a very large file never exceeds 10,000 parts", async () => {
@@ -317,11 +445,7 @@ describe("Aliyun multipart upload", () => {
     const error = await rejectedPanSyncError(() =>
       provider(server).uploadFile({
         accessToken: "access-old",
-        remoteDirectory: {
-          id: "folder-1",
-          path: "/openClawShare",
-          driveId: "drive-default",
-        },
+        remoteDirectory: REMOTE_DIRECTORY,
         file: representedFile,
       })
     );
@@ -343,11 +467,7 @@ describe("Aliyun multipart upload", () => {
     await expect(
       provider(server).uploadFile({
         accessToken: "access-old",
-        remoteDirectory: {
-          id: "folder-1",
-          path: "/openClawShare",
-          driveId: "drive-default",
-        },
+        remoteDirectory: REMOTE_DIRECTORY,
         file,
       }),
     ).resolves.toEqual({
@@ -363,6 +483,28 @@ describe("Aliyun multipart upload", () => {
     expect(server.events).toEqual(["complete"]);
   });
 
+  it("uploads through the ProviderRegistry contract without an unsafe downcast", async () => {
+    const server = await startUploadServer({ completeName: "contract.txt" });
+    const file = await sparseFile(1, "contract.txt");
+    const resolved: CloudDriveProvider = new ProviderRegistry(
+      [provider(server)],
+      "aliyun",
+    ).resolve("aliyun");
+
+    const directory = await resolved.ensureDirectory("/", "access-old");
+    await expect(resolved.uploadFile({
+      accessToken: "access-old",
+      remoteDirectory: directory,
+      file,
+    })).resolves.toEqual({
+      remoteName: "contract.txt",
+      size: 1,
+    });
+
+    expect(directory.providerState).toEqual({ driveId: "drive-default" });
+    await expect(file.handle.stat()).resolves.toMatchObject({ size: 1 });
+  });
+
   it("refreshes an upload URL at 50 minutes before sending the part", async () => {
     const server = await startUploadServer();
     const file = await sparseFile(1);
@@ -372,11 +514,7 @@ describe("Aliyun multipart upload", () => {
       clock: () => clockCalls++ === 0 ? NOW : NOW + 50 * 60 * 1_000,
     }).uploadFile({
       accessToken: "access-old",
-      remoteDirectory: {
-        id: "folder-1",
-        path: "/openClawShare",
-        driveId: "drive-default",
-      },
+      remoteDirectory: REMOTE_DIRECTORY,
       file,
     });
 
@@ -400,11 +538,7 @@ describe("Aliyun multipart upload", () => {
 
     await provider(server, { forceRefresh }).uploadFile({
       accessToken: "access-old",
-      remoteDirectory: {
-        id: "folder-1",
-        path: "/openClawShare",
-        driveId: "drive-default",
-      },
+      remoteDirectory: REMOTE_DIRECTORY,
       file,
     });
 
@@ -430,11 +564,7 @@ describe("Aliyun multipart upload", () => {
     const error = await rejectedPanSyncError(() =>
       provider(server, { forceRefresh }).uploadFile({
         accessToken: "access-old",
-        remoteDirectory: {
-          id: "folder-1",
-          path: "/openClawShare",
-          driveId: "drive-default",
-        },
+        remoteDirectory: REMOTE_DIRECTORY,
         file,
       })
     );
@@ -465,11 +595,7 @@ describe("Aliyun multipart upload", () => {
     const error = await rejectedPanSyncError(() =>
       provider(server).uploadFile({
         accessToken: "access-old",
-        remoteDirectory: {
-          id: "folder-1",
-          path: "/openClawShare",
-          driveId: "drive-default",
-        },
+        remoteDirectory: REMOTE_DIRECTORY,
         file,
       })
     );
@@ -485,11 +611,7 @@ describe("Aliyun multipart upload", () => {
     const error = await rejectedPanSyncError(() =>
       provider(server).uploadFile({
         accessToken: "access-old",
-        remoteDirectory: {
-          id: "folder-1",
-          path: "/openClawShare",
-          driveId: "drive-default",
-        },
+        remoteDirectory: REMOTE_DIRECTORY,
         file,
       })
     );
@@ -498,5 +620,30 @@ describe("Aliyun multipart upload", () => {
     expect(error.message).toBe("UPLOAD_FAILED");
     expect(error.message).not.toContain("upload-url-CANARY");
     expect(error.message).not.toContain("/signed/");
+    await expect(file.handle.stat()).resolves.toMatchObject({ size: 1 });
+    expect(server.events).not.toContain("complete");
+  });
+
+  it("maps a short descriptor read to UPLOAD_FAILED without completing", async () => {
+    const server = await startUploadServer();
+    const file = await sparseFile(1, "truncated.bin");
+    const representedFile = { ...file, size: 2 };
+
+    const error = await rejectedPanSyncError(() =>
+      provider(server).uploadFile({
+        accessToken: "access-old",
+        remoteDirectory: REMOTE_DIRECTORY,
+        file: representedFile,
+      })
+    );
+
+    expect(error.code).toBe("UPLOAD_FAILED");
+    expect(server.events).not.toContain("complete");
+    expect(
+      server.requests.some(({ path: requestPath }) =>
+        requestPath.endsWith("/openFile/complete")
+      ),
+    ).toBe(false);
+    await expect(file.handle.stat()).resolves.toMatchObject({ size: 1 });
   });
 });

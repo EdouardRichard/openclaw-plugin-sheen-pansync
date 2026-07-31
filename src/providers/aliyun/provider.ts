@@ -4,7 +4,6 @@ import type {
   ProviderUploadInput,
   ProviderUploadResult,
   RemoteDirectory,
-  ValidatedCredentialRecord,
 } from "../../contracts.js";
 import type { CredentialRecord } from "../../credentials/types.js";
 import { PanSyncError } from "../../errors.js";
@@ -19,13 +18,6 @@ import {
   isAlreadyExistingName,
   uploadAliyunFile,
 } from "./upload.js";
-
-export type AliyunCredentialCandidate = {
-  clientId: string;
-  clientSecret: string;
-  refreshToken: string;
-  credentialVersion?: number;
-};
 
 export type AliyunProviderOptions = {
   httpClient: Pick<AliyunHttpClient, "refreshToken">;
@@ -58,13 +50,11 @@ function nonEmptyString(
 }
 
 function requiredCandidate(
-  candidate: CredentialInput | AliyunCredentialCandidate,
-): AliyunCredentialCandidate {
+  candidate: CredentialInput,
+): CredentialInput {
   if (
-    !("clientId" in candidate)
-    || typeof candidate.clientId !== "string"
+    typeof candidate.clientId !== "string"
     || candidate.clientId.length === 0
-    || !("clientSecret" in candidate)
     || typeof candidate.clientSecret !== "string"
     || candidate.clientSecret.length === 0
     || typeof candidate.refreshToken !== "string"
@@ -142,21 +132,18 @@ function isAliyunRemoteDirectory(
   directory: RemoteDirectory,
 ): directory is AliyunRemoteDirectory {
   return (
-    "driveId" in directory
-    && typeof directory.driveId === "string"
-    && directory.driveId.length > 0
+    typeof directory.providerState === "object"
+    && directory.providerState !== null
+    && "driveId" in directory.providerState
+    && typeof directory.providerState.driveId === "string"
+    && directory.providerState.driveId.length > 0
   );
 }
 
 function isAliyunUploadInput(
-  input: ProviderUploadInput | AliyunProviderUploadInput,
+  input: ProviderUploadInput,
 ): input is AliyunProviderUploadInput {
-  return (
-    "file" in input
-    && typeof input.file === "object"
-    && input.file !== null
-    && isAliyunRemoteDirectory(input.remoteDirectory)
-  );
+  return isAliyunRemoteDirectory(input.remoteDirectory);
 }
 
 export class AliyunProvider implements CloudDriveProvider {
@@ -174,14 +161,8 @@ export class AliyunProvider implements CloudDriveProvider {
     });
   }
 
-  validateCredentials(
-    candidate: AliyunCredentialCandidate,
-  ): Promise<CredentialRecord>;
-  validateCredentials(
-    candidate: CredentialInput,
-  ): Promise<ValidatedCredentialRecord>;
   async validateCredentials(
-    candidate: CredentialInput | AliyunCredentialCandidate,
+    candidate: CredentialInput,
   ): Promise<CredentialRecord> {
     const completeCandidate = requiredCandidate(candidate);
     let refreshed: Awaited<
@@ -196,7 +177,8 @@ export class AliyunProvider implements CloudDriveProvider {
     } catch (error) {
       if (
         error instanceof PanSyncError
-        && error.code === "RATE_LIMITED"
+        && error.code !== "REFRESH_TOKEN_REJECTED"
+        && error.code !== "CREDENTIALS_INVALID"
       ) {
         throw error;
       }
@@ -253,7 +235,7 @@ export class AliyunProvider implements CloudDriveProvider {
       return {
         id: "root",
         path: normalizedPath,
-        driveId: drive.driveId,
+        providerState: { driveId: drive.driveId },
       };
     }
 
@@ -321,16 +303,12 @@ export class AliyunProvider implements CloudDriveProvider {
     return {
       id: parentId,
       path: normalizedPath,
-      driveId: drive.driveId,
+      providerState: { driveId: drive.driveId },
     };
   }
 
-  uploadFile(
-    input: AliyunProviderUploadInput,
-  ): Promise<ProviderUploadResult>;
-  uploadFile(input: ProviderUploadInput): Promise<ProviderUploadResult>;
   async uploadFile(
-    input: ProviderUploadInput | AliyunProviderUploadInput,
+    input: ProviderUploadInput,
   ): Promise<ProviderUploadResult> {
     if (!isAliyunUploadInput(input)) {
       throw new PanSyncError("UPLOAD_FAILED");

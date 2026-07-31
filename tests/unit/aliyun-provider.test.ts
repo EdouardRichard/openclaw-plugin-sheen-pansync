@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { CloudDriveProvider } from "../../src/contracts.js";
 import type { CredentialRecord } from "../../src/credentials/types.js";
 import { PanSyncError } from "../../src/errors.js";
+import { ProviderRegistry } from "../../src/provider-registry.js";
 import { AliyunHttpClient } from "../../src/providers/aliyun/http.js";
 import { AliyunProvider } from "../../src/providers/aliyun/provider.js";
 import {
@@ -80,7 +82,11 @@ describe("AliyunProvider credential validation", () => {
       driveInfo(),
     ]);
 
-    const result = await provider(server).validateCredentials({
+    const resolved: CloudDriveProvider = new ProviderRegistry(
+      [provider(server)],
+      "aliyun",
+    ).resolve("aliyun");
+    const result = await resolved.validateCredentials({
       clientId: "client-id",
       clientSecret: "client-secret",
       refreshToken: "refresh-candidate",
@@ -106,6 +112,24 @@ describe("AliyunProvider credential validation", () => {
     expect(JSON.stringify(result.account)).not.toContain("unmasked-user-123456789");
     expect(JSON.stringify(result.account)).not.toContain("Unmasked Account Name");
     expect(Number.isNaN(Date.parse(result.accessTokenExpiresAt))).toBe(false);
+  });
+
+  it("preserves a transient token-endpoint failure as TOKEN_ENDPOINT_UNAVAILABLE", async () => {
+    const server = await fakeServer([{
+      status: 503,
+      body: { detail: "transient-secret-CANARY" },
+    }]);
+
+    const error = await rejectedPanSyncError(() =>
+      provider(server).validateCredentials({
+        clientId: "client-id",
+        clientSecret: "client-secret",
+        refreshToken: "refresh-candidate",
+      })
+    );
+
+    expect(error.code).toBe("TOKEN_ENDPOINT_UNAVAILABLE");
+    expect(error.message).not.toContain("transient-secret-CANARY");
   });
 
   it("rejects an invalid candidate before a caller can replace old credentials", async () => {
@@ -208,7 +232,7 @@ describe("AliyunProvider directory traversal", () => {
     ).resolves.toMatchObject({
       id: "folder-2026",
       path: "/openClawShare/reports/2026",
-      driveId: "drive-default",
+      providerState: { driveId: "drive-default" },
     });
 
     expect(server.requests.slice(1).map(({ path }) => path)).toEqual([
@@ -264,7 +288,7 @@ describe("AliyunProvider directory traversal", () => {
       provider(server, forceRefresh).ensureDirectory("/", "access-old"),
     ).resolves.toMatchObject({
       id: "root",
-      driveId: "drive-default",
+      providerState: { driveId: "drive-default" },
     });
 
     expect(forceRefresh).toHaveBeenCalledOnce();

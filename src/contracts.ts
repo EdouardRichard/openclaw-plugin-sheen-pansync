@@ -1,4 +1,6 @@
 import type { PanSyncErrorCode } from "./errors.js";
+import type { CredentialRecord } from "./credentials/types.js";
+import type { ResolvedWorkspaceFile } from "./workspace/path-guard.js";
 
 export type ProviderId = "aliyun";
 
@@ -24,22 +26,23 @@ export type PanSyncUploadResult = {
 };
 
 export type CredentialInput = {
+  clientId: string;
+  clientSecret: string;
   refreshToken: string;
+  credentialVersion?: number;
 };
 
-export type ValidatedCredentialRecord = {
-  accessToken: string;
-  refreshToken: string;
-};
+export type ValidatedCredentialRecord = CredentialRecord;
 
 export type RemoteDirectory = {
   id: string;
   path: string;
+  providerState: Readonly<Record<string, unknown>>;
 };
 
 export type ProviderUploadInput = {
   accessToken: string;
-  localPath: string;
+  file: ResolvedWorkspaceFile;
   remoteDirectory: RemoteDirectory;
   remoteName?: string;
 };

@@ -1,5 +1,6 @@
 import { Readable } from "node:stream";
 import type {
+  ProviderUploadInput,
   ProviderUploadResult,
   RemoteDirectory,
 } from "../../contracts.js";
@@ -16,14 +17,16 @@ const UPLOAD_URL_REFRESH_AGE_MS = 50 * 60 * 1_000;
 const READ_CHUNK_SIZE = 64 * 1024;
 
 export type AliyunRemoteDirectory = RemoteDirectory & {
-  driveId: string;
+  providerState: {
+    driveId: string;
+  };
 };
 
-export type AliyunProviderUploadInput = {
-  accessToken: string;
+export type AliyunProviderUploadInput = Omit<
+  ProviderUploadInput,
+  "remoteDirectory"
+> & {
   remoteDirectory: AliyunRemoteDirectory;
-  remoteName?: string;
-  file: ResolvedWorkspaceFile;
 };
 
 export type AliyunTokenRefresher = {
@@ -275,6 +278,7 @@ async function putPart(
   stream: Readable,
   uploadUrl: string,
   contentLength: number,
+  signal: AbortSignal,
 ): Promise<void> {
   try {
     const init: RequestInit & { duplex: "half" } = {
@@ -284,6 +288,7 @@ async function putPart(
       },
       body: stream as unknown as BodyInit,
       duplex: "half",
+      signal,
     };
     const response = await client.fetch(uploadUrl, init);
     if (!response.ok) {
@@ -344,9 +349,21 @@ async function uploadParts(
 ): Promise<string> {
   let nextIndex = 0;
   let accessToken = initialAccessToken;
+  let failure: PanSyncError | undefined;
+  const cancellation = new AbortController();
+
+  const stopWith = (error: unknown): void => {
+    if (failure !== undefined) {
+      return;
+    }
+    failure = error instanceof PanSyncError
+      ? error
+      : new PanSyncError("UPLOAD_FAILED");
+    cancellation.abort();
+  };
 
   const worker = async (): Promise<void> => {
-    while (true) {
+    while (failure === undefined) {
       const index = nextIndex;
       nextIndex += 1;
       const originalPart = upload.parts[index];
@@ -354,51 +371,55 @@ async function uploadParts(
         return;
       }
 
-      let part = originalPart;
-      if (clock() - part.acquiredAt >= UPLOAD_URL_REFRESH_AGE_MS) {
-        const refreshed = await client.post(
-          "/adrive/v1.0/openFile/getUploadUrl",
-          accessToken,
-          {
-            drive_id: input.remoteDirectory.driveId,
-            file_id: upload.fileId,
-            upload_id: upload.uploadId,
-            part_info_list: [{ part_number: part.partNumber }],
-          },
-          { failureCode: "UPLOAD_FAILED" },
-        );
-        accessToken = refreshed.accessToken;
-        part = parseRefreshedPartUrl(
-          refreshed.body,
-          part.partNumber,
-          clock(),
-        );
-      }
+      try {
+        let part = originalPart;
+        if (clock() - part.acquiredAt >= UPLOAD_URL_REFRESH_AGE_MS) {
+          const refreshed = await client.post(
+            "/adrive/v1.0/openFile/getUploadUrl",
+            accessToken,
+            {
+              drive_id: input.remoteDirectory.providerState.driveId,
+              file_id: upload.fileId,
+              upload_id: upload.uploadId,
+              part_info_list: [{ part_number: part.partNumber }],
+            },
+            { failureCode: "UPLOAD_FAILED" },
+          );
+          accessToken = refreshed.accessToken;
+          part = parseRefreshedPartUrl(
+            refreshed.body,
+            part.partNumber,
+            clock(),
+          );
+        }
 
-      const start = (part.partNumber - 1) * partSize;
-      const length = Math.min(partSize, input.file.size - start);
-      if (length <= 0) {
-        throw new PanSyncError("UPLOAD_FAILED");
+        if (failure !== undefined) {
+          return;
+        }
+        const start = (part.partNumber - 1) * partSize;
+        const length = Math.min(partSize, input.file.size - start);
+        if (length <= 0) {
+          throw new PanSyncError("UPLOAD_FAILED");
+        }
+        const stream = rangeStream(input.file, start, length);
+        await putPart(
+          client,
+          stream,
+          part.uploadUrl,
+          length,
+          cancellation.signal,
+        );
+      } catch (error) {
+        stopWith(error);
+        return;
       }
-      const stream = rangeStream(input.file, start, length);
-      await putPart(client, stream, part.uploadUrl, length);
     }
   };
 
   const workerCount = Math.min(MAX_CONCURRENT_PUTS, upload.parts.length);
-  const outcomes = await Promise.allSettled(
-    Array.from({ length: workerCount }, worker),
-  );
-  const failure = outcomes.find(
-    (outcome): outcome is PromiseRejectedResult =>
-      outcome.status === "rejected",
-  );
+  await Promise.all(Array.from({ length: workerCount }, worker));
   if (failure !== undefined) {
-    const error = failure.reason as unknown;
-    if (error instanceof PanSyncError) {
-      throw error;
-    }
-    throw new PanSyncError("UPLOAD_FAILED");
+    throw failure;
   }
   return accessToken;
 }
@@ -425,11 +446,12 @@ export async function uploadAliyunFile(
     "/adrive/v1.0/openFile/create",
     input.accessToken,
     {
-      drive_id: input.remoteDirectory.driveId,
+      drive_id: input.remoteDirectory.providerState.driveId,
       parent_file_id: input.remoteDirectory.id,
       name: input.remoteName ?? input.file.basename,
       type: "file",
       check_name_mode: "auto_rename",
+      parallel_upload: true,
       size: input.file.size,
       part_info_list: Array.from(
         { length: totalParts },
@@ -451,7 +473,7 @@ export async function uploadAliyunFile(
     "/adrive/v1.0/openFile/complete",
     accessToken,
     {
-      drive_id: input.remoteDirectory.driveId,
+      drive_id: input.remoteDirectory.providerState.driveId,
       file_id: upload.fileId,
       upload_id: upload.uploadId,
     },
