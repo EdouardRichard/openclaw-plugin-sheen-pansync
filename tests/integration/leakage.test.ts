@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
+import { types as nodeTypes } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import type {
   OpenClawPluginApi,
@@ -139,8 +140,19 @@ async function setupRequest(
 }
 
 function containsProtectedValue(values: readonly unknown[]): boolean {
+  const maxErrorPrototypeDepth = 32;
   const pending = [...values];
   const seen = new WeakSet<object>();
+  const safeTypeCheck = (
+    check: (value: unknown) => boolean,
+    value: unknown,
+  ): boolean | "unsafe" => {
+    try {
+      return check(value);
+    } catch {
+      return "unsafe";
+    }
+  };
   const queueDescriptor = (
     target: object,
     key: PropertyKey,
@@ -170,7 +182,11 @@ function containsProtectedValue(values: readonly unknown[]): boolean {
       continue;
     }
     if (typeof value === "symbol") {
-      pending.push(String(value));
+      try {
+        pending.push(String(value));
+      } catch {
+        return true;
+      }
       continue;
     }
     if (
@@ -182,10 +198,30 @@ function containsProtectedValue(values: readonly unknown[]): boolean {
     if (seen.has(value)) continue;
     seen.add(value);
 
-    if (value instanceof Error) {
+    const isNativeError = safeTypeCheck(nodeTypes.isNativeError, value);
+    const isMap = safeTypeCheck(nodeTypes.isMap, value);
+    const isSet = safeTypeCheck(nodeTypes.isSet, value);
+    const isProxy = safeTypeCheck(nodeTypes.isProxy, value);
+    if (
+      isNativeError === "unsafe"
+      || isMap === "unsafe"
+      || isSet === "unsafe"
+      || isProxy === "unsafe"
+    ) {
+      return true;
+    }
+
+    if (isNativeError) {
       for (const field of ["name", "message", "stack", "cause"] as const) {
         let target: object | null = value;
+        const visited = new WeakSet<object>();
+        let depth = 0;
         while (target !== null) {
+          if (visited.has(target) || depth >= maxErrorPrototypeDepth) {
+            return true;
+          }
+          visited.add(target);
+          depth += 1;
           const result = queueDescriptor(target, field);
           if (result === "unsafe") return true;
           if (result === "queued") break;
@@ -197,8 +233,13 @@ function containsProtectedValue(values: readonly unknown[]): boolean {
         }
       }
     }
-    if (value instanceof Map) {
-      const descriptor = Object.getOwnPropertyDescriptor(Map.prototype, "forEach");
+    if (isMap) {
+      let descriptor: PropertyDescriptor | undefined;
+      try {
+        descriptor = Object.getOwnPropertyDescriptor(Map.prototype, "forEach");
+      } catch {
+        return true;
+      }
       if (
         descriptor === undefined
         || !("value" in descriptor)
@@ -214,8 +255,13 @@ function containsProtectedValue(values: readonly unknown[]): boolean {
         return true;
       }
     }
-    if (value instanceof Set) {
-      const descriptor = Object.getOwnPropertyDescriptor(Set.prototype, "forEach");
+    if (isSet) {
+      let descriptor: PropertyDescriptor | undefined;
+      try {
+        descriptor = Object.getOwnPropertyDescriptor(Set.prototype, "forEach");
+      } catch {
+        return true;
+      }
       if (
         descriptor === undefined
         || !("value" in descriptor)
@@ -236,12 +282,13 @@ function containsProtectedValue(values: readonly unknown[]): boolean {
     try {
       keys = Reflect.ownKeys(value);
     } catch {
-      continue;
+      return true;
     }
     for (const key of keys) {
       pending.push(key);
       if (queueDescriptor(value, key) === "unsafe") return true;
     }
+    if (isProxy) return true;
   }
   return false;
 }
@@ -267,7 +314,23 @@ function rejectionMessage(run: () => void): string | undefined {
     run();
     return undefined;
   } catch (error) {
-    return error instanceof Error ? error.message : "non-Error rejection";
+    if (
+      (typeof error !== "object" || error === null)
+      && typeof error !== "function"
+    ) {
+      return "non-Error rejection";
+    }
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(error, "message");
+    } catch {
+      return "unsafe rejection";
+    }
+    return descriptor !== undefined
+      && "value" in descriptor
+      && typeof descriptor.value === "string"
+      ? descriptor.value
+      : "unsafe rejection";
   }
 }
 
@@ -453,6 +516,111 @@ describe("release leakage canaries", () => {
     if (message !== "production plugin emitted unexpected logger calls") {
       throw new Error("production logger cardinality failure was not fixed");
     }
+  });
+
+  it("fails closed when ownKeys throws without exposing the trap error", () => {
+    let trapCalls = 0;
+    const value = new Proxy({}, {
+      ownKeys() {
+        trapCalls += 1;
+        throw new Error(ACCESS_TOKEN);
+      },
+    });
+
+    assertRejectedWithoutDumping("ownKeys logger argument", value);
+    expect(trapCalls).toBe(1);
+  });
+
+  it("fails closed when Error prototype lookup throws", () => {
+    let trapCalls = 0;
+    const hostilePrototype = new Proxy({}, {
+      getPrototypeOf() {
+        trapCalls += 1;
+        throw new Error(REFRESH_TOKEN);
+      },
+    });
+    const error = new Error("safe message");
+    error.stack = "safe stack";
+    Object.setPrototypeOf(error, hostilePrototype);
+
+    assertRejectedWithoutDumping("Error prototype logger argument", error);
+    expect(trapCalls).toBe(1);
+  });
+
+  it.each([
+    ["Map", () => new Map()],
+    ["Set", () => new Set()],
+  ] as const)("avoids %s instanceof prototype traps", (name, createTarget) => {
+    let trapCalls = 0;
+    const value = new Proxy(createTarget(), {
+      getPrototypeOf() {
+        trapCalls += 1;
+        throw new Error(CLIENT_SECRET);
+      },
+    });
+
+    assertRejectedWithoutDumping(`${name} proxy logger argument`, value);
+    expect(trapCalls).toBe(0);
+  });
+
+  it("fails closed when a property descriptor trap throws", () => {
+    let trapCalls = 0;
+    const value = new Proxy({}, {
+      ownKeys: () => ["payload"],
+      getOwnPropertyDescriptor() {
+        trapCalls += 1;
+        throw new Error(ABSOLUTE_PATH);
+      },
+    });
+
+    assertRejectedWithoutDumping("descriptor logger argument", value);
+    expect(trapCalls).toBe(1);
+  });
+
+  it("bounds a cyclic exotic Error prototype traversal", () => {
+    let trapCalls = 0;
+    let cyclicPrototype: object;
+    cyclicPrototype = new Proxy({}, {
+      getPrototypeOf() {
+        trapCalls += 1;
+        if (trapCalls > 8) throw new Error(ACCESS_TOKEN);
+        return cyclicPrototype;
+      },
+    });
+    const error = new Error("safe message");
+    error.stack = "safe stack";
+    Object.setPrototypeOf(error, cyclicPrototype);
+
+    assertRejectedWithoutDumping("cyclic Error prototype logger argument", error);
+    expect(trapCalls).toBeLessThanOrEqual(2);
+  });
+
+  it("captures hostile thrown values without instanceof or direct message reads", () => {
+    let prototypeTrapCalls = 0;
+    let descriptorTrapCalls = 0;
+    const hostile = new Proxy({}, {
+      getPrototypeOf() {
+        prototypeTrapCalls += 1;
+        throw new Error(CLIENT_SECRET);
+      },
+      getOwnPropertyDescriptor() {
+        descriptorTrapCalls += 1;
+        throw new Error(REFRESH_TOKEN);
+      },
+    });
+    let observed: string | undefined;
+    try {
+      observed = rejectionMessage(() => {
+        throw hostile;
+      });
+    } catch {
+      throw new Error("failure capture propagated a hostile value");
+    }
+    if (observed !== "unsafe rejection") {
+      throw new Error("failure capture did not return its fixed label");
+    }
+    expect(prototypeTrapCalls).toBe(0);
+    expect(descriptorTrapCalls).toBe(1);
   });
 
   it("keeps credentials, access tokens, and workspace paths out of failure surfaces", async () => {
