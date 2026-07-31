@@ -12,6 +12,7 @@
     ]
   },
   "files": [
+    "cli-metadata.js",
     "dist",
     "ui",
     "skills",

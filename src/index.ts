@@ -1,5 +1,4 @@
 import { randomBytes } from "node:crypto";
-import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   definePluginEntry,
@@ -12,17 +11,9 @@ import {
 } from "./admin/cli.js";
 import { createPanSyncStatusRoute } from "./admin/status-route.js";
 import { resolvePluginConfig } from "./config.js";
-import { createSqliteWorkerCredentialLeaseRunner } from "./credentials/sqlite-worker-lease.js";
-import {
-  type CredentialLeaseRunner,
-  CredentialStore,
-} from "./credentials/store.js";
-import { TokenManager } from "./credentials/token-manager.js";
-import { ProviderRegistry } from "./provider-registry.js";
-import { AliyunHttpClient } from "./providers/aliyun/http.js";
-import { AliyunProvider } from "./providers/aliyun/provider.js";
+import type { CredentialLeaseRunner } from "./credentials/store.js";
+import { createPanSyncRuntime } from "./runtime-composition.js";
 import { registerPanSyncUploadTool } from "./tool.js";
-import { UploadOrchestrator } from "./upload/orchestrator.js";
 
 const PLUGIN_ID = "pan-sync-helper";
 const PLUGIN_NAME = "Pan Sync Helper";
@@ -78,56 +69,36 @@ export function createPanSyncPluginEntry(
     description: "Upload OpenClaw workspace files to a configured cloud drive",
     configSchema,
     register(api) {
-      const config = resolvePluginConfig(api.pluginConfig);
-      const dataDir = path.join(
-        api.runtime.state.resolveStateDir(),
-        PLUGIN_ID,
-      );
-      const leaseDatabasePath = path.join(
-        dataDir,
-        "locks",
-        "lease.sqlite",
-      );
-      const lease = (
-        options.credentialLeaseFactory
-        ?? createSqliteWorkerCredentialLeaseRunner
-      )(leaseDatabasePath);
-      const store = new CredentialStore(dataDir, lease);
-      const httpClient = new AliyunHttpClient();
-      const tokenManager = new TokenManager(store, httpClient);
-      const provider = new AliyunProvider({
-        httpClient,
-        tokenManager,
-      });
-      const providerRegistry = new ProviderRegistry([provider], "aliyun");
-      const orchestrator = new UploadOrchestrator({
-        providerRegistry,
-        tokenManager,
-        config,
+      const runtime = createPanSyncRuntime({
+        stateDir: api.runtime.state.resolveStateDir(),
+        pluginConfig: api.pluginConfig,
+        ...(options.credentialLeaseFactory === undefined
+          ? {}
+          : { credentialLeaseFactory: options.credentialLeaseFactory }),
       });
 
-      registerPanSyncUploadTool(api, orchestrator);
+      registerPanSyncUploadTool(api, runtime.orchestrator);
       registerPanSyncConfigureCli(api, {
-        store,
-        provider,
-        orchestrator,
-        dataDir,
+        store: runtime.store,
+        provider: runtime.provider,
+        orchestrator: runtime.orchestrator,
+        dataDir: runtime.dataDir,
         assetsDir: ASSETS_DIR,
         clock: Date.now,
         randomBytes,
-        defaultDirectory: config.defaultDirectory,
-        ...(config.tokenGuideUrl === undefined
+        defaultDirectory: runtime.config.defaultDirectory,
+        ...(runtime.config.tokenGuideUrl === undefined
           ? {}
-          : { tokenGuideUrl: config.tokenGuideUrl }),
+          : { tokenGuideUrl: runtime.config.tokenGuideUrl }),
       }, options.configureCliOptions);
       api.registerHttpRoute({
         path: STATUS_PATH,
         auth: "gateway",
         match: "exact",
         handler: createPanSyncStatusRoute({
-          store,
-          tokenManager,
-          config,
+          store: runtime.store,
+          tokenManager: runtime.tokenManager,
+          config: runtime.config,
         }),
       });
       api.session.controls.registerControlUiDescriptor({
@@ -139,8 +110,8 @@ export function createPanSyncPluginEntry(
       });
       api.registerService({
         id: PLUGIN_ID,
-        start: () => store.initialize(),
-        stop: () => tokenManager.clearSnapshots(),
+        start: () => runtime.store.initialize(),
+        stop: () => runtime.tokenManager.clearSnapshots(),
       });
     },
   });

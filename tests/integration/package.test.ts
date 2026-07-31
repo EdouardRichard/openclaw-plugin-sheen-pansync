@@ -1,12 +1,22 @@
-import { spawnSync } from "node:child_process";
+import {
+  spawn,
+  spawnSync,
+  type ChildProcessWithoutNullStreams,
+} from "node:child_process";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 type PackResult = Array<{
+  filename?: string;
   files?: Array<{ path?: string }>;
 }>;
+
+type ProcessExit = {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+};
 
 const temporaryDirectories: string[] = [];
 const allowedUiFiles = new Set([
@@ -16,6 +26,12 @@ const allowedUiFiles = new Set([
 ]);
 const allowedSkillFiles = new Set([
   "skills/pan-sync-upload/SKILL.md",
+]);
+const rejectedPackageRoots = new Set([
+  ".superpowers",
+  "node_modules",
+  "src",
+  "tests",
 ]);
 
 function normalizePackagePath(entry: string): string {
@@ -32,6 +48,7 @@ function packageViolations(paths: readonly string[]): string[] {
     const segments = normalized.split("/");
     const basename = segments.at(-1);
     const rejected = segments.includes("..")
+      || rejectedPackageRoots.has(segments[0] ?? "")
       || segments.includes("tests")
       || segments.includes("plugin-data")
       || basename === ".env"
@@ -52,6 +69,59 @@ function runNpm(args: readonly string[]) {
     cwd: process.cwd(),
     encoding: "utf8",
     timeout: 60_000,
+  });
+}
+
+function waitForExit(child: ChildProcessWithoutNullStreams): Promise<ProcessExit> {
+  return new Promise((resolve) => {
+    child.once("exit", (code, signal) => resolve({ code, signal }));
+  });
+}
+
+async function settlesWithin(
+  promise: Promise<unknown>,
+  timeoutMs: number,
+): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise.then(() => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function waitForReadiness(
+  child: ChildProcessWithoutNullStreams,
+  readStdout: () => string,
+  timeoutMs: number,
+): Promise<"ready" | "exited" | "error" | "timeout"> {
+  return new Promise((resolve) => {
+    const finish = (result: "ready" | "exited" | "error" | "timeout"): void => {
+      clearTimeout(timer);
+      child.stdout.off("data", onData);
+      child.off("exit", onExit);
+      child.off("error", onError);
+      resolve(result);
+    };
+    const onData = (): void => {
+      if (readStdout().includes("Remote URL:")) finish("ready");
+    };
+    const onExit = (): void => finish("exited");
+    const onError = (): void => finish("error");
+    const timer = setTimeout(() => finish("timeout"), timeoutMs);
+    child.stdout.on("data", onData);
+    child.once("exit", onExit);
+    child.once("error", onError);
+    if (child.exitCode !== null || child.signalCode !== null) {
+      finish("exited");
+      return;
+    }
+    onData();
   });
 }
 
@@ -80,8 +150,10 @@ describe("published package", () => {
       entry === undefined ? [] : [entry.replaceAll("\\", "/")]
     ) ?? [];
     const required = [
+      "cli-metadata.js",
       "dist/index.js",
       "dist/admin/cli.js",
+      "dist/cli-entry.js",
       "ui/setup.html",
       "ui/setup.js",
       "ui/setup.css",
@@ -99,6 +171,9 @@ describe("published package", () => {
   it("rejects nested private state and undeclared static content", () => {
     const unsafePaths = [
       "ui\\.env",
+      "src/runtime-composition.ts",
+      "node_modules/dependency/index.js",
+      ".superpowers/sdd/private-report.md",
       "skills/plugin-data/state",
       "dist/tests/helper.js",
       "dist/cache/master.key",
@@ -128,4 +203,114 @@ describe("published package", () => {
     expect(copied.error).toBeUndefined();
     expect(copied.status).not.toBe(0);
   });
+
+  it("launches pan-sync configure through the officially installed package", async () => {
+    const verificationRoot = await mkdtemp(
+      path.join(tmpdir(), "pan-sync-installed-cli-"),
+    );
+    const stateDir = path.join(verificationRoot, "state");
+    const openClawCli = path.resolve("node_modules/openclaw/openclaw.mjs");
+    const isolatedEnvironment: NodeJS.ProcessEnv = {
+      ...process.env,
+      OPENCLAW_STATE_DIR: stateDir,
+    };
+    delete isolatedEnvironment.OPENCLAW_CONFIG_PATH;
+    delete isolatedEnvironment.OPENCLAW_DEBUG;
+    let child: ChildProcessWithoutNullStreams | undefined;
+    let exitPromise: Promise<ProcessExit> | undefined;
+
+    try {
+      const packed = runNpm([
+        "pack",
+        "--json",
+        "--pack-destination",
+        verificationRoot,
+      ]);
+      expect(packed.error, "package creation failed to launch").toBeUndefined();
+      expect(packed.status, "package creation failed").toBe(0);
+      const report = JSON.parse(packed.stdout) as PackResult;
+      const filename = report[0]?.filename;
+      expect(filename, "package creation did not return an artifact").toBeTypeOf(
+        "string",
+      );
+      const tarball = path.join(verificationRoot, path.basename(filename ?? ""));
+
+      const installed = spawnSync(
+        process.execPath,
+        [openClawCli, "plugins", "install", tarball],
+        {
+          cwd: process.cwd(),
+          encoding: "utf8",
+          env: isolatedEnvironment,
+          timeout: 60_000,
+          windowsHide: true,
+        },
+      );
+      expect(
+        installed.error,
+        "official plugin installation failed to launch",
+      ).toBeUndefined();
+      expect(installed.status, "official plugin installation failed").toBe(0);
+
+      child = spawn(
+        process.execPath,
+        [openClawCli, "--no-color", "pan-sync", "configure"],
+        {
+          cwd: process.cwd(),
+          env: isolatedEnvironment,
+          stdio: ["pipe", "pipe", "pipe"],
+          windowsHide: true,
+        },
+      );
+      child.stdin.end();
+      exitPromise = waitForExit(child);
+      let stdout = "";
+      let stderr = "";
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        stdout += chunk;
+      });
+      child.stderr.on("data", (chunk: string) => {
+        stderr += chunk;
+      });
+
+      const readiness = await waitForReadiness(child, () => stdout, 30_000);
+      const combinedOutput = `${stdout}\n${stderr}`;
+      const registrationFailure = combinedOutput.includes(
+        "failed during register",
+      ) || combinedOutput.includes("cli-metadata");
+      const unknownCommand = combinedOutput.includes("Unknown command");
+      expect(
+        readiness,
+        `official CLI readiness=${readiness}; registrationFailure=${registrationFailure}; unknownCommand=${unknownCommand}`,
+      ).toBe("ready");
+      expect(registrationFailure).toBe(false);
+      expect(unknownCommand).toBe(false);
+
+      child.kill("SIGTERM");
+      const graceful = await settlesWithin(exitPromise, 5_000);
+      if (!graceful) {
+        child.kill("SIGKILL");
+        expect(
+          await settlesWithin(exitPromise, 5_000),
+          "official CLI did not exit after exact-child force termination",
+        ).toBe(true);
+      }
+    } finally {
+      if (child !== undefined && child.exitCode === null) {
+        child.kill("SIGTERM");
+        const graceful = exitPromise === undefined
+          ? false
+          : await settlesWithin(exitPromise, 2_000);
+        if (!graceful && child.exitCode === null) {
+          child.kill("SIGKILL");
+          if (exitPromise !== undefined) {
+            await settlesWithin(exitPromise, 2_000);
+          }
+        }
+      }
+      await rm(verificationRoot, { recursive: true, force: true });
+    }
+  }, 120_000);
 });

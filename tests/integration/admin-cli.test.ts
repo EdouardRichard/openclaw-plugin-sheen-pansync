@@ -30,14 +30,13 @@ class FakeCommand {
 }
 
 describe("OpenClaw configuration CLI", () => {
-  it("registers pan-sync configure, resolves the public state dir, prints only guidance, and closes on signals", async () => {
-    const stateDir = path.join("C:\\state", "openclaw");
+  it("registers and launches pan-sync configure without an OpenClaw runtime state facade", async () => {
+    const dataDir = path.join("C:\\prepared-state", "pan-sync-helper");
     const program = new FakeCommand();
     let registrar: ((context: { program: FakeCommand }) => void | Promise<void>) | undefined;
     let registrationOptions: unknown;
     const api = {
       rootDir: "C:\\plugin",
-      runtime: { state: { resolveStateDir: () => stateDir } },
       registerCli(callback: typeof registrar, options: unknown) {
         registrar = callback;
         registrationOptions = options;
@@ -68,7 +67,7 @@ describe("OpenClaw configuration CLI", () => {
       store: {} as SetupServerDependencies["store"],
       provider: {} as SetupServerDependencies["provider"],
       orchestrator: {} as SetupServerDependencies["orchestrator"],
-      dataDir: "must-be-replaced",
+      dataDir,
       assetsDir: path.join("C:\\plugin", "ui"),
       clock: Date.now,
       randomBytes: Buffer.alloc,
@@ -92,7 +91,7 @@ describe("OpenClaw configuration CLI", () => {
     await configure?.actionHandler?.();
 
     expect(startServer).toHaveBeenCalledWith(expect.objectContaining({
-      dataDir: path.join(stateDir, "pan-sync-helper"),
+      dataDir,
     }));
     expect(lines).toEqual([
       "Pan Sync Helper configuration page is ready for 10 minutes.",
@@ -100,7 +99,7 @@ describe("OpenClaw configuration CLI", () => {
       "SSH example: ssh -L 43891:127.0.0.1:43891 user@linux.example.com",
       "Then open the Remote URL in your local browser.",
     ]);
-    expect(lines.join("\n")).not.toContain("must-be-replaced");
+    expect(lines.join("\n")).not.toContain(dataDir);
     expect(signalHandlers.has("SIGINT")).toBe(true);
     expect(signalHandlers.has("SIGTERM")).toBe(true);
 
