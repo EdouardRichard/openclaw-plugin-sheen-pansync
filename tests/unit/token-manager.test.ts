@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { TokenManager } from "../../src/credentials/token-manager.js";
@@ -63,6 +64,31 @@ async function fakeServer(
   const server = await startFakeAliyunServer(response);
   cleanups.push(server.close);
   return server;
+}
+
+async function refusedLocalBaseUrl(): Promise<string> {
+  const listener = createServer();
+  await new Promise<void>((resolve, reject) => {
+    listener.once("error", reject);
+    listener.listen(0, "127.0.0.1", () => {
+      listener.off("error", reject);
+      resolve();
+    });
+  });
+  const address = listener.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("refused-endpoint fixture did not bind a TCP port");
+  }
+  await new Promise<void>((resolve, reject) => {
+    listener.close((error) => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    });
+  });
+  return `http://127.0.0.1:${address.port}`;
 }
 
 function successResponse(
@@ -186,6 +212,45 @@ describe("AliyunHttpClient", () => {
     },
   );
 
+  it.each([
+    {
+      status: 429,
+      code: "RATE_LIMITED",
+    },
+    {
+      status: 502,
+      code: "TOKEN_ENDPOINT_UNAVAILABLE",
+    },
+    {
+      status: 503,
+      code: "TOKEN_ENDPOINT_UNAVAILABLE",
+    },
+  ] as const)(
+    "prioritizes HTTP $status over an invalid_grant response body",
+    async ({ status, code }) => {
+      const server = await fakeServer({
+        status,
+        body: {
+          error: "invalid_grant",
+          error_description: "mixed-status-response-CANARY",
+        },
+      });
+
+      const error = await rejectedPanSyncError(() =>
+        client(server).refreshToken({
+          clientId: "client-id",
+          clientSecret: "mixed-status-secret-CANARY",
+          refreshToken: "mixed-status-refresh-CANARY",
+        }),
+      );
+
+      expect(error.code).toBe(code);
+      expect(error.message).not.toContain("mixed-status-secret-CANARY");
+      expect(error.message).not.toContain("mixed-status-refresh-CANARY");
+      expect(error.message).not.toContain("mixed-status-response-CANARY");
+    },
+  );
+
   it("maps the 15-second request timeout without exposing tokens", async () => {
     const server = await fakeServer({ status: 200, hang: true });
     const timeoutDelays: number[] = [];
@@ -300,6 +365,75 @@ describe("TokenManager", () => {
     expect(server.requests).toEqual([]);
   });
 
+  it("keeps same-version reauth state after returning a fresh access token", async () => {
+    const { store } = await tempStore();
+    await store.replace(expiredRecord(1, {
+      accessTokenExpiresAt: new Date(NOW + 3_600_000).toISOString(),
+    }));
+    const server = await fakeServer({
+      status: 400,
+      body: { error: "invalid_grant" },
+    });
+    const manager = new TokenManager(store, client(server), () => NOW);
+    const refreshError = await rejectedPanSyncError(
+      () => manager.forceRefresh(),
+    );
+    expect(refreshError.code).toBe("REFRESH_TOKEN_REJECTED");
+
+    await expect(manager.getValidAccessToken()).resolves.toBe("access-1");
+
+    await expect(manager.status()).resolves.toBe("reauth_required");
+  });
+
+  it("keeps same-version degraded state after an expected-token mismatch", async () => {
+    const { store } = await tempStore();
+    const initial = expiredRecord(1, {
+      accessTokenExpiresAt: new Date(NOW + 3_600_000).toISOString(),
+    });
+    await store.replace(initial);
+    const server = await fakeServer({
+      status: 503,
+      body: { message: "temporarily unavailable" },
+    });
+    const manager = new TokenManager(store, client(server), () => NOW);
+    const refreshError = await rejectedPanSyncError(
+      () => manager.forceRefresh(),
+    );
+    expect(refreshError.code).toBe("TOKEN_ENDPOINT_UNAVAILABLE");
+    await store.replace({
+      ...initial,
+      accessToken: "same-version-access",
+    });
+
+    await expect(manager.forceRefresh("access-1")).resolves.toBe(
+      "same-version-access",
+    );
+
+    await expect(manager.status()).resolves.toBe("degraded");
+  });
+
+  it("clears failure state after the stored credential version changes", async () => {
+    const { store } = await tempStore();
+    await store.replace(expiredRecord(1, {
+      accessTokenExpiresAt: new Date(NOW + 3_600_000).toISOString(),
+    }));
+    const server = await fakeServer({
+      status: 503,
+      body: { message: "temporarily unavailable" },
+    });
+    const manager = new TokenManager(store, client(server), () => NOW);
+    await rejectedPanSyncError(() => manager.forceRefresh());
+    await store.replace(expiredRecord(2, {
+      accessToken: "new-version-access",
+      accessTokenExpiresAt: new Date(NOW + 3_600_000).toISOString(),
+    }));
+
+    await expect(manager.getValidAccessToken()).resolves.toBe(
+      "new-version-access",
+    );
+    await expect(manager.status()).resolves.toBe("ready");
+  });
+
   it("reports unconfigured and rejects token access when the vault is empty", async () => {
     const { store } = await tempStore();
     const server = await fakeServer(successResponse());
@@ -392,6 +526,33 @@ describe("TokenManager", () => {
     expect(error.code).toBe("TOKEN_ENDPOINT_UNAVAILABLE");
     expect(await readFile(encryptedPath)).toEqual(ciphertextBefore);
     await expect(store.read()).resolves.toEqual(expiredRecord());
+    await expect(manager.status()).resolves.toBe("degraded");
+  });
+
+  it("sanitizes a refused transport and preserves the encrypted record", async () => {
+    const { dataDir, store } = await tempStore();
+    const initial = expiredRecord(1, {
+      clientSecret: "transport-secret-CANARY",
+      refreshToken: "transport-refresh-CANARY",
+    });
+    await store.replace(initial);
+    const encryptedPath = path.join(dataDir, "credentials.enc");
+    const ciphertextBefore = await readFile(encryptedPath);
+    const aliyun = new AliyunHttpClient({
+      baseUrl: await refusedLocalBaseUrl(),
+      clock: () => NOW,
+    });
+    const manager = new TokenManager(store, aliyun, () => NOW);
+
+    const error = await rejectedPanSyncError(
+      () => manager.getValidAccessToken(),
+    );
+
+    expect(error.code).toBe("TOKEN_ENDPOINT_UNAVAILABLE");
+    expect(error.message).not.toContain("transport-secret-CANARY");
+    expect(error.message).not.toContain("transport-refresh-CANARY");
+    expect(await readFile(encryptedPath)).toEqual(ciphertextBefore);
+    await expect(store.read()).resolves.toEqual(initial);
     await expect(manager.status()).resolves.toBe("degraded");
   });
 });

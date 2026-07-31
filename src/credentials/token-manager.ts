@@ -40,7 +40,6 @@ export class TokenManager {
       && Date.parse(record.accessTokenExpiresAt) - this.clock()
         >= REFRESH_WINDOW_MS
     ) {
-      this.#failureState = undefined;
       return record.accessToken;
     }
 
@@ -56,7 +55,6 @@ export class TokenManager {
       if (record.accessToken.length === 0) {
         throw new PanSyncError("CREDENTIALS_INVALID");
       }
-      this.#failureState = undefined;
       return record.accessToken;
     }
 

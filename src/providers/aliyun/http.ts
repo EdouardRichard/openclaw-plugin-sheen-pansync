@@ -111,14 +111,17 @@ export class AliyunHttpClient {
       const body: unknown = await response.json().catch(() => undefined);
 
       if (!response.ok) {
-        if (isInvalidGrant(body)) {
-          throw new PanSyncError("REFRESH_TOKEN_REJECTED");
-        }
         if (response.status === 429) {
           throw new PanSyncError("RATE_LIMITED");
         }
         if (response.status === 502 || response.status === 503) {
           throw new PanSyncError("TOKEN_ENDPOINT_UNAVAILABLE");
+        }
+        if (
+          (response.status === 400 || response.status === 401)
+          && isInvalidGrant(body)
+        ) {
+          throw new PanSyncError("REFRESH_TOKEN_REJECTED");
         }
         throw new PanSyncError("CREDENTIALS_INVALID");
       }
