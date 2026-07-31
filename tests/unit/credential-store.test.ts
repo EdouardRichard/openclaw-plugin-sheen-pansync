@@ -1,8 +1,17 @@
-import { readFile, rename } from "node:fs/promises";
+import {
+  chmod,
+  link,
+  mkdir,
+  open,
+  readFile,
+  rename,
+  unlink,
+} from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { CredentialRecord } from "../../src/credentials/types.js";
 import {
+  type CredentialFileAdapter,
   CredentialStore,
   type CredentialLeaseRunner,
 } from "../../src/credentials/store.js";
@@ -40,6 +49,17 @@ async function tempDataDir(): Promise<string> {
   const state = await createTempState();
   cleanups.push(state.cleanup);
   return state.dataDir;
+}
+
+async function rejectedError(run: () => Promise<unknown>): Promise<Error> {
+  let rejected: unknown;
+  try {
+    await run();
+  } catch (error) {
+    rejected = error;
+  }
+  expect(rejected).toBeInstanceOf(Error);
+  return rejected as Error;
 }
 
 describe("CredentialStore", () => {
@@ -92,7 +112,7 @@ describe("CredentialStore", () => {
       async rename(source, destination) {
         if (failNextRename) {
           failNextRename = false;
-          throw new Error("injected rename failure");
+          throw new Error(`injected rename failure ${dataDir}`);
         }
         await rename(source, destination);
       },
@@ -101,10 +121,122 @@ describe("CredentialStore", () => {
     const previousCiphertext = await readFile(credentialsPath);
     failNextRename = true;
 
-    await expect(store.replace(record(2))).rejects.toThrow("injected rename failure");
+    const error = await rejectedError(() => store.replace(record(2)));
 
+    expect(error.message).toBe("credential store write failed");
+    expect(error.message).not.toContain("injected rename failure");
+    expect(error.message).not.toContain(dataDir);
     expect(await readFile(credentialsPath)).toEqual(previousCiphertext);
     await expect(store.read()).resolves.toEqual(initial);
+  });
+
+  it("sanitizes read failures without exposing filesystem paths", async () => {
+    const dataDir = await tempDataDir();
+    const masterKeyPath = path.join(dataDir, "master.key");
+    const store = new CredentialStore(dataDir, immediateLease);
+    await store.replace(record(1));
+    await unlink(masterKeyPath);
+
+    const error = await rejectedError(() => store.read());
+
+    expect(error.message).toBe("credential store read failed");
+    expect(error.message).not.toContain(dataDir);
+    expect(error.message).not.toContain("ENOENT");
+  });
+
+  it("sanitizes clear failures without exposing filesystem paths", async () => {
+    const dataDir = path.join(await tempDataDir(), "clear-path-CANARY");
+    const credentialsPath = path.join(dataDir, "credentials.enc");
+    await mkdir(credentialsPath, { recursive: true });
+    const store = new CredentialStore(dataDir, immediateLease);
+
+    const error = await rejectedError(() => store.clear());
+
+    expect(error.message).toBe("credential store clear failed");
+    expect(error.message).not.toContain("clear-path-CANARY");
+    expect(error.message).not.toContain(credentialsPath);
+  });
+
+  it("restores previous ciphertext when post-rename directory sync fails", async () => {
+    const dataDir = await tempDataDir();
+    const credentialsPath = path.join(dataDir, "credentials.enc");
+    const initial = record(1);
+    const seedStore = new CredentialStore(dataDir, immediateLease);
+    await seedStore.replace(initial);
+    const previousCiphertext = await readFile(credentialsPath);
+    let replacementRenamed = false;
+    let failPostRenameSync = true;
+    const syncFailureAdapter: Partial<CredentialFileAdapter> = {
+      async rename(source: string, destination: string) {
+        await rename(source, destination);
+        if (destination === credentialsPath) {
+          replacementRenamed = true;
+        }
+      },
+      async syncDirectory() {
+        if (replacementRenamed && failPostRenameSync) {
+          failPostRenameSync = false;
+          throw new Error(`POST_RENAME_SYNC_CANARY ${dataDir}`);
+        }
+      },
+    };
+    const store = new CredentialStore(dataDir, immediateLease, syncFailureAdapter);
+
+    const error = await rejectedError(() => store.replace(record(2)));
+
+    expect(error.message).toBe("credential store write failed");
+    expect(error.message).not.toContain("POST_RENAME_SYNC_CANARY");
+    expect(error.message).not.toContain(dataDir);
+    expect(await readFile(credentialsPath)).toEqual(previousCiphertext);
+    await expect(seedStore.read()).resolves.toEqual(initial);
+  });
+
+  it("performs no filesystem mutations when CAS is stale", async () => {
+    const dataDir = await tempDataDir();
+    const masterKeyPath = path.join(dataDir, "master.key");
+    const credentialsPath = path.join(dataDir, "credentials.enc");
+    const seedStore = new CredentialStore(dataDir, immediateLease);
+    await seedStore.replace(record(1));
+    await chmod(masterKeyPath, 0o400);
+    const modeBefore = await octalMode(masterKeyPath);
+    const ciphertextBefore = await readFile(credentialsPath);
+    const mutations: string[] = [];
+    const observingAdapter: Partial<CredentialFileAdapter> = {
+      async chmod(target: string, mode: number) {
+        mutations.push(`chmod:${target}:${mode}`);
+        await chmod(target, mode);
+      },
+      async link(existingPath: string, newPath: string) {
+        mutations.push(`link:${existingPath}:${newPath}`);
+        await link(existingPath, newPath);
+      },
+      async mkdir(directory: string, options: { recursive: true; mode: number }) {
+        mutations.push(`mkdir:${directory}`);
+        await mkdir(directory, options);
+      },
+      async open(target: string, flags: string, mode?: number) {
+        mutations.push(`open:${target}:${flags}`);
+        return open(target, flags, mode);
+      },
+      async rename(source: string, destination: string) {
+        mutations.push(`rename:${source}:${destination}`);
+        await rename(source, destination);
+      },
+      async unlink(target: string) {
+        mutations.push(`unlink:${target}`);
+        await unlink(target);
+      },
+      async syncDirectory(directory: string) {
+        mutations.push(`sync:${directory}`);
+      },
+    };
+    const store = new CredentialStore(dataDir, immediateLease, observingAdapter);
+
+    await expect(store.replaceIfVersion(99, record(2))).resolves.toBe(false);
+
+    expect(mutations).toEqual([]);
+    expect(await octalMode(masterKeyPath)).toBe(modeBefore);
+    expect(await readFile(credentialsPath)).toEqual(ciphertextBefore);
   });
 
   it("clears configured credentials without deleting the master key", async () => {
@@ -127,11 +259,13 @@ describe("CredentialStore", () => {
     };
     const store = new CredentialStore(dataDir, deniedLease);
 
-    await expect(store.read()).rejects.toThrow("credential lease denied");
-    await expect(store.replace(record(1))).rejects.toThrow("credential lease denied");
-    await expect(store.replaceIfVersion(1, record(2))).rejects.toThrow(
-      "credential lease denied",
+    await expect(store.read()).rejects.toThrow("credential store read failed");
+    await expect(store.replace(record(1))).rejects.toThrow(
+      "credential store write failed",
     );
-    await expect(store.clear()).rejects.toThrow("credential lease denied");
+    await expect(store.replaceIfVersion(1, record(2))).rejects.toThrow(
+      "credential store write failed",
+    );
+    await expect(store.clear()).rejects.toThrow("credential store clear failed");
   });
 });
