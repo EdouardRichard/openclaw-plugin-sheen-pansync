@@ -293,6 +293,20 @@ describe("CredentialStore", () => {
     await expect(freshStore.read()).resolves.toEqual(initial);
   });
 
+  it("reads the intact canonical record when a marker survives without a backup", async () => {
+    const dataDir = await tempDataDir();
+    const backupPath = path.join(dataDir, "credentials.enc.bak");
+    const transactionPath = path.join(dataDir, "credentials.txn");
+    const store = new CredentialStore(dataDir, immediateLease);
+    const initial = record(1);
+    await store.replace(initial);
+    await expect(readFile(backupPath)).rejects.toMatchObject({ code: "ENOENT" });
+    await writeFile(transactionPath, "rollback-v1\n", { mode: 0o600 });
+    const freshStore = new CredentialStore(dataDir, immediateLease);
+
+    await expect(freshStore.read()).resolves.toEqual(initial);
+  });
+
   it("performs no filesystem mutations when CAS is stale", async () => {
     const dataDir = await tempDataDir();
     const masterKeyPath = path.join(dataDir, "master.key");

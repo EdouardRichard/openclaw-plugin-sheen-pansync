@@ -150,17 +150,22 @@ export class CredentialStore {
   }
 
   async #readUnlocked(): Promise<CredentialRecord | undefined> {
-    const credentialsPath = await this.#hasPendingTransaction()
-      ? this.#backupPath
-      : this.#credentialsPath;
-    let serialized: string;
-    try {
-      serialized = await this.#files.readText(credentialsPath);
-    } catch (error) {
-      if (hasErrorCode(error, "ENOENT")) {
-        return undefined;
+    const credentialPaths = await this.#hasPendingTransaction()
+      ? [this.#backupPath, this.#credentialsPath]
+      : [this.#credentialsPath];
+    let serialized: string | undefined;
+    for (const credentialsPath of credentialPaths) {
+      try {
+        serialized = await this.#files.readText(credentialsPath);
+        break;
+      } catch (error) {
+        if (!hasErrorCode(error, "ENOENT")) {
+          throw error;
+        }
       }
-      throw error;
+    }
+    if (serialized === undefined) {
+      return undefined;
     }
 
     let envelope: EncryptedEnvelopeV1;
