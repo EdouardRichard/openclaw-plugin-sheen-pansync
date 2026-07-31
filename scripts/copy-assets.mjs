@@ -1,14 +1,9 @@
-import { access, cp, mkdir } from "node:fs/promises";
+import { access } from "node:fs/promises";
 
-const assets = ["ui", "skills"];
+const requiredAssets = [
+  "ui/setup.html",
+  "ui/setup.js",
+  "ui/setup.css",
+];
 
-for (const asset of assets) {
-  try {
-    await access(asset);
-  } catch {
-    continue;
-  }
-
-  await mkdir(`dist/${asset}`, { recursive: true });
-  await cp(asset, `dist/${asset}`, { recursive: true });
-}
+await Promise.all(requiredAssets.map((asset) => access(asset)));

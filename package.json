@@ -43,7 +43,10 @@
   "scripts": {
     "build": "node scripts/clean-dist.mjs && tsc -p tsconfig.build.json && node scripts/copy-assets.mjs",
     "test": "vitest",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration",
+    "test:leakage": "vitest run tests/integration/leakage.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "verify": "npm run typecheck && npm test -- --run && npm run build && npm pack --dry-run"
+    "verify": "npm run typecheck && npm run test:unit && npm run test:integration && npm run build && npm pack --dry-run"
   }
 }
