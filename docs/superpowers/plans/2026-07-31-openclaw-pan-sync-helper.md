@@ -1430,18 +1430,139 @@ git add package.json package-lock.json scripts/copy-assets.mjs tests/integration
 git commit -m "test: add package and secret leakage gates"
 ```
 
-## Task 13: Perform OpenClaw smoke testing and real-account acceptance
+## Task 13: Repair CLI metadata loading, then perform OpenClaw acceptance
 
 **Files:**
 
+- Create: `cli-metadata.js`
+- Create: `src/runtime-composition.ts`
+- Create: `src/cli-entry.ts`
+- Modify: `src/index.ts`
+- Modify: `src/admin/cli.ts`
+- Modify: `package.json`
+- Modify: `tests/integration/admin-cli.test.ts`
+- Modify: `tests/integration/package.test.ts`
 - Modify: `README.md`
 - Create: `docs/verification/2026-07-31-v0.1.0.md`
 
-- [ ] **Step 1: Install the packed plugin into an isolated OpenClaw test state**
+**Interfaces:**
 
-Use the exact tarball from Task 12 and a fresh temporary OpenClaw state directory. Record the OpenClaw and Node versions in the verification note; do not record tokens, paths outside the temporary state, QR data, or raw logs.
+- `createPanSyncRuntime(options: { stateDir: string; pluginConfig: unknown;
+  credentialLeaseFactory?: (databasePath: string) => CredentialLeaseRunner })`
+  returns the single shared Store/Token/Provider/Registry/Orchestrator composition used by
+  both the full plugin and CLI entry.
+- `registerPanSyncConfigureCommand(program, dependencies, options?)` attaches
+  `pan-sync configure` to a Commander-compatible program and never resolves OpenClaw state.
+- `registerPanSyncCli(program, options: { pluginConfig: unknown; pluginRoot: string })`
+  resolves state with `openclaw/plugin-sdk/state-paths`, creates the shared runtime, and
+  attaches the configuration command.
+- Root `cli-metadata.js` registers only the `pan-sync` descriptor and lazily imports
+  `./dist/cli-entry.js` from its registrar; it must not import the full plugin entry.
 
-- [ ] **Step 2: Verify plugin discovery without credentials**
+- [ ] **Step 1: Write failing CLI metadata and package tests**
+
+Update `tests/integration/admin-cli.test.ts` so its fake API has no `runtime.state` and the
+command receives a prepared `dataDir`. Assert command registration and launch never read a
+runtime state facade.
+
+Update `tests/integration/package.test.ts` to require `cli-metadata.js` and
+`dist/cli-entry.js`. Add an installed-package regression that:
+
+1. runs `npm pack --json --pack-destination <unique-temp-dir>` after the existing build;
+2. installs that exact tarball into a fresh `OPENCLAW_STATE_DIR` with the official OpenClaw
+   `plugins install` command;
+3. spawns the official `openclaw --no-color pan-sync configure` command;
+4. waits until stdout contains the sanitized readiness marker `Remote URL:`;
+5. asserts the process did not report `cli-metadata` registration failure or `Unknown command`;
+6. sends `SIGTERM`, waits for exit, and force-terminates only that exact child if the graceful
+   deadline expires; and
+7. deletes only its unique temporary directory in `finally`.
+
+The test may hold raw child output only in memory. Failure diagnostics must redact URL
+fragments and must never print credentials, dynamic ports, or absolute state paths.
+
+- [ ] **Step 2: Run the focused tests and confirm RED**
+
+Run:
+
+```powershell
+volta run --node 22.23.1 npm test -- --run tests/integration/admin-cli.test.ts tests/integration/package.test.ts
+```
+
+Expected: FAIL because there is no root `cli-metadata.js`, `dist/cli-entry.js`, or
+runtime-independent command registrar, and the official packed command is not recognized.
+
+- [ ] **Step 3: Add the lightweight metadata entry and shared runtime composition**
+
+Create root `cli-metadata.js` with a `definePluginEntry` registration whose only side effect
+is `api.registerCli(...)`. The registrar must dynamically import `./dist/cli-entry.js` only
+when OpenClaw invokes it, pass `api.pluginConfig` and `api.rootDir`, and publish this exact
+descriptor:
+
+```js
+{
+  name: "pan-sync",
+  description: "Configure Pan Sync Helper",
+  hasSubcommands: true,
+}
+```
+
+Create `src/runtime-composition.ts` and move the existing construction of Credential Store,
+SQLite Worker lease, Token Manager, Aliyun client/provider, Provider Registry, and Upload
+Orchestrator out of `src/index.ts`. The caller supplies the already resolved state root; the
+function derives `<stateDir>/pan-sync-helper` and the lease database beneath it.
+
+Create `src/cli-entry.ts`. It imports `resolveStateDir` only from
+`openclaw/plugin-sdk/state-paths`, constructs the shared runtime with
+`options.pluginConfig`, uses `options.pluginRoot/ui` for setup assets, and calls
+`registerPanSyncConfigureCommand`.
+
+Refactor `src/admin/cli.ts` so `registerPanSyncConfigureCommand` accepts the program and
+already prepared `SetupServerDependencies`. Keep a small full-runtime `registerCli` adapter
+only if `src/index.ts` still needs it. Neither command attachment nor action execution may
+dereference `api.runtime.state`.
+
+Update `src/index.ts` to use `createPanSyncRuntime` for full registration and update
+`package.json.files` so the exact root `cli-metadata.js` is published.
+
+- [ ] **Step 4: Run focused tests and confirm GREEN**
+
+Run:
+
+```powershell
+volta run --node 22.23.1 npm test -- --run tests/integration/admin-cli.test.ts tests/integration/package.test.ts
+```
+
+Expected: PASS, including the actual packed-install invocation of the official
+`openclaw pan-sync configure` command.
+
+- [ ] **Step 5: Run the complete automated gate**
+
+Run:
+
+```powershell
+volta run --node 22.23.1 npm run verify
+```
+
+Expected: typecheck, unit tests, integration tests, build, and package dry run all PASS. The
+package inspection must include root `cli-metadata.js` and exclude `src/`, `tests/`,
+`node_modules/`, `.superpowers/`, state files, keys, and credentials.
+
+- [ ] **Step 6: Commit the CLI metadata repair**
+
+```bash
+git add cli-metadata.js src/runtime-composition.ts src/cli-entry.ts src/index.ts src/admin/cli.ts package.json tests/integration/admin-cli.test.ts tests/integration/package.test.ts
+git commit -m "fix: support openclaw cli metadata loading"
+```
+
+- [ ] **Step 7: Install the repaired packed plugin into an isolated OpenClaw test state**
+
+Create a new exact tarball from the reviewed repair commit and a fresh temporary OpenClaw
+state directory. Do not reuse the pre-fix Task 12 artifact as acceptance evidence. Record the
+artifact SHA-256, OpenClaw version, and Node version in the verification note; do not record
+tokens, URL fragments, dynamic ports, paths outside the temporary state, or raw logs.
+
+- [ ] **Step 8: Verify plugin discovery without credentials**
 
 Confirm:
 
@@ -1451,9 +1572,12 @@ Confirm:
 - Control UI shows the status tab only to an `operator.write` session;
 - Tool returns `CREDENTIALS_REQUIRED` with safe setup guidance.
 
-- [ ] **Step 3: Verify the loopback configuration flow**
+- [ ] **Step 9: Verify the official loopback configuration flow**
 
-Run `openclaw pan-sync configure`, establish the printed SSH tunnel, open the page, and verify:
+Run the official installed `openclaw pan-sync configure`. If a remote Linux host is
+available, establish the printed SSH tunnel; otherwise record the remote-tunnel criterion as
+`NOT RUN` and exercise the actual loopback page locally without substituting a handler harness.
+Verify:
 
 - the server listens only on `127.0.0.1`;
 - the fragment disappears from the address bar;
@@ -1462,7 +1586,7 @@ Run `openclaw pan-sync configure`, establish the printed SSH tunnel, open the pa
 - server closes after save/clear completion or ten-minute timeout;
 - file modes are `0700/0600/0600`.
 
-- [ ] **Step 4: Run the dedicated real-account matrix**
+- [ ] **Step 10: Run the dedicated real-account matrix**
 
 With a dedicated Aliyun test application and account:
 
@@ -1477,7 +1601,7 @@ With a dedicated Aliyun test application and account:
 9. Confirm Chinese and English trigger phrases.
 10. Inspect sanitized logs and conversation output for credential/path leakage.
 
-- [ ] **Step 5: Record evidence with separate gate statuses**
+- [ ] **Step 11: Record evidence with separate gate statuses**
 
 The verification note must contain:
 
@@ -1491,7 +1615,7 @@ Release decision: READY/BLOCKED
 
 If the real-account gate is not run, use `NOT RUN` and keep the release decision `BLOCKED`.
 
-- [ ] **Step 6: Run final diff and repository checks**
+- [ ] **Step 12: Run final diff and repository checks**
 
 Run:
 
@@ -1503,7 +1627,7 @@ npm run verify
 
 Expected: no unexpected files, no whitespace errors, all automated checks pass.
 
-- [ ] **Step 7: Commit the verified documentation**
+- [ ] **Step 13: Commit the verified documentation**
 
 ```bash
 git add README.md docs/verification/2026-07-31-v0.1.0.md
