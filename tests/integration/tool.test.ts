@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -18,9 +18,14 @@ type CapturedTool = ReturnType<ToolRegistration>;
 
 const require = createRequire(import.meta.url);
 
+function resolveOpenClawCliEntry(
+  resolveModule: (specifier: string) => string = require.resolve,
+) {
+  return resolveModule("openclaw/cli-entry");
+}
+
 function runOpenClaw(args: readonly string[], stateDir: string) {
-  const packageRoot = dirname(dirname(require.resolve("openclaw")));
-  const cliPath = join(packageRoot, "openclaw.mjs");
+  const cliPath = resolveOpenClawCliEntry();
   const nodeMajor = Number.parseInt(process.versions.node.split(".")[0] ?? "0", 10);
   const supportedCurrentNode =
     nodeMajor > 22 ||
@@ -253,6 +258,20 @@ describe("pan_sync_upload Tool", () => {
 });
 
 describe("OpenClaw manifest ownership", () => {
+  it("resolves the CLI only through the public openclaw/cli-entry export", () => {
+    const requestedSpecifiers: string[] = [];
+    const cliEntry = resolveOpenClawCliEntry((specifier) => {
+      requestedSpecifiers.push(specifier);
+      if (specifier !== "openclaw/cli-entry") {
+        throw new Error(`unexpected private resolution: ${specifier}`);
+      }
+      return "C:\\public-export\\openclaw-cli.mjs";
+    });
+
+    expect(cliEntry).toBe("C:\\public-export\\openclaw-cli.mjs");
+    expect(requestedSpecifiers).toEqual(["openclaw/cli-entry"]);
+  });
+
   it(
     "loads the declared pan_sync_upload contract through the installed OpenClaw registry",
     async () => {
