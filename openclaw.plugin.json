@@ -3,6 +3,9 @@
   "name": "Pan Sync Helper",
   "description": "Upload OpenClaw workspace files to a configured cloud drive",
   "version": "0.1.0",
+  "contracts": {
+    "tools": ["pan_sync_upload"]
+  },
   "skills": ["skills/pan-sync-upload"],
   "configSchema": {
     "type": "object",

@@ -1,4 +1,9 @@
-import { readFile } from "node:fs/promises";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { Value } from "typebox/value";
 import { describe, expect, it, vi } from "vitest";
 import type { PanSyncUploadResult } from "../../src/contracts.js";
 import { PanSyncError } from "../../src/errors.js";
@@ -10,6 +15,37 @@ import type { UploadOrchestrator } from "../../src/upload/orchestrator.js";
 
 type ToolRegistration = Parameters<PanSyncUploadToolApi["registerTool"]>[0];
 type CapturedTool = ReturnType<ToolRegistration>;
+
+const require = createRequire(import.meta.url);
+
+function runOpenClaw(args: readonly string[], stateDir: string) {
+  const packageRoot = dirname(dirname(require.resolve("openclaw")));
+  const cliPath = join(packageRoot, "openclaw.mjs");
+  const nodeMajor = Number.parseInt(process.versions.node.split(".")[0] ?? "0", 10);
+  const supportedCurrentNode =
+    nodeMajor > 22 ||
+    (nodeMajor === 22 && Number.parseInt(process.versions.node.split(".")[1] ?? "0", 10) >= 22);
+  const command = supportedCurrentNode ? process.execPath : "volta";
+  const commandArgs = supportedCurrentNode
+    ? [cliPath, ...args]
+    : ["run", "--node", "22.23.1", "node", cliPath, ...args];
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    NODE_ENV: "production",
+    NO_COLOR: "1",
+    OPENCLAW_STATE_DIR: stateDir,
+  };
+  delete env.VITEST;
+  delete env.VITEST_POOL_ID;
+  delete env.VITEST_WORKER_ID;
+
+  return spawnSync(command, commandArgs, {
+    cwd: process.cwd(),
+    env,
+    encoding: "utf8",
+    timeout: 45_000,
+  });
+}
 
 function captureTool(
   orchestrator: Pick<UploadOrchestrator, "upload">,
@@ -56,6 +92,41 @@ describe("pan_sync_upload Tool", () => {
     });
   });
 
+  it("enforces schema bounds and rejects undeclared input properties", () => {
+    const tool = captureTool({
+      upload: vi.fn(async () => {
+        throw new Error("not executed");
+      }),
+    });
+
+    expect(Value.Check(tool.parameters, { paths: ["report.pdf"] })).toBe(true);
+    expect(Value.Check(tool.parameters, { paths: [] })).toBe(false);
+    expect(
+      Value.Check(tool.parameters, {
+        paths: Array.from({ length: 101 }, () => "report.pdf"),
+      }),
+    ).toBe(false);
+    expect(Value.Check(tool.parameters, { paths: [""] })).toBe(false);
+    expect(
+      Value.Check(tool.parameters, {
+        paths: ["report.pdf"],
+        provider: "other",
+      }),
+    ).toBe(false);
+    expect(
+      Value.Check(tool.parameters, {
+        paths: ["report.pdf"],
+        remoteDirectory: "",
+      }),
+    ).toBe(false);
+    expect(
+      Value.Check(tool.parameters, {
+        paths: ["report.pdf"],
+        workspaceDir: "C:\\forged",
+      }),
+    ).toBe(false);
+  });
+
   it("uses only the factory workspace context and returns the safe result as OpenClaw JSON", async () => {
     const workspaceDir = "C:\\private\\openclaw\\workspace";
     const safeResult: PanSyncUploadResult = {
@@ -71,12 +142,25 @@ describe("pan_sync_upload Tool", () => {
         },
       ],
     };
+    const runtimeResult = {
+      ...safeResult,
+      accessToken: "access-token-CANARY",
+      credentials: { refreshToken: "refresh-token-CANARY" },
+      workspaceDir,
+      files: safeResult.files.map((file) => ({
+        ...file,
+        runtime: {
+          accessToken: "access-token-CANARY",
+          workspacePath: workspaceDir,
+        },
+      })),
+    } as unknown as PanSyncUploadResult;
     let receivedInput: unknown;
     const tool = captureTool(
       {
         upload: vi.fn(async (input) => {
           receivedInput = input;
-          return safeResult;
+          return runtimeResult;
         }),
       },
       workspaceDir,
@@ -166,6 +250,94 @@ describe("pan_sync_upload Tool", () => {
     expect(uploadCalled).toBe(false);
     expect(result.details).toEqual({ code: "WORKSPACE_PATH_REJECTED" });
   });
+});
+
+describe("OpenClaw manifest ownership", () => {
+  it(
+    "loads the declared pan_sync_upload contract through the installed OpenClaw registry",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "pan-sync-tool-manifest-"));
+      const pluginDir = join(root, "plugin");
+      const stateDir = join(root, "state");
+      await mkdir(pluginDir);
+      await mkdir(stateDir);
+
+      try {
+        const manifest = await readFile(
+          new URL("../../openclaw.plugin.json", import.meta.url),
+          "utf8",
+        );
+        await writeFile(
+          join(pluginDir, "package.json"),
+          JSON.stringify(
+            {
+              name: "openclaw-pan-sync-helper",
+              version: "0.1.0",
+              type: "module",
+              openclaw: { extensions: ["./index.js"] },
+            },
+            null,
+            2,
+          ),
+          "utf8",
+        );
+        await writeFile(join(pluginDir, "openclaw.plugin.json"), manifest, "utf8");
+        await writeFile(
+          join(pluginDir, "index.js"),
+          `export default {
+  id: "pan-sync-helper",
+  name: "Pan Sync Helper",
+  register(api) {
+    api.registerTool(
+      () => ({
+        name: "pan_sync_upload",
+        label: "Pan Sync Upload",
+        description: "Manifest ownership probe",
+        parameters: { type: "object", properties: {}, additionalProperties: false },
+        async execute() { return { content: [], details: {} }; },
+      }),
+      { name: "pan_sync_upload" },
+    );
+  },
+};
+`,
+          "utf8",
+        );
+
+        const install = runOpenClaw(["plugins", "install", "-l", pluginDir], stateDir);
+        expect(install.error).toBeUndefined();
+        expect(install.status, install.stderr).toBe(0);
+
+        const inspect = runOpenClaw(
+          ["plugins", "inspect", "pan-sync-helper", "--runtime", "--json"],
+          stateDir,
+        );
+        expect(inspect.error).toBeUndefined();
+        expect(inspect.status, inspect.stderr).toBe(0);
+        expect(
+          inspect.stdout.trim(),
+          JSON.stringify({ stderr: inspect.stderr, status: inspect.status }),
+        ).not.toBe("");
+        const result = JSON.parse(inspect.stdout) as {
+          tools?: Array<{ names?: string[] }>;
+          diagnostics?: Array<{ message?: string }>;
+          plugin?: { toolNames?: string[] };
+        };
+        expect(
+          result.diagnostics?.filter(({ message }) =>
+            message?.includes("contracts.tools"),
+          ),
+        ).toEqual([]);
+        expect(result.plugin?.toolNames).toContain("pan_sync_upload");
+        expect(result.tools?.flatMap(({ names }) => names ?? [])).toContain(
+          "pan_sync_upload",
+        );
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
 });
 
 describe("pan-sync-upload Skill discovery contract", () => {

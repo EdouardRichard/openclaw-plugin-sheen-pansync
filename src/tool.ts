@@ -1,7 +1,9 @@
 import { jsonResult } from "openclaw/plugin-sdk/tool-results";
 import { Type, type Static } from "typebox";
+import type { FileUploadResult, PanSyncUploadResult } from "./contracts.js";
 import { safeErrorDetails } from "./errors.js";
 import type { UploadOrchestrator } from "./upload/orchestrator.js";
+import { normalizeRemoteDirectory } from "./workspace/path-guard.js";
 
 const PanSyncUploadSchema = Type.Object(
   {
@@ -20,6 +22,31 @@ type PanSyncUploadParameters = Static<typeof PanSyncUploadSchema>;
 type PanSyncUploadToolContext = {
   workspaceDir?: string;
 };
+
+function projectSafeFileResult(file: FileUploadResult): FileUploadResult {
+  return {
+    inputName: file.inputName,
+    ...(file.remoteName !== undefined
+      ? { remoteName: file.remoteName }
+      : {}),
+    ...(file.size !== undefined ? { size: file.size } : {}),
+    status: file.status,
+    ...(file.errorCode !== undefined
+      ? { errorCode: file.errorCode }
+      : {}),
+  };
+}
+
+function projectSafeUploadResult(
+  result: PanSyncUploadResult,
+): PanSyncUploadResult {
+  return {
+    provider: result.provider,
+    remoteDirectory: normalizeRemoteDirectory(result.remoteDirectory),
+    status: result.status,
+    files: result.files.map(projectSafeFileResult),
+  };
+}
 
 function createPanSyncUploadTool(
   context: PanSyncUploadToolContext,
@@ -40,10 +67,12 @@ function createPanSyncUploadTool(
 
       try {
         return jsonResult(
-          await orchestrator.upload({
-            ...params,
-            workspaceDir: context.workspaceDir,
-          }),
+          projectSafeUploadResult(
+            await orchestrator.upload({
+              ...params,
+              workspaceDir: context.workspaceDir,
+            }),
+          ),
         );
       } catch (error) {
         return jsonResult(safeErrorDetails(error));
