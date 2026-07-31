@@ -7,7 +7,11 @@ import type {
 } from "../contracts.js";
 import type { PluginConfig } from "../config.js";
 import type { TokenManager } from "../credentials/token-manager.js";
-import { PanSyncError, safeErrorDetails } from "../errors.js";
+import {
+  PanSyncError,
+  safeErrorDetails,
+  type PanSyncErrorCode,
+} from "../errors.js";
 import type { ProviderRegistry } from "../provider-registry.js";
 import {
   isSameWorkspaceFile,
@@ -50,12 +54,55 @@ function stableError(error: unknown): PanSyncError {
   return new PanSyncError("UPLOAD_FAILED");
 }
 
+const CONTROL_CHARACTER = /\p{Cc}/u;
+const WINDOWS_DRIVE_PATH = /^[A-Za-z]:/u;
+
 function safeFailedInputName(input: string): string {
-  const basename = path.posix.basename(input.replaceAll("\\", "/"));
-  return basename === "" || basename === "." || basename === "/"
-    ? "invalid-path"
-    : basename;
+  const normalizedSeparators = input.replaceAll("\\", "/");
+  const segments = normalizedSeparators.split("/");
+  const basename = path.posix.basename(normalizedSeparators);
+  if (
+    input.trim().length === 0
+    || CONTROL_CHARACTER.test(input)
+    || path.posix.isAbsolute(normalizedSeparators)
+    || WINDOWS_DRIVE_PATH.test(normalizedSeparators)
+    || segments.some((segment) => segment === "." || segment === "..")
+    || basename.trim().length === 0
+    || basename === "."
+    || basename === ".."
+  ) {
+    return "invalid-path";
+  }
+  return basename;
 }
+
+const GLOBAL_UPLOAD_ERROR_CODES: ReadonlySet<PanSyncErrorCode> = new Set([
+  "CREDENTIALS_REQUIRED",
+  "CREDENTIALS_INVALID",
+  "REFRESH_TOKEN_REJECTED",
+  "AUTHORIZATION_REVOKED",
+  "TOKEN_ENDPOINT_UNAVAILABLE",
+  "RATE_LIMITED",
+]);
+
+function isGlobalUploadError(error: unknown): error is PanSyncError {
+  return (
+    error instanceof PanSyncError
+    && GLOBAL_UPLOAD_ERROR_CODES.has(error.code)
+  );
+}
+
+type PreparedUpload = {
+  kind: "upload";
+  file: ResolvedWorkspaceFile;
+};
+
+type PreparedFailure = {
+  kind: "failure";
+  result: FileUploadResult;
+};
+
+type PreparedEntry = PreparedUpload | PreparedFailure;
 
 function aggregateStatus(
   files: readonly FileUploadResult[],
@@ -99,7 +146,52 @@ export class UploadOrchestrator {
     );
 
     const distinctFiles: ResolvedWorkspaceFile[] = [];
-    const files: FileUploadResult[] = [];
+    try {
+      const prepared = await this.#prepareFiles(input, distinctFiles);
+      const files: FileUploadResult[] = [];
+      for (const entry of prepared) {
+        if (entry.kind === "failure") {
+          files.push(entry.result);
+          continue;
+        }
+
+        try {
+          files.push(
+            await this.#uploadFile(
+              provider,
+              accessToken,
+              directory,
+              entry.file,
+            ),
+          );
+        } catch (error) {
+          if (isGlobalUploadError(error)) {
+            throw error;
+          }
+          files.push({
+            inputName: entry.file.inputName,
+            status: "failed",
+            errorCode: safeErrorDetails(error).code,
+          });
+        }
+      }
+
+      return {
+        provider: provider.id,
+        remoteDirectory,
+        status: aggregateStatus(files),
+        files,
+      };
+    } finally {
+      await this.#closeFiles(distinctFiles);
+    }
+  }
+
+  async #prepareFiles(
+    input: UploadRequest,
+    distinctFiles: ResolvedWorkspaceFile[],
+  ): Promise<PreparedEntry[]> {
+    const prepared: PreparedEntry[] = [];
     for (const requestedPath of input.paths) {
       let file: ResolvedWorkspaceFile;
       try {
@@ -108,10 +200,13 @@ export class UploadOrchestrator {
           requestedPath,
         );
       } catch (error) {
-        files.push({
-          inputName: safeFailedInputName(requestedPath),
-          status: "failed",
-          errorCode: safeErrorDetails(error).code,
+        prepared.push({
+          kind: "failure",
+          result: {
+            inputName: safeFailedInputName(requestedPath),
+            status: "failed",
+            errorCode: safeErrorDetails(error).code,
+          },
         });
         continue;
       }
@@ -122,29 +217,32 @@ export class UploadOrchestrator {
             this.#pathGuard.isSameWorkspaceFile(candidate, file)
           )
         ) {
+          await file.handle.close().catch(() => undefined);
           continue;
         }
-        distinctFiles.push(file);
-        files.push(
-          await this.#uploadFile(provider, accessToken, directory, file),
-        );
       } catch (error) {
-        files.push({
-          inputName: file.inputName,
-          status: "failed",
-          errorCode: safeErrorDetails(error).code,
-        });
-      } finally {
         await file.handle.close().catch(() => undefined);
+        prepared.push({
+          kind: "failure",
+          result: {
+            inputName: file.inputName,
+            status: "failed",
+            errorCode: safeErrorDetails(error).code,
+          },
+        });
+        continue;
       }
-    }
 
-    return {
-      provider: provider.id,
-      remoteDirectory,
-      status: aggregateStatus(files),
-      files,
-    };
+      distinctFiles.push(file);
+      prepared.push({ kind: "upload", file });
+    }
+    return prepared;
+  }
+
+  async #closeFiles(files: readonly ResolvedWorkspaceFile[]): Promise<void> {
+    for (const file of files) {
+      await file.handle.close().catch(() => undefined);
+    }
   }
 
   async #uploadFile(

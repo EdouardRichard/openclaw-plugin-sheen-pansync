@@ -6,6 +6,7 @@ import type {
   ProviderUploadResult,
   RemoteDirectory,
 } from "../../src/contracts.js";
+import { TokenManager } from "../../src/credentials/token-manager.js";
 import { PanSyncError } from "../../src/errors.js";
 import {
   UploadOrchestrator,
@@ -23,7 +24,17 @@ type HarnessOptions = {
     input: ProviderUploadInput,
     call: number,
   ) => Promise<ProviderUploadResult>;
+  closeFailures?: Readonly<Record<string, unknown>>;
+  tokenManager?: UploadOrchestratorDependencies["tokenManager"];
 };
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
 
 function harness(options: HarnessOptions = {}) {
   const events: string[] = [];
@@ -76,7 +87,7 @@ function harness(options: HarnessOptions = {}) {
         return provider;
       },
     },
-    tokenManager: {
+    tokenManager: options.tokenManager ?? {
       async getValidAccessToken() {
         events.push("token");
         if (options.tokenFailure !== undefined) {
@@ -97,6 +108,10 @@ function harness(options: HarnessOptions = {}) {
         }
         const close = vi.fn(async () => {
           events.push(`close:${input}`);
+          const closeFailure = options.closeFailures?.[input];
+          if (closeFailure !== undefined) {
+            throw closeFailure;
+          }
         });
         const file: ResolvedWorkspaceFile = {
           inputName: input,
@@ -159,10 +174,10 @@ describe("UploadOrchestrator", () => {
       "token",
       "ensure:/openClawShare:access-token",
       "resolve:a.txt",
-      "upload:a.txt",
-      "close:a.txt",
       "resolve:b.txt",
+      "upload:a.txt",
       "upload:b.txt",
+      "close:a.txt",
       "close:b.txt",
     ]);
     expect(opened.map(({ close }) => close.mock.calls.length)).toEqual([1, 1]);
@@ -308,7 +323,176 @@ describe("UploadOrchestrator", () => {
     expect(events.filter((event) => event.startsWith("upload:"))).toEqual([
       "upload:report.txt",
     ]);
+    expect(events.indexOf("close:alias.txt")).toBeLessThan(
+      events.indexOf("upload:report.txt"),
+    );
     expect(opened.map(({ close }) => close.mock.calls.length)).toEqual([1, 1]);
+  });
+
+  it.each([
+    "CREDENTIALS_REQUIRED",
+    "CREDENTIALS_INVALID",
+    "REFRESH_TOKEN_REJECTED",
+    "AUTHORIZATION_REVOKED",
+    "TOKEN_ENDPOINT_UNAVAILABLE",
+    "RATE_LIMITED",
+  ] as const)(
+    "stops remaining uploads and closes every resolved handle on global %s",
+    async (code) => {
+      const { orchestrator, events, opened } = harness({
+        upload: async () => {
+          throw new PanSyncError(code);
+        },
+      });
+
+      await expect(
+        orchestrator.upload({
+          workspaceDir: "workspace",
+          paths: ["a.txt", "b.txt", "c.txt"],
+        }),
+      ).rejects.toMatchObject({ code });
+      expect(events.filter((event) => event.startsWith("upload:"))).toEqual([
+        "upload:a.txt",
+      ]);
+      expect(opened).toHaveLength(3);
+      expect(opened.map(({ close }) => close.mock.calls.length)).toEqual([
+        1,
+        1,
+        1,
+      ]);
+    },
+  );
+
+  it.each(["QUOTA_EXCEEDED", "UPLOAD_FAILED"] as const)(
+    "continues later unique uploads after file-scoped %s",
+    async (code) => {
+      const { orchestrator, events, opened } = harness({
+        upload: async (input, call) => {
+          if (call === 2) {
+            throw new PanSyncError(code);
+          }
+          return {
+            remoteName: input.file.basename,
+            size: input.file.size,
+          };
+        },
+      });
+
+      const result = await orchestrator.upload({
+        workspaceDir: "workspace",
+        paths: ["a.txt", "b.txt", "c.txt"],
+      });
+
+      expect(result.status).toBe("partial");
+      expect(result.files[1]).toEqual({
+        inputName: "b.txt",
+        status: "failed",
+        errorCode: code,
+      });
+      expect(events.filter((event) => event.startsWith("upload:"))).toEqual([
+        "upload:a.txt",
+        "upload:b.txt",
+        "upload:c.txt",
+      ]);
+      expect(opened.every(({ close }) => close.mock.calls.length === 1)).toBe(
+        true,
+      );
+    },
+  );
+
+  it("finishes all resolution before sequential uploads begin", async () => {
+    const resolutionGate = deferred<void>();
+    const uploadGates = new Map([
+      ["a.txt", deferred<void>()],
+      ["b.txt", deferred<void>()],
+    ]);
+    const events: string[] = [];
+    const opened: Array<ReturnType<typeof vi.fn>> = [];
+    const identities = new WeakMap<ResolvedWorkspaceFile, string>();
+    let activeUploads = 0;
+    let maximumActiveUploads = 0;
+
+    const pathGuard: NonNullable<
+      UploadOrchestratorDependencies["pathGuard"]
+    > = {
+      async resolveWorkspaceFile(_workspaceDir, input) {
+        events.push(`resolve-start:${input}`);
+        if (input === "b.txt") {
+          await resolutionGate.promise;
+        }
+        const close = vi.fn(async () => {
+          events.push(`close:${input}`);
+        });
+        const file: ResolvedWorkspaceFile = {
+          inputName: input,
+          basename: input,
+          size: 1,
+          handle: { close } as unknown as FileHandle,
+        };
+        opened.push(close);
+        identities.set(file, input);
+        events.push(`resolved:${input}`);
+        return file;
+      },
+      isSameWorkspaceFile(left, right) {
+        return identities.get(left) === identities.get(right);
+      },
+    };
+    const provider: CloudDriveProvider = {
+      id: "aliyun",
+      aliases: ["aliyun"],
+      async validateCredentials() {
+        throw new Error("not used");
+      },
+      async ensureDirectory(remotePath) {
+        return { id: "directory", path: remotePath, providerState: {} };
+      },
+      async uploadFile(input) {
+        activeUploads += 1;
+        maximumActiveUploads = Math.max(maximumActiveUploads, activeUploads);
+        events.push(`upload:${input.file.inputName}`);
+        await uploadGates.get(input.file.inputName)?.promise;
+        activeUploads -= 1;
+        return {
+          remoteName: input.file.basename,
+          size: input.file.size,
+        };
+      },
+    };
+    const orchestrator = new UploadOrchestrator({
+      providerRegistry: { resolve: () => provider },
+      tokenManager: { getValidAccessToken: async () => "access-token" },
+      config: { defaultDirectory: "/openClawShare" },
+      pathGuard,
+    });
+
+    const resultPromise = orchestrator.upload({
+      workspaceDir: "workspace",
+      paths: ["a.txt", "b.txt"],
+    });
+    await vi.waitFor(() => {
+      expect(events).toContain("resolve-start:b.txt");
+    });
+    expect(events.some((event) => event.startsWith("upload:"))).toBe(false);
+
+    resolutionGate.resolve();
+    await vi.waitFor(() => {
+      expect(events).toContain("upload:a.txt");
+    });
+    expect(events.indexOf("resolved:b.txt")).toBeLessThan(
+      events.indexOf("upload:a.txt"),
+    );
+    expect(events).not.toContain("upload:b.txt");
+    uploadGates.get("a.txt")?.resolve();
+    await vi.waitFor(() => {
+      expect(events).toContain("upload:b.txt");
+    });
+    expect(maximumActiveUploads).toBe(1);
+    uploadGates.get("b.txt")?.resolve();
+
+    await expect(resultPromise).resolves.toMatchObject({ status: "success" });
+    expect(maximumActiveUploads).toBe(1);
+    expect(opened.map((close) => close.mock.calls.length)).toEqual([1, 1]);
   });
 
   it("keeps credentials-required as a global precondition failure", async () => {
@@ -323,6 +507,30 @@ describe("UploadOrchestrator", () => {
       }),
     ).rejects.toMatchObject({ code: "CREDENTIALS_REQUIRED" });
     expect(events).toEqual(["provider:default", "token"]);
+  });
+
+  it("propagates CREDENTIALS_REQUIRED from an actual empty TokenManager vault", async () => {
+    const refreshToken = vi.fn(async () => {
+      throw new Error("refresh must not run without stored credentials");
+    });
+    const tokenManager = new TokenManager(
+      {
+        read: async () => undefined,
+        replaceIfVersion: async () => false,
+      },
+      { refreshToken },
+    );
+    const { orchestrator, events, opened } = harness({ tokenManager });
+
+    await expect(
+      orchestrator.upload({
+        workspaceDir: "workspace",
+        paths: ["a.txt"],
+      }),
+    ).rejects.toMatchObject({ code: "CREDENTIALS_REQUIRED" });
+    expect(refreshToken).not.toHaveBeenCalled();
+    expect(events).toEqual(["provider:default"]);
+    expect(opened).toEqual([]);
   });
 
   it("normalizes an explicit directory before ensuring it exactly once", async () => {
@@ -375,6 +583,55 @@ describe("UploadOrchestrator", () => {
       "ensure:/openClawShare:access-token",
     ]);
     expect(opened).toEqual([]);
+  });
+
+  it.each([
+    "..",
+    ".",
+    "",
+    "/",
+    "../secret.txt",
+    "nested/\u0000secret.txt",
+    "C:\\private-workspace\\secret.txt",
+  ])("uses a neutral failed input name for unsafe path %j", async (input) => {
+    const { orchestrator } = harness({
+      resolutionFailures: {
+        [input]: new PanSyncError("WORKSPACE_PATH_REJECTED"),
+      },
+    });
+
+    const result = await orchestrator.upload({
+      workspaceDir: "D:\\private-workspace",
+      paths: [input],
+    });
+
+    expect(result.files).toEqual([
+      {
+        inputName: "invalid-path",
+        status: "failed",
+        errorCode: "WORKSPACE_PATH_REJECTED",
+      },
+    ]);
+    expect(JSON.stringify(result)).not.toContain("private-workspace");
+    expect(JSON.stringify(result)).not.toContain("\\u0000");
+  });
+
+  it("suppresses native close failures and still attempts every handle once", async () => {
+    const { orchestrator, opened } = harness({
+      closeFailures: {
+        "a.txt": new Error("native close failure at D:\\private-workspace"),
+      },
+    });
+
+    const result = await orchestrator.upload({
+      workspaceDir: "D:\\private-workspace",
+      paths: ["a.txt", "b.txt"],
+    });
+
+    expect(result.status).toBe("success");
+    expect(opened.map(({ close }) => close.mock.calls.length)).toEqual([1, 1]);
+    expect(JSON.stringify(result)).not.toContain("native close failure");
+    expect(JSON.stringify(result)).not.toContain("private-workspace");
   });
 
   it("keeps path failures per-file, closes acquired handles, and aggregates failed", async () => {
