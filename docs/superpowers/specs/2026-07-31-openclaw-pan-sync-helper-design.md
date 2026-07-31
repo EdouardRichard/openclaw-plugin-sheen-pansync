@@ -1,7 +1,7 @@
 # OpenClaw Pan Sync Helper 设计
 
 - 日期：2026-07-31
-- 状态：已完成交互确认，等待书面规格审阅
+- 状态：审核通过
 - 第一版网盘：阿里云盘 OpenAPI
 - 插件形态：OpenClaw 原生 TypeScript ESM 混合能力插件（Tool + Control UI）
 
@@ -32,7 +32,7 @@ OpenClaw 部署在远程 Linux 主机时，生成文件位于远程工作区，�
 - 在 OpenClaw 对话中要求上传已有文件。
 - 在生成结果文件的同一请求中要求自动推送到网盘。
 - 未配置凭证时获得明确的配置引导。
-- 在 Control UI 中录入、验证、查看、替换和清除阿里云盘凭证。
+- 通过插件提供的一次性回环地址配置页录入、验证、查看、替换和清除阿里云盘凭证，并在 Control UI 查看脱敏状态。
 - OpenClaw 重启后继续保持登录。
 
 ### 3.2 工程目标
@@ -82,11 +82,12 @@ OpenClaw 部署在远程 Linux 主机时，生成文件位于远程工作区，�
 
 5. **Credential Vault**
    - 加密保存应用凭证、用户令牌和账号摘要。
-   - 提供原子替换、凭证版本检查和进程内刷新锁。
+   - 提供原子替换、凭证版本检查、进程内刷新锁和 OpenClaw 跨进程 state lease。
 
-6. **Control UI**
-   - 提供凭证配置、连接状态、上传设置和测试上传。
-   - 页面读取与写入均受 OpenClaw Operator 权限控制。
+6. **管理界面**
+   - Control UI 提供脱敏连接状态、上传设置摘要和配置命令指引。
+   - 一次性回环地址配置页提供完整凭证配置、验证、清除和测试上传。
+   - Control UI 可见性受 OpenClaw Operator 权限控制；完整凭证页受本机回环地址、SSH 隧道和一次性访问密钥控制。
 
 数据流：
 
@@ -105,7 +106,7 @@ OpenClaw 部署在远程 Linux 主机时，生成文件位于远程工作区，�
 
 ### 6.1 包结构
 
-插件使用 `definePluginEntry` 注册 Tool、Control UI、HTTP 路由和 Gateway 方法。它不是只能注册工具的 `defineToolPlugin` 纯 Tool Plugin。
+插件使用 `definePluginEntry` 注册 Tool、Control UI、HTTP 路由、CLI 和服务生命周期。它不是只能注册工具的 `defineToolPlugin` 纯 Tool Plugin。第一版不注册凭证写入 Gateway 方法，因为当前外部插件 iframe 没有安全的写调用桥接。
 
 运行要求：
 
@@ -129,7 +130,17 @@ api.session.controls.registerControlUiDescriptor(...)
 api.registerHttpRoute({ auth: "gateway", ... })
 ```
 
-标签页只对具有 `operator.write` 的管理者显示。页面写操作通过插件专属 Gateway 方法执行，避免把 Gateway Bearer Token 放入 URL 或页面 JavaScript。
+标签页只对具有 `operator.write` 的管理者显示。
+
+经对 OpenClaw `2026.7.1-2` 源码契约复核，外部插件标签页运行在沙箱 iframe 中，Gateway 只向该 iframe 发放短期、只读、仅限 `GET/HEAD` 的授权；当前没有把插件专属 `operator.write` Gateway 方法安全桥接给外部 iframe 的公开 SDK。因此本版本不能在该 iframe 中直接保存、完整读取或清除凭证，否则会把凭证写入降级为只读授权、URL Token 或自建弱认证，违背本设计的权限边界。
+
+第一版采用以下兼容方案：
+
+- Control UI 标签页只展示脱敏连接状态、默认目录、配置指引和本机配置命令，不返回完整凭证。
+- 插件提供 `openclaw pan-sync configure` 命令。命令仅监听远程主机 `127.0.0.1`，启动一个有时限的一次性配置页面；远程用户通过 SSH 端口转发访问。
+- 一次性页面访问密钥放在 URL fragment 中，不进入 HTTP 请求、服务端日志或 Referer；前端读取后立即从地址栏移除，并通过专用 Authorization 请求头提交。
+- 完整 `client_secret` 和 `refresh_token` 只在该一次性配置页面中回显。页面保存、验证、清除或超时后停止监听。
+- 后端 Credential Vault、Token Manager 和 Provider 接口与 UI 传输方式解耦。OpenClaw 后续提供受 `operator.write` 保护的外部标签页写桥接后，可以替换为原生 Control UI 配置表单，而不修改凭证格式或上传流程。
 
 插件 HTTP 页面只包含本地静态资源，不加载 CDN、统计脚本、第三方字体、图片或 iframe。
 
@@ -260,7 +271,7 @@ aliases:
 
 刷新规则：
 
-- 同一进程只允许一个刷新请求运行。
+- 同一进程只允许一个刷新请求运行，Gateway 与配置 CLI 的持久化操作通过同一个 OpenClaw state lease 协调。
 - 并发上传等待同一个刷新结果。
 - 使用凭证版本号防止旧请求覆盖新 Token。
 - 新 Refresh Token 成功加密落盘后才更新内存快照。
@@ -329,9 +340,11 @@ Linux 权限：
 
 失败时保留原文件。
 
-## 10. Control UI 设计
+## 10. 管理界面设计
 
 ### 10.1 凭证区
+
+凭证区位于 `openclaw pan-sync configure` 启动的一次性回环地址配置页面，不位于 OpenClaw 外部插件 iframe。Control UI 标签页只显示第 10.3 节的脱敏状态和打开配置页的命令指引。
 
 字段：
 
@@ -343,7 +356,8 @@ Linux 权限：
 
 安全约束：
 
-- 凭证读取和修改均要求 `operator.write`。
+- Control UI 脱敏状态页要求 `operator.write`。
+- 完整凭证页面仅监听 `127.0.0.1`，要求高熵、一次性、有时限的页面访问密钥；远程访问必须使用 SSH 端口转发。
 - 响应包含 `Cache-Control: no-store`。
 - 使用严格 CSP。
 - 使用 `Referrer-Policy: no-referrer`。
@@ -624,7 +638,7 @@ refresh_token
 - 阿里云盘 Provider。
 - `pan_sync_upload` Agent Tool。
 - 随包对话触发 Skill。
-- Control UI 配置页。
+- Control UI 脱敏状态页和一次性回环地址凭证配置页。
 - Credential Vault。
 - 自动刷新和上传编排。
 - 自动化测试。
