@@ -4,7 +4,7 @@
 
 **Goal:** 交付一个可安装的 OpenClaw TypeScript ESM 插件，让 Agent 将当前工作区内的一个或多个普通文件上传到单一阿里云盘账号，并提供安全、可完整回显凭证的一次性配置页面。
 
-**Architecture:** 插件入口只负责装配 Tool、Skill、只读 Control UI、CLI 和服务生命周期。上传业务经过 `UploadOrchestrator -> ProviderRegistry -> AliyunProvider`；凭证由 AES-256-GCM Vault 持久化，并使用 OpenClaw `state.withLease` 协调 Gateway 与 CLI 两个进程。`openclaw pan-sync configure` 仅在 `127.0.0.1` 启动短时配置页，Control UI iframe 不承担敏感写入。
+**Architecture:** 插件入口只负责装配 Tool、Skill、只读 Control UI、CLI 和服务生命周期。上传业务经过 `UploadOrchestrator -> ProviderRegistry -> AliyunProvider`；凭证由 AES-256-GCM Vault 持久化，并使用插件数据目录中的跨进程文件租约协调 Gateway 与 CLI 两个进程。`openclaw pan-sync configure` 仅在 `127.0.0.1` 启动短时配置页，Control UI iframe 不承担敏感写入。
 
 **Tech Stack:** Node.js 22.22.3+、TypeScript ESM、OpenClaw Plugin SDK `>=2026.7.1-2`、`typebox`、原生 `fetch`/`node:http`/`node:crypto`/`node:fs`、Vitest。
 
@@ -514,7 +514,7 @@ export class CredentialStore {
 }
 ```
 
-The plugin entry will adapt `api.runtime.state.withLease` to `CredentialLeaseRunner` with namespace `pan-sync-helper`, database `{ scope: "shared" }`, lease `30_000ms`, wait `15_000ms`.
+The plugin uses a self-owned cross-process filesystem lease under `<dataDir>/locks` because the supported OpenClaw release restricts `state.withLease` to bundled/trusted-official plugins. Lease acquisition must use atomic exclusive creation, owner identity, a 10-second heartbeat, a 30-second stale threshold, and a 15-second acquisition timeout. Stale recovery is allowed only after the heartbeat is stale and the recorded owner PID is no longer alive; an indeterminate/alive PID must never be stolen. Release and important Vault mutation boundaries must verify the owner token. This preserves safe community-plugin installation without relying on privileged runtime state APIs.
 
 - [ ] **Step 6: Implement safe filesystem writes**
 
@@ -1234,7 +1234,7 @@ The entry must:
 
 1. Parse only non-secret config.
 2. Resolve `dataDir = <stateDir>/pan-sync-helper`.
-3. Adapt `api.runtime.state.withLease` for the Vault.
+3. Construct the approved plugin-owned filesystem lease under `<dataDir>/locks` and adapt it to the Vault. Do not call privileged `state.withLease`, `openKeyedStore`, or `openSyncKeyedStore` from this third-party plugin.
 4. Construct one shared store, HTTP client, Token Manager, Aliyun Provider, Provider Registry, and Orchestrator.
 5. Register Tool factory.
 6. Register CLI command `pan-sync configure`.
