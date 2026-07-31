@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Pan Sync Helper configuration</title>
+    <link rel="stylesheet" href="/setup.css">
+    <script src="/setup.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <p class="eyebrow">OpenClaw · Pan Sync Helper</p>
+        <h1>Connect Aliyun Drive</h1>
+        <p class="warning" role="alert">This page shows full credential values. Host administrators, screen sharing, browser extensions, and screenshots can see them.</p>
+      </header>
+
+      <form id="credentials" autocomplete="off">
+        <label for="clientId">Client ID</label>
+        <input id="clientId" name="clientId" type="text" autocomplete="off" spellcheck="false" required>
+
+        <label for="clientSecret">Client Secret</label>
+        <input id="clientSecret" name="clientSecret" type="text" autocomplete="off" spellcheck="false" required>
+
+        <label for="refreshToken">Refresh Token</label>
+        <input id="refreshToken" name="refreshToken" type="text" autocomplete="off" spellcheck="false" required>
+
+        <div class="actions">
+          <button type="submit">Save and verify</button>
+          <button id="revalidate" type="button">Revalidate</button>
+          <button id="testUpload" type="button">Test upload</button>
+          <button id="clearCredentials" class="danger" type="button">Clear credentials</button>
+          <button id="confirmClear" class="danger confirm" type="button" hidden>Confirm: clear credentials</button>
+        </div>
+      </form>
+
+      <section class="notes" aria-label="Configuration notes">
+        <p>Default upload directory: <code id="defaultDirectory">/openClawShare</code></p>
+        <p id="tokenGuide" hidden></p>
+        <p>AList is only one possible tool for obtaining the initial Refresh Token. You must choose custom Client ID and Client Secret credentials, and all three values must belong to the same OAuth application.</p>
+      </section>
+
+      <output id="result" role="status" aria-live="polite"></output>
+    </main>
+  </body>
+</html>
