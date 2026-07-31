@@ -9,6 +9,41 @@ type PackResult = Array<{
 }>;
 
 const temporaryDirectories: string[] = [];
+const allowedUiFiles = new Set([
+  "ui/setup.html",
+  "ui/setup.js",
+  "ui/setup.css",
+]);
+const allowedSkillFiles = new Set([
+  "skills/pan-sync-upload/SKILL.md",
+]);
+
+function normalizePackagePath(entry: string): string {
+  return entry
+    .replaceAll("\\", "/")
+    .split("/")
+    .filter((segment) => segment !== "" && segment !== ".")
+    .join("/");
+}
+
+function packageViolations(paths: readonly string[]): string[] {
+  return paths.flatMap((entry) => {
+    const normalized = normalizePackagePath(entry);
+    const segments = normalized.split("/");
+    const basename = segments.at(-1);
+    const rejected = segments.includes("..")
+      || segments.includes("tests")
+      || segments.includes("plugin-data")
+      || basename === ".env"
+      || basename === "master.key"
+      || basename === "credentials.enc"
+      || normalized.startsWith("dist/ui/")
+      || normalized.startsWith("dist/skills/")
+      || (segments[0] === "ui" && !allowedUiFiles.has(normalized))
+      || (segments[0] === "skills" && !allowedSkillFiles.has(normalized));
+    return rejected ? [normalized] : [];
+  });
+}
 
 function runNpm(args: readonly string[]) {
   const npmCli = process.env.npm_execpath;
@@ -58,18 +93,23 @@ describe("published package", () => {
       expect(paths, `missing package entry: ${entry}`).toContain(entry);
     }
 
-    const forbidden = paths.filter((entry) =>
-      entry === ".env"
-      || entry.startsWith("tests/")
-      || entry.startsWith("plugin-data/")
-      || entry.endsWith("/master.key")
-      || entry === "master.key"
-      || entry.endsWith("/credentials.enc")
-      || entry === "credentials.enc"
-      || entry.startsWith("dist/ui/")
-      || entry.startsWith("dist/skills/")
-    );
-    expect(forbidden).toEqual([]);
+    expect(packageViolations(paths)).toEqual([]);
+  });
+
+  it("rejects nested private state and undeclared static content", () => {
+    const unsafePaths = [
+      "ui\\.env",
+      "skills/plugin-data/state",
+      "dist/tests/helper.js",
+      "dist/cache/master.key",
+      "dist/cache/credentials.enc",
+      "ui/nested/setup.html",
+      "skills/pan-sync-upload/private.txt",
+      "dist/ui/setup.html",
+      "dist/skills/pan-sync-upload/SKILL.md",
+    ];
+
+    expect(packageViolations(unsafePaths)).toHaveLength(unsafePaths.length);
   });
 
   it("fails the asset gate when any required setup asset is absent", async () => {

@@ -4,11 +4,17 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
-import type { OpenClawPluginHttpRouteHandler } from "openclaw/plugin-sdk/plugin-entry";
+import type {
+  OpenClawPluginApi,
+  OpenClawPluginHttpRouteHandler,
+  OpenClawPluginService,
+  OpenClawPluginToolFactory,
+} from "openclaw/plugin-sdk/plugin-entry";
 import { startSetupServer, type SetupServer } from "../../src/admin/setup-server.js";
 import { createPanSyncStatusRoute } from "../../src/admin/status-route.js";
 import { TokenManager, type TokenCredentialVault } from "../../src/credentials/token-manager.js";
 import type { CredentialRecord } from "../../src/credentials/types.js";
+import { createPanSyncPluginEntry } from "../../src/index.js";
 import { ProviderRegistry } from "../../src/provider-registry.js";
 import { AliyunHttpClient } from "../../src/providers/aliyun/http.js";
 import { AliyunProvider } from "../../src/providers/aliyun/provider.js";
@@ -132,14 +138,130 @@ async function setupRequest(
   return fetch(`${baseUrl}${pathname}`, { ...init, headers });
 }
 
-function assertNoProtectedValue(label: string, value: string): void {
-  if (
-    value.includes(CLIENT_SECRET)
-    || value.includes(REFRESH_TOKEN)
-    || value.includes(ACCESS_TOKEN)
-    || value.includes(ABSOLUTE_PATH)
-  ) {
+function containsProtectedValue(values: readonly unknown[]): boolean {
+  const pending = [...values];
+  const seen = new WeakSet<object>();
+  while (pending.length > 0) {
+    const value = pending.pop();
+    if (typeof value === "string") {
+      if (
+        value.includes(CLIENT_SECRET)
+        || value.includes(REFRESH_TOKEN)
+        || value.includes(ACCESS_TOKEN)
+        || value.includes(ABSOLUTE_PATH)
+      ) {
+        return true;
+      }
+      continue;
+    }
+    if (typeof value === "symbol") {
+      pending.push(value.description, Symbol.keyFor(value));
+      continue;
+    }
+    if (
+      (typeof value !== "object" || value === null)
+      && typeof value !== "function"
+    ) {
+      continue;
+    }
+    if (seen.has(value)) continue;
+    seen.add(value);
+
+    if (value instanceof Error) {
+      pending.push(value.name, value.message, value.stack, value.cause);
+    }
+    if (value instanceof Map) {
+      for (const [key, entry] of value) pending.push(key, entry);
+    }
+    if (value instanceof Set) {
+      for (const entry of value) pending.push(entry);
+    }
+
+    let keys: PropertyKey[];
+    try {
+      keys = Reflect.ownKeys(value);
+    } catch {
+      continue;
+    }
+    for (const key of keys) {
+      pending.push(key);
+      try {
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        if (descriptor !== undefined && "value" in descriptor) {
+          pending.push(descriptor.value);
+        }
+      } catch {
+        // Do not invoke or trust accessors while inspecting logger arguments.
+      }
+    }
+  }
+  return false;
+}
+
+function assertNoProtectedArguments(
+  label: string,
+  values: readonly unknown[],
+): void {
+  if (containsProtectedValue(values)) {
     throw new Error(`${label} exposed a protected value`);
+  }
+}
+
+async function exercisePluginLoggerBoundary(
+  stateDir: string,
+  workspaceDir: string,
+  logger: {
+    debug(...values: unknown[]): unknown;
+    info(...values: unknown[]): unknown;
+    warn(...values: unknown[]): unknown;
+    error(...values: unknown[]): unknown;
+  },
+): Promise<void> {
+  let toolFactory: OpenClawPluginToolFactory | undefined;
+  let service: OpenClawPluginService | undefined;
+  const entry = createPanSyncPluginEntry({
+    credentialLeaseFactory: () => async (_key, run) =>
+      run({ assertOwned: async () => undefined }),
+  });
+  const api = {
+    id: "pan-sync-helper",
+    name: "Pan Sync Helper",
+    source: "leakage-gate",
+    registrationMode: "full",
+    pluginConfig: {},
+    logger,
+    runtime: { state: { resolveStateDir: () => stateDir } },
+    registerTool(candidate: OpenClawPluginToolFactory) {
+      toolFactory = candidate;
+    },
+    registerCli() {},
+    registerHttpRoute() {},
+    registerService(candidate: OpenClawPluginService) {
+      service = candidate;
+    },
+    session: {
+      controls: { registerControlUiDescriptor() {} },
+    },
+  } as unknown as OpenClawPluginApi;
+  if (entry.register === undefined) throw new Error("plugin register missing");
+  entry.register(api);
+  if (toolFactory === undefined || service === undefined) {
+    throw new Error("plugin runtime registration missing");
+  }
+
+  const context = { config: {}, stateDir, logger } as never;
+  await service.start(context);
+  try {
+    const tool = toolFactory({ workspaceDir } as never);
+    if (tool === null || tool === undefined || Array.isArray(tool)) {
+      throw new Error("plugin registered an invalid Tool boundary");
+    }
+    const result = await tool.execute("plugin-logger-boundary", {
+      paths: ["report.txt"],
+    });
+    expect(result.details).toEqual({ code: "CREDENTIALS_REQUIRED" });
+  } finally {
+    await service.stop?.(context);
   }
 }
 
@@ -150,6 +272,54 @@ afterEach(async () => {
 });
 
 describe("release leakage canaries", () => {
+  it.each([
+    ["Error message", () => new Error(ACCESS_TOKEN)],
+    ["Error stack", () => {
+      const error = new Error("safe message");
+      error.stack = REFRESH_TOKEN;
+      return error;
+    }],
+    ["Error cause", () => {
+      const error = new Error("safe message", { cause: CLIENT_SECRET });
+      error.stack = "safe stack";
+      return error;
+    }],
+    ["non-enumerable own property", () => {
+      const value = {};
+      Object.defineProperty(value, "hidden", {
+        value: ABSOLUTE_PATH,
+        enumerable: false,
+      });
+      return value;
+    }],
+    ["symbol property", () => {
+      const value: Record<PropertyKey, unknown> = {};
+      value[Symbol("protected logger property")] = CLIENT_SECRET;
+      return value;
+    }],
+    ["symbol description", () => Symbol(REFRESH_TOKEN)],
+    ["nested array and object", () => ({ nested: [{ value: ACCESS_TOKEN }] })],
+    ["cycle", () => {
+      const value: Record<string, unknown> = {
+        nested: { value: ABSOLUTE_PATH },
+      };
+      value.self = value;
+      return value;
+    }],
+  ] as const)("inspects protected values in %s", (_name, createValue) => {
+    expect(() =>
+      assertNoProtectedArguments("host logger arguments", [createValue()])
+    ).toThrow("host logger arguments exposed a protected value");
+  });
+
+  it("handles clean cyclic logger arguments", () => {
+    const value: Record<string, unknown> = { nested: ["safe"] };
+    value.self = value;
+    expect(() =>
+      assertNoProtectedArguments("host logger arguments", [value])
+    ).not.toThrow();
+  });
+
   it("keeps credentials, access tokens, and workspace paths out of failure surfaces", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "pan-sync-leakage-"));
     cleanups.push(() => rm(root, { recursive: true, force: true }));
@@ -269,13 +439,21 @@ describe("release leakage canaries", () => {
       warn: (...values: unknown[]) => loggerCalls.push(values),
       error: (...values: unknown[]) => loggerCalls.push(values),
     };
-    logger.debug(refreshResult.details);
-    logger.warn(uploadResult.details);
+    await exercisePluginLoggerBoundary(
+      path.join(root, "plugin-state"),
+      workspace,
+      logger,
+    );
+    expect(loggerCalls).toEqual([]);
 
-    assertNoProtectedValue("invalid credentials response", invalidOutput);
-    assertNoProtectedValue("refresh failure Tool result", JSON.stringify(refreshResult));
-    assertNoProtectedValue("path and upload Tool result", JSON.stringify(uploadResult));
-    assertNoProtectedValue("status HTML", statusOutput);
-    assertNoProtectedValue("logger calls", JSON.stringify(loggerCalls));
+    assertNoProtectedArguments("invalid credentials response", [invalidOutput]);
+    assertNoProtectedArguments("refresh failure Tool result", [refreshResult]);
+    assertNoProtectedArguments("path and upload Tool result", [uploadResult]);
+    assertNoProtectedArguments("status HTML", [statusOutput]);
+    assertNoProtectedArguments("actual OpenClaw logger calls", loggerCalls);
+    assertNoProtectedArguments(
+      "simulated host logging of projected Tool results",
+      [refreshResult, uploadResult],
+    );
   });
 });
