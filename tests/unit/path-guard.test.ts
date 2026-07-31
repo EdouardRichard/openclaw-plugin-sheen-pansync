@@ -1,15 +1,19 @@
 import { execFile } from "node:child_process";
+import { constants } from "node:fs";
 import {
   mkdir,
   mkdtemp,
+  open,
+  rename,
   rm,
   symlink,
   writeFile,
+  type FileHandle,
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PanSyncError } from "../../src/errors.js";
 import {
   normalizeRemoteDirectory,
@@ -68,11 +72,23 @@ describe("resolveWorkspaceFile", () => {
     const resolved = await resolveWorkspaceFile(workspace, "report.pdf");
 
     try {
-      expect(resolved).toMatchObject({
+      expect(Object.keys(resolved).sort()).toEqual([
+        "basename",
+        "handle",
+        "inputName",
+        "size",
+      ]);
+      expect(resolved).toEqual({
         inputName: "report.pdf",
         basename: "report.pdf",
         size: 15,
+        handle: resolved.handle,
       });
+      expect(
+        Object.values(resolved).filter(
+          (value): value is string => typeof value === "string",
+        ),
+      ).not.toContain(expect.stringContaining(workspace));
       await expect(resolved.handle.readFile("utf8")).resolves.toBe(
         "report contents",
       );
@@ -161,17 +177,137 @@ describe("resolveWorkspaceFile", () => {
     });
   });
 
+  it("rejects when an ancestor redirects the open outside the workspace", async () => {
+    const nestedDirectory = path.join(workspace, "nested");
+    const movedDirectory = path.join(workspace, "nested-original");
+    const outsideDirectory = path.join(fixtureRoot, "outside-tree");
+    const candidate = path.join(nestedDirectory, "notes.txt");
+    await mkdir(outsideDirectory);
+    await writeFile(
+      path.join(outsideDirectory, "notes.txt"),
+      "outside replacement",
+    );
+
+    vi.resetModules();
+    vi.doMock("node:fs/promises", async () => {
+      const actual =
+        await vi.importActual<typeof import("node:fs/promises")>(
+          "node:fs/promises",
+        );
+      return {
+        ...actual,
+        async open(target: string, flags: number) {
+          if (path.resolve(target) === path.resolve(candidate)) {
+            await rename(nestedDirectory, movedDirectory);
+            await symlink(
+              outsideDirectory,
+              nestedDirectory,
+              process.platform === "win32" ? "junction" : "dir",
+            );
+          }
+          return actual.open(target, flags);
+        },
+      };
+    });
+
+    let resolved:
+      | Awaited<ReturnType<typeof resolveWorkspaceFile>>
+      | undefined;
+    let rejected: unknown;
+    try {
+      const racedPathGuard = await import("../../src/workspace/path-guard.js");
+      resolved = await racedPathGuard.resolveWorkspaceFile(
+        workspace,
+        path.join("nested", "notes.txt"),
+      );
+    } catch (error) {
+      rejected = error;
+    } finally {
+      await resolved?.handle.close();
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
+    }
+
+    expect(rejected).toBeInstanceOf(Error);
+    expect(rejected).toMatchObject({ code: "WORKSPACE_PATH_REJECTED" });
+  });
+
+  it("rejects and closes a handle whose identity no longer matches its path", async () => {
+    const candidate = path.join(workspace, "report.pdf");
+    const movedCandidate = path.join(workspace, "report-original.pdf");
+    const replacement = path.join(workspace, "report-replacement.pdf");
+    await writeFile(replacement, "replacement contents");
+    let openedDuringRace: FileHandle | undefined;
+
+    vi.resetModules();
+    vi.doMock("node:fs/promises", async () => {
+      const actual =
+        await vi.importActual<typeof import("node:fs/promises")>(
+          "node:fs/promises",
+        );
+      return {
+        ...actual,
+        async open(target: string, flags: number) {
+          const handle = await actual.open(target, flags);
+          if (path.resolve(target) === path.resolve(candidate)) {
+            openedDuringRace = handle;
+            await rename(candidate, movedCandidate);
+            await rename(replacement, candidate);
+          }
+          return handle;
+        },
+      };
+    });
+
+    let resolved:
+      | Awaited<ReturnType<typeof resolveWorkspaceFile>>
+      | undefined;
+    let rejected: unknown;
+    try {
+      const racedPathGuard = await import("../../src/workspace/path-guard.js");
+      resolved = await racedPathGuard.resolveWorkspaceFile(
+        workspace,
+        "report.pdf",
+      );
+    } catch (error) {
+      rejected = error;
+    } finally {
+      await resolved?.handle.close();
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
+    }
+
+    expect(rejected).toBeInstanceOf(Error);
+    expect(rejected).toMatchObject({ code: "WORKSPACE_PATH_REJECTED" });
+    expect(openedDuringRace).toBeDefined();
+    await expect(openedDuringRace?.stat()).rejects.toMatchObject({
+      code: "EBADF",
+    });
+  });
+
   it.runIf(process.platform === "linux")(
-    "rejects a FIFO",
+    "rejects a FIFO without waiting for a writer",
     async () => {
       const fifoPath = path.join(workspace, "upload.fifo");
       await execFileAsync("mkfifo", [fifoPath]);
+      const startedAt = Date.now();
+      const rescueWriter = setTimeout(() => {
+        void open(fifoPath, constants.O_WRONLY)
+          .then((handle) => handle.close())
+          .catch(() => undefined);
+      }, 500);
 
-      await expect(
-        resolveWorkspaceFile(workspace, "upload.fifo"),
-      ).rejects.toMatchObject({
-        code: "WORKSPACE_PATH_REJECTED",
-      });
+      try {
+        await expect(
+          resolveWorkspaceFile(workspace, "upload.fifo"),
+        ).rejects.toMatchObject({
+          code: "WORKSPACE_PATH_REJECTED",
+        });
+      } finally {
+        clearTimeout(rescueWriter);
+      }
+
+      expect(Date.now() - startedAt).toBeLessThan(250);
     },
   );
 });

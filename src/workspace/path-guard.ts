@@ -13,7 +13,6 @@ export type ResolvedWorkspaceFile = {
   inputName: string;
   basename: string;
   size: number;
-  canonicalPath: string;
   handle: FileHandle;
 };
 
@@ -109,25 +108,55 @@ export async function resolveWorkspaceFile(
 
   let handle: FileHandle;
   try {
-    const noFollow =
-      process.platform === "win32" ? 0 : constants.O_NOFOLLOW;
-    handle = await open(canonicalPath, constants.O_RDONLY | noFollow);
+    const inspectionFlags =
+      process.platform === "win32"
+        ? constants.O_RDONLY
+        : constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW;
+    handle = await open(canonicalPath, inspectionFlags);
   } catch (error) {
     throw pathFailure(error);
   }
 
   try {
-    const openedMetadata = await handle.stat();
+    const openedMetadata = await handle.stat({ bigint: true });
     if (!openedMetadata.isFile()) {
       throw new PanSyncError("WORKSPACE_PATH_REJECTED");
     }
 
-    const relativeName = path.relative(workspace.canonical, canonicalPath);
+    // Node has no portable openat-style API or cross-platform descriptor path.
+    // Rechecking containment and (dev, ino) proves that this handle matched a
+    // contained name at verification time; callers must keep using the handle.
+    let verifiedCanonicalPath: string;
+    try {
+      verifiedCanonicalPath = await realpath(candidate);
+      if (!isContained(workspace.canonical, verifiedCanonicalPath)) {
+        throw new PanSyncError("WORKSPACE_PATH_REJECTED");
+      }
+
+      const verifiedPathMetadata = await stat(verifiedCanonicalPath, {
+        bigint: true,
+      });
+      if (
+        openedMetadata.dev !== verifiedPathMetadata.dev ||
+        openedMetadata.ino !== verifiedPathMetadata.ino
+      ) {
+        throw new PanSyncError("WORKSPACE_PATH_REJECTED");
+      }
+    } catch (error) {
+      if (error instanceof PanSyncError) {
+        throw error;
+      }
+      throw new PanSyncError("WORKSPACE_PATH_REJECTED");
+    }
+
+    const relativeName = path.relative(
+      workspace.canonical,
+      verifiedCanonicalPath,
+    );
     return {
       inputName: relativeName.split(path.sep).join(path.posix.sep),
-      basename: path.basename(canonicalPath),
-      size: openedMetadata.size,
-      canonicalPath,
+      basename: path.basename(verifiedCanonicalPath),
+      size: Number(openedMetadata.size),
       handle,
     };
   } catch (error) {
