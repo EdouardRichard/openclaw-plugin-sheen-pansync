@@ -4,9 +4,9 @@
 
 **Goal:** 交付一个可安装的 OpenClaw TypeScript ESM 插件，让 Agent 将当前工作区内的一个或多个普通文件上传到单一阿里云盘账号，并提供安全、可完整回显凭证的一次性配置页面。
 
-**Architecture:** 插件入口只负责装配 Tool、Skill、只读 Control UI、CLI 和服务生命周期。上传业务经过 `UploadOrchestrator -> ProviderRegistry -> AliyunProvider`；凭证由 AES-256-GCM Vault 持久化，并使用插件数据目录中的跨进程文件租约协调 Gateway 与 CLI 两个进程。`openclaw pan-sync configure` 仅在 `127.0.0.1` 启动短时配置页，Control UI iframe 不承担敏感写入。
+**Architecture:** 插件入口只负责装配 Tool、Skill、只读 Control UI、CLI 和服务生命周期。上传业务经过 `UploadOrchestrator -> ProviderRegistry -> AliyunProvider`；凭证由 AES-256-GCM Vault 持久化，并使用 Node 22 内置 SQLite 的 Worker 事务租约协调 Gateway 与 CLI 两个进程。`openclaw pan-sync configure` 仅在 `127.0.0.1` 启动短时配置页，Control UI iframe 不承担敏感写入。
 
-**Tech Stack:** Node.js 22.22.3+、TypeScript ESM、OpenClaw Plugin SDK `>=2026.7.1-2`、`typebox`、原生 `fetch`/`node:http`/`node:crypto`/`node:fs`、Vitest。
+**Tech Stack:** Node.js 22.22.3+、TypeScript ESM、OpenClaw Plugin SDK `>=2026.7.1-2`、`typebox`、原生 `fetch`/`node:http`/`node:crypto`/`node:fs`/`node:sqlite`/`node:worker_threads`、Vitest。
 
 ## Global Constraints
 
@@ -514,7 +514,7 @@ export class CredentialStore {
 }
 ```
 
-The plugin uses a self-owned cross-process filesystem lease under `<dataDir>/locks` because the supported OpenClaw release restricts `state.withLease` to bundled/trusted-official plugins. Lease acquisition must use atomic exclusive creation, owner identity, a 10-second heartbeat, a 30-second stale threshold, and a 15-second acquisition timeout. Stale recovery is allowed only after the heartbeat is stale and the recorded owner PID is no longer alive; an indeterminate/alive PID must never be stolen. Release and important Vault mutation boundaries must verify the owner token. This preserves safe community-plugin installation without relying on privileged runtime state APIs.
+The plugin uses a self-owned cross-process SQLite transaction lease at `<dataDir>/locks/lease.sqlite` because the supported OpenClaw release restricts `state.withLease` to bundled/trusted-official plugins. A dedicated Worker owns a `node:sqlite` `DatabaseSync` connection and holds `BEGIN IMMEDIATE` for the callback lifetime; `timeout: 15_000` bounds acquisition without blocking the Gateway event loop. The parent terminates an acquiring Worker on caller cancellation, treats Worker exit/error as lease loss, and releases with COMMIT/ROLLBACK plus connection close. Process death automatically releases SQLite locks, so the design must not implement PID, heartbeat, stale-file deletion, or manual path recovery. The lock directory and database must request `0700`/`0600` permissions. Important Vault mutation boundaries must assert the live Worker/transaction ownership signal. This preserves safe community-plugin installation without privileged runtime state APIs or native npm dependencies.
 
 - [ ] **Step 6: Implement safe filesystem writes**
 
@@ -1234,7 +1234,7 @@ The entry must:
 
 1. Parse only non-secret config.
 2. Resolve `dataDir = <stateDir>/pan-sync-helper`.
-3. Construct the approved plugin-owned filesystem lease under `<dataDir>/locks` and adapt it to the Vault. Do not call privileged `state.withLease`, `openKeyedStore`, or `openSyncKeyedStore` from this third-party plugin.
+3. Construct the approved Worker-owned SQLite transaction lease at `<dataDir>/locks/lease.sqlite` and adapt it to the Vault. Do not call privileged `state.withLease`, `openKeyedStore`, or `openSyncKeyedStore` from this third-party plugin.
 4. Construct one shared store, HTTP client, Token Manager, Aliyun Provider, Provider Registry, and Orchestrator.
 5. Register Tool factory.
 6. Register CLI command `pan-sync configure`.
