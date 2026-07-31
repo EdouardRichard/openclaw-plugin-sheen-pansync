@@ -141,6 +141,21 @@ async function setupRequest(
 function containsProtectedValue(values: readonly unknown[]): boolean {
   const pending = [...values];
   const seen = new WeakSet<object>();
+  const queueDescriptor = (
+    target: object,
+    key: PropertyKey,
+  ): "missing" | "queued" | "unsafe" => {
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(target, key);
+    } catch {
+      return "unsafe";
+    }
+    if (descriptor === undefined) return "missing";
+    if (!("value" in descriptor)) return "unsafe";
+    pending.push(descriptor.value);
+    return "queued";
+  };
   while (pending.length > 0) {
     const value = pending.pop();
     if (typeof value === "string") {
@@ -155,7 +170,7 @@ function containsProtectedValue(values: readonly unknown[]): boolean {
       continue;
     }
     if (typeof value === "symbol") {
-      pending.push(value.description, Symbol.keyFor(value));
+      pending.push(String(value));
       continue;
     }
     if (
@@ -168,13 +183,53 @@ function containsProtectedValue(values: readonly unknown[]): boolean {
     seen.add(value);
 
     if (value instanceof Error) {
-      pending.push(value.name, value.message, value.stack, value.cause);
+      for (const field of ["name", "message", "stack", "cause"] as const) {
+        let target: object | null = value;
+        while (target !== null) {
+          const result = queueDescriptor(target, field);
+          if (result === "unsafe") return true;
+          if (result === "queued") break;
+          try {
+            target = Object.getPrototypeOf(target) as object | null;
+          } catch {
+            return true;
+          }
+        }
+      }
     }
     if (value instanceof Map) {
-      for (const [key, entry] of value) pending.push(key, entry);
+      const descriptor = Object.getOwnPropertyDescriptor(Map.prototype, "forEach");
+      if (
+        descriptor === undefined
+        || !("value" in descriptor)
+        || typeof descriptor.value !== "function"
+      ) {
+        return true;
+      }
+      try {
+        Reflect.apply(descriptor.value, value, [
+          (entry: unknown, key: unknown) => pending.push(key, entry),
+        ]);
+      } catch {
+        return true;
+      }
     }
     if (value instanceof Set) {
-      for (const entry of value) pending.push(entry);
+      const descriptor = Object.getOwnPropertyDescriptor(Set.prototype, "forEach");
+      if (
+        descriptor === undefined
+        || !("value" in descriptor)
+        || typeof descriptor.value !== "function"
+      ) {
+        return true;
+      }
+      try {
+        Reflect.apply(descriptor.value, value, [
+          (entry: unknown) => pending.push(entry),
+        ]);
+      } catch {
+        return true;
+      }
     }
 
     let keys: PropertyKey[];
@@ -185,14 +240,7 @@ function containsProtectedValue(values: readonly unknown[]): boolean {
     }
     for (const key of keys) {
       pending.push(key);
-      try {
-        const descriptor = Object.getOwnPropertyDescriptor(value, key);
-        if (descriptor !== undefined && "value" in descriptor) {
-          pending.push(descriptor.value);
-        }
-      } catch {
-        // Do not invoke or trust accessors while inspecting logger arguments.
-      }
+      if (queueDescriptor(value, key) === "unsafe") return true;
     }
   }
   return false;
@@ -204,6 +252,32 @@ function assertNoProtectedArguments(
 ): void {
   if (containsProtectedValue(values)) {
     throw new Error(`${label} exposed a protected value`);
+  }
+}
+
+function assertNoProductionLoggerCalls(calls: readonly unknown[][]): void {
+  assertNoProtectedArguments("actual OpenClaw logger calls", calls);
+  if (calls.length !== 0) {
+    throw new Error("production plugin emitted unexpected logger calls");
+  }
+}
+
+function rejectionMessage(run: () => void): string | undefined {
+  try {
+    run();
+    return undefined;
+  } catch (error) {
+    return error instanceof Error ? error.message : "non-Error rejection";
+  }
+}
+
+function assertRejectedWithoutDumping(
+  label: string,
+  value: unknown,
+): void {
+  const expected = `${label} exposed a protected value`;
+  if (rejectionMessage(() => assertNoProtectedArguments(label, [value])) !== expected) {
+    throw new Error(`${label} was not rejected safely`);
   }
 }
 
@@ -318,6 +392,67 @@ describe("release leakage canaries", () => {
     expect(() =>
       assertNoProtectedArguments("host logger arguments", [value])
     ).not.toThrow();
+  });
+
+  it("fails closed on an enumerable accessor without invoking its getter", () => {
+    let getterCalls = 0;
+    const value = {};
+    Object.defineProperty(value, "payload", {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        return ACCESS_TOKEN;
+      },
+    });
+
+    assertRejectedWithoutDumping("accessor logger argument", value);
+    expect(getterCalls).toBe(0);
+  });
+
+  it("does not invoke a customized Error accessor", () => {
+    let getterCalls = 0;
+    const error = new Error("safe message");
+    error.stack = "safe stack";
+    const prototype = Object.create(Error.prototype) as object;
+    Object.defineProperty(prototype, "name", {
+      get() {
+        getterCalls += 1;
+        return CLIENT_SECRET;
+      },
+    });
+    Object.setPrototypeOf(error, prototype);
+
+    assertRejectedWithoutDumping("custom Error logger argument", error);
+    expect(getterCalls).toBe(0);
+  });
+
+  it.each([
+    ["Map", () => new Map([["payload", REFRESH_TOKEN]])],
+    ["Set", () => new Set([ABSOLUTE_PATH])],
+    ["function own property", () => {
+      const value = () => undefined;
+      Object.defineProperty(value, "payload", { value: ACCESS_TOKEN });
+      return value;
+    }],
+  ] as const)("inspects %s logger arguments", (name, createValue) => {
+    assertRejectedWithoutDumping(`${name} logger argument`, createValue());
+  });
+
+  it("scans production logger calls before enforcing zero cardinality", () => {
+    const calls = [[{ payload: CLIENT_SECRET }]];
+    const message = rejectionMessage(() => assertNoProductionLoggerCalls(calls));
+    if (message !== "actual OpenClaw logger calls exposed a protected value") {
+      throw new Error("production logger failure order was not safe");
+    }
+  });
+
+  it("uses a fixed failure for clean unexpected production logger calls", () => {
+    const message = rejectionMessage(() =>
+      assertNoProductionLoggerCalls([[{ event: "safe event" }]])
+    );
+    if (message !== "production plugin emitted unexpected logger calls") {
+      throw new Error("production logger cardinality failure was not fixed");
+    }
   });
 
   it("keeps credentials, access tokens, and workspace paths out of failure surfaces", async () => {
@@ -444,13 +579,12 @@ describe("release leakage canaries", () => {
       workspace,
       logger,
     );
-    expect(loggerCalls).toEqual([]);
+    assertNoProductionLoggerCalls(loggerCalls);
 
     assertNoProtectedArguments("invalid credentials response", [invalidOutput]);
     assertNoProtectedArguments("refresh failure Tool result", [refreshResult]);
     assertNoProtectedArguments("path and upload Tool result", [uploadResult]);
     assertNoProtectedArguments("status HTML", [statusOutput]);
-    assertNoProtectedArguments("actual OpenClaw logger calls", loggerCalls);
     assertNoProtectedArguments(
       "simulated host logging of projected Tool results",
       [refreshResult, uploadResult],
