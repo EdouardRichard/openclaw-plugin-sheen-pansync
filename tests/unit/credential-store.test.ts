@@ -191,6 +191,85 @@ describe("CredentialStore", () => {
     await expect(seedStore.read()).resolves.toEqual(initial);
   });
 
+  it("commits the installed replacement when rollback rename fails", async () => {
+    const dataDir = await tempDataDir();
+    const credentialsPath = path.join(dataDir, "credentials.enc");
+    const initial = record(1);
+    const replacement = record(2);
+    const seedStore = new CredentialStore(dataDir, immediateLease);
+    await seedStore.replace(initial);
+    let canonicalRenames = 0;
+    let replacementInstalled = false;
+    let failPostRenameSync = true;
+    const rollbackRenameFailureAdapter: Partial<CredentialFileAdapter> = {
+      async rename(source, destination) {
+        if (destination === credentialsPath) {
+          canonicalRenames += 1;
+          if (canonicalRenames === 2) {
+            throw new Error(`ROLLBACK_RENAME_CANARY ${dataDir}`);
+          }
+        }
+        await rename(source, destination);
+        if (destination === credentialsPath) {
+          replacementInstalled = true;
+        }
+      },
+      async syncDirectory() {
+        if (replacementInstalled && failPostRenameSync) {
+          failPostRenameSync = false;
+          throw new Error(`POST_RENAME_SYNC_CANARY ${dataDir}`);
+        }
+      },
+    };
+    const store = new CredentialStore(
+      dataDir,
+      immediateLease,
+      rollbackRenameFailureAdapter,
+    );
+
+    await expect(store.replace(replacement)).resolves.toBeUndefined();
+
+    expect(canonicalRenames).toBe(2);
+    await expect(seedStore.read()).resolves.toEqual(replacement);
+  });
+
+  it("retries rollback directory sync before rejecting with the previous record", async () => {
+    const dataDir = await tempDataDir();
+    const credentialsPath = path.join(dataDir, "credentials.enc");
+    const initial = record(1);
+    const seedStore = new CredentialStore(dataDir, immediateLease);
+    await seedStore.replace(initial);
+    let replacementInstalled = false;
+    let syncCalls = 0;
+    const rollbackSyncFailureAdapter: Partial<CredentialFileAdapter> = {
+      async rename(source, destination) {
+        await rename(source, destination);
+        if (destination === credentialsPath) {
+          replacementInstalled = true;
+        }
+      },
+      async syncDirectory() {
+        syncCalls += 1;
+        if (replacementInstalled && (syncCalls === 2 || syncCalls === 3)) {
+          throw new Error(`ROLLBACK_SYNC_CANARY ${dataDir}`);
+        }
+      },
+    };
+    const store = new CredentialStore(
+      dataDir,
+      immediateLease,
+      rollbackSyncFailureAdapter,
+    );
+
+    const error = await rejectedError(() => store.replace(record(2)));
+
+    expect(error.message).toBe("credential store write failed");
+    expect(error.message).not.toContain("ROLLBACK_SYNC_CANARY");
+    expect(error.message).not.toContain(dataDir);
+    expect(syncCalls).toBe(4);
+    await expect(seedStore.read()).resolves.toEqual(initial);
+  });
+
   it("performs no filesystem mutations when CAS is stale", async () => {
     const dataDir = await tempDataDir();
     const masterKeyPath = path.join(dataDir, "master.key");

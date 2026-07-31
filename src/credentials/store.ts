@@ -211,13 +211,18 @@ export class CredentialStore {
         await this.#files.syncDirectory(this.dataDir);
       } catch (error) {
         preserveBackup = backupCreated;
-        if (backupCreated) {
-          await this.#files.rename(backupPath, this.#credentialsPath);
-          backupCreated = false;
-        } else {
-          await this.#files.unlink(this.#credentialsPath);
+        try {
+          if (backupCreated) {
+            await this.#files.rename(backupPath, this.#credentialsPath);
+            backupCreated = false;
+          } else {
+            await this.#files.unlink(this.#credentialsPath);
+          }
+        } catch {
+          await this.#files.syncDirectory(this.dataDir).catch(() => undefined);
+          return;
         }
-        await this.#files.syncDirectory(this.dataDir);
+        await this.#syncRollbackDirectory();
         throw error;
       }
 
@@ -285,6 +290,14 @@ export class CredentialStore {
       throw new Error("credential key rejected");
     }
     return key;
+  }
+
+  async #syncRollbackDirectory(): Promise<void> {
+    try {
+      await this.#files.syncDirectory(this.dataDir);
+    } catch {
+      await this.#files.syncDirectory(this.dataDir);
+    }
   }
 
   async #clearUnlocked(): Promise<void> {
