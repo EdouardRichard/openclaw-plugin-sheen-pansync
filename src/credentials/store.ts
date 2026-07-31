@@ -20,6 +20,7 @@ const CREDENTIAL_LEASE_KEY = "credentials";
 const DATA_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 const MASTER_KEY_BYTES = 32;
+const ROLLBACK_MARKER = "rollback-v1\n";
 const READ_FAILED = "credential store read failed";
 const WRITE_FAILED = "credential store write failed";
 const CLEAR_FAILED = "credential store clear failed";
@@ -79,7 +80,9 @@ function hasErrorCode(error: unknown, code: string): boolean {
 
 export class CredentialStore {
   readonly #credentialsPath: string;
+  readonly #backupPath: string;
   readonly #masterKeyPath: string;
+  readonly #transactionPath: string;
   readonly #files: CredentialFileAdapter;
 
   constructor(
@@ -88,7 +91,9 @@ export class CredentialStore {
     files: Partial<CredentialFileAdapter> = {},
   ) {
     this.#credentialsPath = path.join(dataDir, "credentials.enc");
+    this.#backupPath = path.join(dataDir, "credentials.enc.bak");
     this.#masterKeyPath = path.join(dataDir, "master.key");
+    this.#transactionPath = path.join(dataDir, "credentials.txn");
     this.#files = { ...defaultFileAdapter, ...files };
   }
 
@@ -145,9 +150,12 @@ export class CredentialStore {
   }
 
   async #readUnlocked(): Promise<CredentialRecord | undefined> {
+    const credentialsPath = await this.#hasPendingTransaction()
+      ? this.#backupPath
+      : this.#credentialsPath;
     let serialized: string;
     try {
-      serialized = await this.#files.readText(this.#credentialsPath);
+      serialized = await this.#files.readText(credentialsPath);
     } catch (error) {
       if (hasErrorCode(error, "ENOENT")) {
         return undefined;
@@ -168,20 +176,15 @@ export class CredentialStore {
 
   async #writeUnlocked(candidate: CredentialRecord): Promise<void> {
     await this.#ensureDataDirectory();
+    await this.#recoverPendingTransactionForWrite();
     const key = await this.#loadOrCreateMasterKey();
     const envelope = encryptRecord(key, candidate);
     const temporaryPath = path.join(
       this.dataDir,
       `.credentials.enc.${randomBytes(16).toString("hex")}.tmp`,
     );
-    const backupPath = path.join(
-      this.dataDir,
-      `.credentials.enc.${randomBytes(16).toString("hex")}.bak`,
-    );
     let temporaryFile: FileHandle | undefined;
     let temporaryRenamed = false;
-    let backupCreated = false;
-    let preserveBackup = false;
 
     try {
       temporaryFile = await this.#files.open(
@@ -195,40 +198,22 @@ export class CredentialStore {
       await temporaryFile.close();
       temporaryFile = undefined;
 
-      try {
-        await this.#files.link(this.#credentialsPath, backupPath);
-        backupCreated = true;
-        await this.#files.syncDirectory(this.dataDir);
-      } catch (error) {
-        if (!hasErrorCode(error, "ENOENT")) {
-          throw error;
-        }
-      }
-
+      await this.#prepareRollbackJournal();
       await this.#files.rename(temporaryPath, this.#credentialsPath);
       temporaryRenamed = true;
       try {
         await this.#files.syncDirectory(this.dataDir);
       } catch (error) {
-        preserveBackup = backupCreated;
-        try {
-          if (backupCreated) {
-            await this.#files.rename(backupPath, this.#credentialsPath);
-            backupCreated = false;
-          } else {
-            await this.#files.unlink(this.#credentialsPath);
-          }
-        } catch {
-          await this.#files.syncDirectory(this.dataDir).catch(() => undefined);
-          return;
-        }
-        await this.#syncRollbackDirectory();
+        await this.#restorePreviousCanonical().catch(() => undefined);
         throw error;
       }
 
-      if (backupCreated) {
-        await this.#files.unlink(backupPath).catch(() => undefined);
-        backupCreated = false;
+      try {
+        await this.#commitTransaction();
+      } catch (error) {
+        await this.#ensureRollbackMarker().catch(() => undefined);
+        await this.#restorePreviousCanonical().catch(() => undefined);
+        throw error;
       }
     } finally {
       if (temporaryFile !== undefined) {
@@ -236,9 +221,6 @@ export class CredentialStore {
       }
       if (!temporaryRenamed) {
         await this.#files.unlink(temporaryPath).catch(() => undefined);
-      }
-      if (backupCreated && !preserveBackup) {
-        await this.#files.unlink(backupPath).catch(() => undefined);
       }
     }
   }
@@ -292,15 +274,131 @@ export class CredentialStore {
     return key;
   }
 
-  async #syncRollbackDirectory(): Promise<void> {
+  async #hasPendingTransaction(): Promise<boolean> {
     try {
-      await this.#files.syncDirectory(this.dataDir);
-    } catch {
-      await this.#files.syncDirectory(this.dataDir);
+      await this.#files.readText(this.#transactionPath);
+      return true;
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) {
+        return false;
+      }
+      throw error;
     }
   }
 
+  async #prepareRollbackJournal(): Promise<void> {
+    await this.#files.unlink(this.#backupPath).catch((error: unknown) => {
+      if (!hasErrorCode(error, "ENOENT")) {
+        throw error;
+      }
+    });
+    try {
+      await this.#files.link(this.#credentialsPath, this.#backupPath);
+    } catch (error) {
+      if (!hasErrorCode(error, "ENOENT")) {
+        throw error;
+      }
+    }
+
+    await this.#writeRollbackMarker();
+    await this.#files.syncDirectory(this.dataDir);
+  }
+
+  async #writeRollbackMarker(): Promise<void> {
+    let markerFile: FileHandle | undefined;
+    try {
+      markerFile = await this.#files.open(
+        this.#transactionPath,
+        "wx",
+        PRIVATE_FILE_MODE,
+      );
+      await markerFile.writeFile(ROLLBACK_MARKER, "utf8");
+      await this.#files.chmod(this.#transactionPath, PRIVATE_FILE_MODE);
+      await markerFile.sync();
+      await markerFile.close();
+      markerFile = undefined;
+    } finally {
+      if (markerFile !== undefined) {
+        await markerFile.close().catch(() => undefined);
+      }
+    }
+  }
+
+  async #ensureRollbackMarker(): Promise<void> {
+    try {
+      await this.#writeRollbackMarker();
+    } catch (error) {
+      if (!hasErrorCode(error, "EEXIST")) {
+        throw error;
+      }
+    }
+    await this.#files.syncDirectory(this.dataDir);
+  }
+
+  async #restorePreviousCanonical(): Promise<void> {
+    const recoveryPath = path.join(
+      this.dataDir,
+      `.credentials.enc.${randomBytes(16).toString("hex")}.rollback`,
+    );
+    let recoveryLinked = false;
+    try {
+      try {
+        await this.#files.link(this.#backupPath, recoveryPath);
+        recoveryLinked = true;
+      } catch (error) {
+        if (!hasErrorCode(error, "ENOENT")) {
+          throw error;
+        }
+      }
+
+      if (recoveryLinked) {
+        await this.#files.rename(recoveryPath, this.#credentialsPath);
+        recoveryLinked = false;
+      } else {
+        await this.#files.unlink(this.#credentialsPath).catch((error: unknown) => {
+          if (!hasErrorCode(error, "ENOENT")) {
+            throw error;
+          }
+        });
+      }
+      await this.#files.syncDirectory(this.dataDir);
+    } finally {
+      if (recoveryLinked) {
+        await this.#files.unlink(recoveryPath).catch(() => undefined);
+      }
+    }
+  }
+
+  async #commitTransaction(): Promise<void> {
+    await this.#files.unlink(this.#transactionPath);
+    await this.#files.syncDirectory(this.dataDir);
+    await this.#files.unlink(this.#backupPath).catch((error: unknown) => {
+      if (!hasErrorCode(error, "ENOENT")) {
+        throw error;
+      }
+    });
+    await this.#files.syncDirectory(this.dataDir).catch(() => undefined);
+  }
+
+  async #recoverPendingTransactionForWrite(): Promise<void> {
+    if (!(await this.#hasPendingTransaction())) {
+      await this.#files.unlink(this.#backupPath).catch((error: unknown) => {
+        if (!hasErrorCode(error, "ENOENT")) {
+          throw error;
+        }
+      });
+      return;
+    }
+
+    await this.#restorePreviousCanonical();
+    await this.#files.unlink(this.#transactionPath);
+    await this.#files.syncDirectory(this.dataDir);
+    await this.#files.unlink(this.#backupPath).catch(() => undefined);
+    await this.#files.syncDirectory(this.dataDir).catch(() => undefined);
+  }
+
   async #clearUnlocked(): Promise<void> {
+    await this.#recoverPendingTransactionForWrite();
     const backupPath = path.join(
       this.dataDir,
       `.credentials.enc.${randomBytes(16).toString("hex")}.bak`,

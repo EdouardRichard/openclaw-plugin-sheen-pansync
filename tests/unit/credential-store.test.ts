@@ -6,6 +6,7 @@ import {
   readFile,
   rename,
   unlink,
+  writeFile,
 } from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -191,16 +192,16 @@ describe("CredentialStore", () => {
     await expect(seedStore.read()).resolves.toEqual(initial);
   });
 
-  it("commits the installed replacement when rollback rename fails", async () => {
+  it("recovers the previous record after restart when rollback rename fails", async () => {
     const dataDir = await tempDataDir();
     const credentialsPath = path.join(dataDir, "credentials.enc");
     const initial = record(1);
     const replacement = record(2);
     const seedStore = new CredentialStore(dataDir, immediateLease);
     await seedStore.replace(initial);
+    const previousCiphertext = await readFile(credentialsPath);
     let canonicalRenames = 0;
     let replacementInstalled = false;
-    let failPostRenameSync = true;
     const rollbackRenameFailureAdapter: Partial<CredentialFileAdapter> = {
       async rename(source, destination) {
         if (destination === credentialsPath) {
@@ -215,8 +216,7 @@ describe("CredentialStore", () => {
         }
       },
       async syncDirectory() {
-        if (replacementInstalled && failPostRenameSync) {
-          failPostRenameSync = false;
+        if (replacementInstalled) {
           throw new Error(`POST_RENAME_SYNC_CANARY ${dataDir}`);
         }
       },
@@ -227,15 +227,19 @@ describe("CredentialStore", () => {
       rollbackRenameFailureAdapter,
     );
 
-    await expect(store.replace(replacement)).resolves.toBeUndefined();
+    const error = await rejectedError(() => store.replace(replacement));
+    const freshStore = new CredentialStore(dataDir, immediateLease);
 
+    expect(error.message).toBe("credential store write failed");
     expect(canonicalRenames).toBe(2);
-    await expect(seedStore.read()).resolves.toEqual(replacement);
+    expect(await readFile(credentialsPath)).not.toEqual(previousCiphertext);
+    await expect(freshStore.read()).resolves.toEqual(initial);
   });
 
-  it("retries rollback directory sync before rejecting with the previous record", async () => {
+  it("recovers from a durable marker after repeated directory sync failure", async () => {
     const dataDir = await tempDataDir();
     const credentialsPath = path.join(dataDir, "credentials.enc");
+    const transactionPath = path.join(dataDir, "credentials.txn");
     const initial = record(1);
     const seedStore = new CredentialStore(dataDir, immediateLease);
     await seedStore.replace(initial);
@@ -266,8 +270,27 @@ describe("CredentialStore", () => {
     expect(error.message).toBe("credential store write failed");
     expect(error.message).not.toContain("ROLLBACK_SYNC_CANARY");
     expect(error.message).not.toContain(dataDir);
-    expect(syncCalls).toBe(4);
-    await expect(seedStore.read()).resolves.toEqual(initial);
+    expect(syncCalls).toBeGreaterThanOrEqual(3);
+    await expect(readFile(transactionPath, "utf8")).resolves.toBe("rollback-v1\n");
+    const freshStore = new CredentialStore(dataDir, immediateLease);
+    await expect(freshStore.read()).resolves.toEqual(initial);
+  });
+
+  it("treats a partially written transaction marker as rollback pending", async () => {
+    const dataDir = await tempDataDir();
+    const credentialsPath = path.join(dataDir, "credentials.enc");
+    const backupPath = path.join(dataDir, "credentials.enc.bak");
+    const transactionPath = path.join(dataDir, "credentials.txn");
+    const store = new CredentialStore(dataDir, immediateLease);
+    const initial = record(1);
+    await store.replace(initial);
+    const initialCiphertext = await readFile(credentialsPath);
+    await store.replace(record(2));
+    await writeFile(backupPath, initialCiphertext, { mode: 0o600 });
+    await writeFile(transactionPath, "roll", { mode: 0o600 });
+    const freshStore = new CredentialStore(dataDir, immediateLease);
+
+    await expect(freshStore.read()).resolves.toEqual(initial);
   });
 
   it("performs no filesystem mutations when CAS is stale", async () => {
