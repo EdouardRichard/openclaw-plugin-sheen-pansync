@@ -16,6 +16,13 @@ export type ResolvedWorkspaceFile = {
   handle: FileHandle;
 };
 
+type OpenedFileIdentity = {
+  dev: bigint;
+  ino: bigint;
+};
+
+const openedFileIdentities = new WeakMap<FileHandle, OpenedFileIdentity>();
+
 function isContained(root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate);
   return (
@@ -162,6 +169,10 @@ export async function resolveWorkspaceFile(
       workspace.canonical,
       verifiedCanonicalPath,
     );
+    openedFileIdentities.set(handle, {
+      dev: openedMetadata.dev,
+      ino: openedMetadata.ino,
+    });
     return {
       inputName: relativeName.split(path.sep).join(path.posix.sep),
       basename: path.basename(verifiedCanonicalPath),
@@ -175,6 +186,21 @@ export async function resolveWorkspaceFile(
     }
     throw pathFailure(error);
   }
+}
+
+export function isSameWorkspaceFile(
+  left: ResolvedWorkspaceFile,
+  right: ResolvedWorkspaceFile,
+): boolean {
+  const leftIdentity = openedFileIdentities.get(left.handle);
+  const rightIdentity = openedFileIdentities.get(right.handle);
+  if (leftIdentity === undefined || rightIdentity === undefined) {
+    throw new PanSyncError("WORKSPACE_PATH_REJECTED");
+  }
+  return (
+    leftIdentity.dev === rightIdentity.dev
+    && leftIdentity.ino === rightIdentity.ino
+  );
 }
 
 const CONTROL_CHARACTER = /\p{Cc}/u;

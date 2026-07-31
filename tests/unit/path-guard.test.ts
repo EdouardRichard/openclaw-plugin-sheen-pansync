@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import {
   mkdir,
   mkdtemp,
+  link,
   open,
   rename,
   rm,
@@ -17,6 +18,7 @@ import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PanSyncError } from "../../src/errors.js";
 import {
+  isSameWorkspaceFile,
   normalizeRemoteDirectory,
   resolveWorkspaceFile,
 } from "../../src/workspace/path-guard.js";
@@ -112,6 +114,34 @@ describe("resolveWorkspaceFile", () => {
       });
     } finally {
       await resolved.handle.close();
+    }
+  });
+
+  it("compares canonical aliases by opened-file identity without returning a pathname", async () => {
+    await link(
+      path.join(workspace, "report.pdf"),
+      path.join(workspace, "report-alias.pdf"),
+    );
+    const original = await resolveWorkspaceFile(workspace, "report.pdf");
+    const alias = await resolveWorkspaceFile(workspace, "report-alias.pdf");
+    const different = await resolveWorkspaceFile(
+      workspace,
+      path.join("nested", "notes.txt"),
+    );
+
+    try {
+      expect(isSameWorkspaceFile(original, alias)).toBe(true);
+      expect(isSameWorkspaceFile(original, different)).toBe(false);
+      expect(Object.values(original)).not.toContain(
+        expect.stringContaining(workspace),
+      );
+      expect(Object.values(alias)).not.toContain(
+        expect.stringContaining(workspace),
+      );
+    } finally {
+      await original.handle.close();
+      await alias.handle.close();
+      await different.handle.close();
     }
   });
 
