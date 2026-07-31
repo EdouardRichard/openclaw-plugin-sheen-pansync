@@ -4,6 +4,7 @@ import type {
   FileUploadResult,
   PanSyncUploadInput,
   PanSyncUploadResult,
+  ProviderOperationOptions,
 } from "../contracts.js";
 import type { PluginConfig } from "../config.js";
 import type { TokenManager } from "../credentials/token-manager.js";
@@ -52,6 +53,12 @@ function stableError(error: unknown): PanSyncError {
     return error;
   }
   return new PanSyncError("UPLOAD_FAILED");
+}
+
+function assertActive(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) {
+    throw new PanSyncError("UPLOAD_FAILED");
+  }
 }
 
 const CONTROL_CHARACTER = /\p{Cc}/u;
@@ -121,33 +128,43 @@ export class UploadOrchestrator {
     this.#pathGuard = dependencies.pathGuard ?? defaultPathGuard;
   }
 
-  async upload(input: UploadRequest): Promise<PanSyncUploadResult> {
+  async upload(
+    input: UploadRequest,
+    options: ProviderOperationOptions = {},
+  ): Promise<PanSyncUploadResult> {
     if (input.paths.length < 1 || input.paths.length > 100) {
       throw new PanSyncError("UPLOAD_FAILED");
     }
 
     try {
-      return await this.#upload(input);
+      return await this.#upload(input, options);
     } catch (error) {
       throw stableError(error);
     }
   }
 
-  async #upload(input: UploadRequest): Promise<PanSyncUploadResult> {
+  async #upload(
+    input: UploadRequest,
+    options: ProviderOperationOptions,
+  ): Promise<PanSyncUploadResult> {
+    assertActive(options.signal);
     const provider = this.dependencies.providerRegistry.resolve(input.provider);
     const remoteDirectory = normalizeRemoteDirectory(
       input.remoteDirectory ?? this.dependencies.config.defaultDirectory,
     );
     const accessToken =
-      await this.dependencies.tokenManager.getValidAccessToken();
+      await this.dependencies.tokenManager.getValidAccessToken(options);
+    assertActive(options.signal);
     const directory = await provider.ensureDirectory(
       remoteDirectory,
       accessToken,
+      options,
     );
+    assertActive(options.signal);
 
     const distinctFiles: ResolvedWorkspaceFile[] = [];
     try {
-      const prepared = await this.#prepareFiles(input, distinctFiles);
+      const prepared = await this.#prepareFiles(input, distinctFiles, options);
       const files: FileUploadResult[] = [];
       for (const entry of prepared) {
         if (entry.kind === "failure") {
@@ -156,15 +173,20 @@ export class UploadOrchestrator {
         }
 
         try {
+          assertActive(options.signal);
           files.push(
             await this.#uploadFile(
               provider,
               accessToken,
               directory,
               entry.file,
+              options,
             ),
           );
         } catch (error) {
+          if (options.signal?.aborted === true) {
+            throw stableError(error);
+          }
           if (isGlobalUploadError(error)) {
             throw error;
           }
@@ -190,9 +212,11 @@ export class UploadOrchestrator {
   async #prepareFiles(
     input: UploadRequest,
     distinctFiles: ResolvedWorkspaceFile[],
+    options: ProviderOperationOptions,
   ): Promise<PreparedEntry[]> {
     const prepared: PreparedEntry[] = [];
     for (const requestedPath of input.paths) {
+      assertActive(options.signal);
       let file: ResolvedWorkspaceFile;
       try {
         file = await this.#pathGuard.resolveWorkspaceFile(
@@ -252,12 +276,12 @@ export class UploadOrchestrator {
       ReturnType<CloudDriveProvider["ensureDirectory"]>
     >,
     file: ResolvedWorkspaceFile,
+    options: ProviderOperationOptions,
   ): Promise<FileUploadResult> {
-    const uploaded = await provider.uploadFile({
-      accessToken,
-      file,
-      remoteDirectory,
-    });
+    const uploaded = await provider.uploadFile(
+      { accessToken, file, remoteDirectory },
+      options,
+    );
     return {
       inputName: file.inputName,
       remoteName: uploaded.remoteName,

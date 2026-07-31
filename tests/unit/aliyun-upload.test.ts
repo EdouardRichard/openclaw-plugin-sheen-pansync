@@ -428,6 +428,34 @@ describe("Aliyun multipart upload", () => {
     await expect(file.handle.stat()).resolves.toMatchObject({ size: 85 * MIB });
   });
 
+  it("aborts all multipart PUTs from the caller signal and never completes the upload", async () => {
+    const server = await startUploadServer({ holdPutsMs: 2_000 });
+    const file = await sparseFile(45 * MIB);
+    const controller = new AbortController();
+    const startedAt = Date.now();
+    const uploading = provider(server).uploadFile(
+      {
+        accessToken: "access-old",
+        remoteDirectory: REMOTE_DIRECTORY,
+        file,
+      },
+      { signal: controller.signal },
+    );
+    await vi.waitFor(() => {
+      expect(server.events.some((event) => event.endsWith("-start"))).toBe(true);
+    });
+
+    controller.abort();
+
+    await expect(uploading).rejects.toMatchObject({ code: "UPLOAD_FAILED" });
+    expect(Date.now() - startedAt).toBeLessThan(1_500);
+    await vi.waitFor(() => expect(server.abortedParts.size).toBeGreaterThan(0));
+    expect(server.events).not.toContain("complete");
+    expect(server.requests.some(({ path: requestPath }) =>
+      requestPath.endsWith("/openFile/complete")
+    )).toBe(false);
+  });
+
   it("raises part size so a very large file never exceeds 10,000 parts", async () => {
     const server = await startUploadServer({
       createResponses: [{

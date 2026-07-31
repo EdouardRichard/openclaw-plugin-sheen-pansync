@@ -3,16 +3,20 @@ import {
   request as nodeRequest,
   type Server,
 } from "node:http";
-import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { JSDOM } from "jsdom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CredentialRecord } from "../../src/credentials/types.js";
 import { PanSyncError } from "../../src/errors.js";
+import { AliyunHttpClient } from "../../src/providers/aliyun/http.js";
+import { AliyunProvider } from "../../src/providers/aliyun/provider.js";
+import { UploadOrchestrator } from "../../src/upload/orchestrator.js";
 import {
   startSetupServer,
   type SetupServerDependencies,
+  type SetupServerRuntime,
 } from "../../src/admin/setup-server.js";
 
 const SECURITY_HEADERS = {
@@ -55,6 +59,44 @@ function deferred<T = void>() {
     resolve = resolvePromise;
   });
   return { promise, resolve };
+}
+
+async function startDelayedApi(delayedPath: string) {
+  const started = deferred();
+  const aborted = deferred();
+  const requests: string[] = [];
+  const server = nodeCreateServer((request, response) => {
+    const requestPath = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
+    requests.push(requestPath);
+    if (requestPath === delayedPath) {
+      started.resolve();
+      request.once("aborted", () => aborted.resolve());
+      response.once("close", () => {
+        if (!response.writableEnded) aborted.resolve();
+      });
+      request.resume();
+      return;
+    }
+    response.writeHead(500, { "content-type": "application/json" });
+    response.end('{"code":"UNEXPECTED_REQUEST"}');
+  });
+  server.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve, reject) => {
+    server.once("listening", resolve);
+    server.once("error", reject);
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("delayed API unavailable");
+  return {
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    requests,
+    started: started.promise,
+    aborted: aborted.promise,
+    async close() {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
 }
 
 async function createHarness(options: HarnessOptions = {}) {
@@ -399,7 +441,7 @@ describe("one-time setup server", () => {
     expect(harness.validateCredentials).toHaveBeenCalledWith({
       ...candidate,
       credentialVersion: 8,
-    });
+    }, expect.objectContaining({ signal: expect.any(AbortSignal) }));
     expect(harness.replace).not.toHaveBeenCalled();
     expect(harness.replaceIfVersion).toHaveBeenCalledWith(
       7,
@@ -664,6 +706,96 @@ describe("one-time setup server", () => {
     expect(await responseText).not.toContain(candidateSecret);
   });
 
+  it("aborts the real OAuth validation request on setup expiry before drive discovery", async () => {
+    const api = await startDelayedApi("/oauth/access_token");
+    cleanups.push(api.close);
+    const harness = await createHarness({ record: savedRecord });
+    cleanups.push(harness.cleanup);
+    harness.deps.provider = new AliyunProvider({
+      httpClient: new AliyunHttpClient({ baseUrl: api.baseUrl }),
+      baseUrl: api.baseUrl,
+      tokenManager: { async forceRefresh() { return "unused"; } },
+    });
+    let expire: (() => void) | undefined;
+    const result = await startSetupServer(harness.deps, {
+      scheduleTimeout(callback, delay) {
+        if (delay === 10 * 60 * 1_000) expire = callback;
+        return callback;
+      },
+      cancelTimeout() {},
+    });
+    runningServers.push(result);
+    const saving = apiRequest(
+      result.url.split("/#")[0] ?? "",
+      "/api/config",
+      accessKey(result.url),
+      {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          clientId: "oauth-client",
+          clientSecret: "oauth-secret",
+          refreshToken: "oauth-refresh",
+        }),
+      },
+    ).catch(() => undefined);
+    await api.started;
+
+    expire?.();
+
+    await expect(Promise.race([
+      api.aborted.then(() => "aborted"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("timeout"), 500)),
+    ])).resolves.toBe("aborted");
+    await result.closed;
+    await saving;
+    expect(api.requests).toEqual(["/oauth/access_token"]);
+    expect(harness.replaceIfVersion).not.toHaveBeenCalled();
+  });
+
+  it("aborts the real test-upload provider request on expiry before directory or upload mutation", async () => {
+    const api = await startDelayedApi("/adrive/v1.0/user/getDriveInfo");
+    cleanups.push(api.close);
+    const harness = await createHarness({ record: savedRecord });
+    cleanups.push(harness.cleanup);
+    const provider = new AliyunProvider({
+      httpClient: new AliyunHttpClient({ baseUrl: api.baseUrl }),
+      baseUrl: api.baseUrl,
+      tokenManager: { async forceRefresh() { return savedRecord.accessToken; } },
+    });
+    harness.deps.orchestrator = new UploadOrchestrator({
+      providerRegistry: { resolve: () => provider },
+      tokenManager: { async getValidAccessToken() { return savedRecord.accessToken; } },
+      config: { defaultDirectory: "/openClawShare" },
+    });
+    let expire: (() => void) | undefined;
+    const result = await startSetupServer(harness.deps, {
+      scheduleTimeout(callback, delay) {
+        if (delay === 10 * 60 * 1_000) expire = callback;
+        return callback;
+      },
+      cancelTimeout() {},
+    });
+    runningServers.push(result);
+    const uploading = apiRequest(
+      result.url.split("/#")[0] ?? "",
+      "/api/test-upload",
+      accessKey(result.url),
+      { method: "POST" },
+    ).catch(() => undefined);
+    await api.started;
+
+    expire?.();
+
+    await expect(Promise.race([
+      api.aborted.then(() => "aborted"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("timeout"), 500)),
+    ])).resolves.toBe("aborted");
+    await result.closed;
+    await uploading;
+    expect(api.requests).toEqual(["/adrive/v1.0/user/getDriveInfo"]);
+  });
+
   it("passes expiry cancellation into a delayed Vault CAS so it cannot commit", async () => {
     const casStarted = deferred();
     const casGate = deferred();
@@ -750,6 +882,9 @@ describe("one-time setup server", () => {
     });
     expect(cleared.status).toBe(200);
     expect(harness.clear).toHaveBeenCalledTimes(1);
+    expect(harness.clear).toHaveBeenCalledWith(
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
     expect(harness.record).toBeUndefined();
   });
 
@@ -938,7 +1073,7 @@ describe("one-time setup server", () => {
       clientSecret: savedRecord.clientSecret,
       refreshToken: savedRecord.refreshToken,
       credentialVersion: 8,
-    });
+    }, expect.objectContaining({ signal: expect.any(AbortSignal) }));
 
     const uploaded = await apiRequest(baseUrl, "/api/test-upload", key, {
       method: "POST",
@@ -1004,6 +1139,37 @@ describe("one-time setup server", () => {
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual({ code: "UPLOAD_FAILED" });
     expect(workspace).toMatch(/pan-sync-test-/u);
+  });
+
+  it("removes a newly created private workspace when its chmod fails", async () => {
+    const harness = await createHarness({ record: savedRecord });
+    cleanups.push(harness.cleanup);
+    let workspace = "";
+    const runtime = {
+      temporaryFiles: {
+        async chmod(target: string, mode: number) {
+          if (path.basename(target).startsWith("pan-sync-test-")) {
+            workspace = target;
+            throw new Error("workspace chmod failed");
+          }
+          await chmod(target, mode);
+        },
+      },
+    } as unknown as SetupServerRuntime;
+    const result = await startSetupServer(harness.deps, runtime);
+    runningServers.push(result);
+
+    const response = await apiRequest(
+      result.url.split("/#")[0] ?? "",
+      "/api/test-upload",
+      accessKey(result.url),
+      { method: "POST" },
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ code: "UPLOAD_FAILED" });
+    expect(workspace).toMatch(/pan-sync-test-/u);
+    await expect(access(workspace)).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
 

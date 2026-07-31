@@ -1,5 +1,6 @@
 import { PanSyncError } from "../errors.js";
 import type { AliyunHttpClient } from "../providers/aliyun/http.js";
+import type { ProviderOperationOptions } from "../contracts.js";
 import type { CredentialRecord } from "./types.js";
 
 const REFRESH_WINDOW_MS = 5 * 60 * 1_000;
@@ -34,7 +35,7 @@ export class TokenManager {
     private readonly clock: () => number = Date.now,
   ) {}
 
-  async getValidAccessToken(): Promise<string> {
+  async getValidAccessToken(options: ProviderOperationOptions = {}): Promise<string> {
     const record = await this.#readConfiguredRecord();
     if (
       record.accessToken.length > 0
@@ -44,10 +45,13 @@ export class TokenManager {
       return record.accessToken;
     }
 
-    return this.#singleFlightRefresh(record);
+    return this.#singleFlightRefresh(record, options);
   }
 
-  async forceRefresh(expectedAccessToken?: string): Promise<string> {
+  async forceRefresh(
+    expectedAccessToken?: string,
+    options: ProviderOperationOptions = {},
+  ): Promise<string> {
     const record = await this.#readConfiguredRecord();
     if (
       expectedAccessToken !== undefined
@@ -59,7 +63,7 @@ export class TokenManager {
       return record.accessToken;
     }
 
-    return this.#singleFlightRefresh(record);
+    return this.#singleFlightRefresh(record, options);
   }
 
   async status(): Promise<TokenManagerStatus> {
@@ -94,12 +98,15 @@ export class TokenManager {
     return record;
   }
 
-  #singleFlightRefresh(record: CredentialRecord): Promise<string> {
+  #singleFlightRefresh(
+    record: CredentialRecord,
+    options: ProviderOperationOptions,
+  ): Promise<string> {
     if (this.#refreshInFlight !== undefined) {
       return this.#refreshInFlight;
     }
 
-    const refresh = this.#refresh(record);
+    const refresh = this.#refresh(record, options);
     const tracked = refresh.finally(() => {
       if (this.#refreshInFlight === tracked) {
         this.#refreshInFlight = undefined;
@@ -109,7 +116,10 @@ export class TokenManager {
     return tracked;
   }
 
-  async #refresh(record: CredentialRecord): Promise<string> {
+  async #refresh(
+    record: CredentialRecord,
+    options: ProviderOperationOptions,
+  ): Promise<string> {
     if (
       record.clientId.length === 0
       || record.clientSecret.length === 0
@@ -124,6 +134,7 @@ export class TokenManager {
         clientId: record.clientId,
         clientSecret: record.clientSecret,
         refreshToken: record.refreshToken,
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
       });
     } catch (error) {
       if (
@@ -169,6 +180,7 @@ export class TokenManager {
     const replaced = await this.store.replaceIfVersion(
       record.credentialVersion,
       candidate,
+      options,
     );
     if (replaced) {
       this.#failureState = undefined;

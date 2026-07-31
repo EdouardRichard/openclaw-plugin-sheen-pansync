@@ -2,6 +2,7 @@ import { Readable } from "node:stream";
 import type {
   ProviderUploadInput,
   ProviderUploadResult,
+  ProviderOperationOptions,
   RemoteDirectory,
 } from "../../contracts.js";
 import type { PanSyncErrorCode } from "../../errors.js";
@@ -30,7 +31,7 @@ export type AliyunProviderUploadInput = Omit<
 };
 
 export type AliyunTokenRefresher = {
-  forceRefresh(expectedAccessToken?: string): Promise<string>;
+  forceRefresh(expectedAccessToken?: string, options?: ProviderOperationOptions): Promise<string>;
 };
 
 export type AliyunAuthorizedClientOptions = {
@@ -43,6 +44,7 @@ export type AliyunPostOptions = {
   failureCode: PanSyncErrorCode;
   retryUnauthorized?: boolean;
   allowAlreadyExisting?: boolean;
+  signal?: AbortSignal;
 };
 
 export type AliyunPostResult = {
@@ -146,6 +148,7 @@ export class AliyunAuthorizedClient {
               "content-type": "application/json",
             },
             body: JSON.stringify(requestBody),
+            ...(options.signal === undefined ? {} : { signal: options.signal }),
           },
         );
         body = await response.json().catch(() => undefined);
@@ -157,7 +160,11 @@ export class AliyunAuthorizedClient {
         if (refreshed) {
           throw new PanSyncError("AUTHORIZATION_REVOKED");
         }
-        token = await this.options.tokenManager.forceRefresh(token);
+        token = options.signal === undefined
+          ? await this.options.tokenManager.forceRefresh(token)
+          : await this.options.tokenManager.forceRefresh(token, {
+            signal: options.signal,
+          });
         refreshed = true;
         continue;
       }
@@ -346,11 +353,18 @@ async function uploadParts(
   partSize: number,
   initialAccessToken: string,
   clock: () => number,
+  externalSignal?: AbortSignal,
 ): Promise<string> {
   let nextIndex = 0;
   let accessToken = initialAccessToken;
   let failure: PanSyncError | undefined;
   const cancellation = new AbortController();
+  const abortFromExternal = (): void => cancellation.abort(externalSignal?.reason);
+  if (externalSignal?.aborted === true) {
+    abortFromExternal();
+  } else {
+    externalSignal?.addEventListener("abort", abortFromExternal, { once: true });
+  }
 
   const stopWith = (error: unknown): void => {
     if (failure !== undefined) {
@@ -383,7 +397,10 @@ async function uploadParts(
               upload_id: upload.uploadId,
               part_info_list: [{ part_number: part.partNumber }],
             },
-            { failureCode: "UPLOAD_FAILED" },
+            {
+              failureCode: "UPLOAD_FAILED",
+              signal: cancellation.signal,
+            },
           );
           accessToken = refreshed.accessToken;
           part = parseRefreshedPartUrl(
@@ -417,17 +434,22 @@ async function uploadParts(
   };
 
   const workerCount = Math.min(MAX_CONCURRENT_PUTS, upload.parts.length);
-  await Promise.all(Array.from({ length: workerCount }, worker));
-  if (failure !== undefined) {
-    throw failure;
+  try {
+    await Promise.all(Array.from({ length: workerCount }, worker));
+    if (failure !== undefined) {
+      throw failure;
+    }
+    return accessToken;
+  } finally {
+    externalSignal?.removeEventListener("abort", abortFromExternal);
   }
-  return accessToken;
 }
 
 export async function uploadAliyunFile(
   client: AliyunAuthorizedClient,
   input: AliyunProviderUploadInput,
   clock: () => number,
+  options: ProviderOperationOptions = {},
 ): Promise<ProviderUploadResult> {
   if (
     !Number.isSafeInteger(input.file.size)
@@ -458,7 +480,10 @@ export async function uploadAliyunFile(
         (_unused, index) => ({ part_number: index + 1 }),
       ),
     },
-    { failureCode: "UPLOAD_FAILED" },
+    {
+      failureCode: "UPLOAD_FAILED",
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    },
   );
   const upload = parseCreatedUpload(create.body, totalParts, clock());
   const accessToken = await uploadParts(
@@ -468,6 +493,7 @@ export async function uploadAliyunFile(
     partSize,
     create.accessToken,
     clock,
+    options.signal,
   );
   const complete = await client.post(
     "/adrive/v1.0/openFile/complete",
@@ -477,7 +503,10 @@ export async function uploadAliyunFile(
       file_id: upload.fileId,
       upload_id: upload.uploadId,
     },
-    { failureCode: "UPLOAD_FAILED" },
+    {
+      failureCode: "UPLOAD_FAILED",
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    },
   );
   if (!isRecord(complete.body)) {
     throw new PanSyncError("UPLOAD_FAILED");

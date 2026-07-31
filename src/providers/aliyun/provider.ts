@@ -3,6 +3,7 @@ import type {
   CredentialInput,
   ProviderUploadInput,
   ProviderUploadResult,
+  ProviderOperationOptions,
   RemoteDirectory,
 } from "../../contracts.js";
 import type { CredentialRecord } from "../../credentials/types.js";
@@ -163,6 +164,7 @@ export class AliyunProvider implements CloudDriveProvider {
 
   async validateCredentials(
     candidate: CredentialInput,
+    options: ProviderOperationOptions = {},
   ): Promise<CredentialRecord> {
     const completeCandidate = requiredCandidate(candidate);
     let refreshed: Awaited<
@@ -173,6 +175,7 @@ export class AliyunProvider implements CloudDriveProvider {
         clientId: completeCandidate.clientId,
         clientSecret: completeCandidate.clientSecret,
         refreshToken: completeCandidate.refreshToken,
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
       });
     } catch (error) {
       if (
@@ -192,6 +195,7 @@ export class AliyunProvider implements CloudDriveProvider {
       {
         failureCode: "CREDENTIALS_INVALID",
         retryUnauthorized: false,
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
       },
     );
     const drive = parseDriveSummary(driveResponse.body);
@@ -220,13 +224,17 @@ export class AliyunProvider implements CloudDriveProvider {
   async ensureDirectory(
     remotePath: string,
     accessToken: string,
+    options: ProviderOperationOptions = {},
   ): Promise<AliyunRemoteDirectory> {
     let token = accessToken;
     const driveResponse = await this.#api.post(
       "/adrive/v1.0/user/getDriveInfo",
       token,
       {},
-      { failureCode: "CREDENTIALS_INVALID" },
+      {
+        failureCode: "CREDENTIALS_INVALID",
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+      },
     );
     token = driveResponse.accessToken;
     const drive = parseDriveSummary(driveResponse.body);
@@ -258,6 +266,7 @@ export class AliyunProvider implements CloudDriveProvider {
         parentId,
         segment,
         token,
+        options,
       );
       token = listed.accessToken;
       if (listed.fileId !== undefined) {
@@ -279,6 +288,7 @@ export class AliyunProvider implements CloudDriveProvider {
         {
           failureCode: "REMOTE_DIRECTORY_FAILED",
           allowAlreadyExisting: true,
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
         },
       );
       token = created.accessToken;
@@ -288,6 +298,7 @@ export class AliyunProvider implements CloudDriveProvider {
           parentId,
           segment,
           token,
+          options,
         );
         token = raced.accessToken;
         if (raced.fileId === undefined) {
@@ -309,11 +320,12 @@ export class AliyunProvider implements CloudDriveProvider {
 
   async uploadFile(
     input: ProviderUploadInput,
+    options: ProviderOperationOptions = {},
   ): Promise<ProviderUploadResult> {
     if (!isAliyunUploadInput(input)) {
       throw new PanSyncError("UPLOAD_FAILED");
     }
-    return uploadAliyunFile(this.#api, input, this.#clock);
+    return uploadAliyunFile(this.#api, input, this.#clock, options);
   }
 
   async #findFolder(
@@ -321,6 +333,7 @@ export class AliyunProvider implements CloudDriveProvider {
     parentId: string,
     name: string,
     initialAccessToken: string,
+    options: ProviderOperationOptions,
   ): Promise<{ fileId?: string; accessToken: string }> {
     let marker: string | undefined;
     let accessToken = initialAccessToken;
@@ -334,7 +347,10 @@ export class AliyunProvider implements CloudDriveProvider {
           limit: 200,
           ...(marker === undefined ? {} : { marker }),
         },
-        { failureCode: "REMOTE_DIRECTORY_FAILED" },
+        {
+          failureCode: "REMOTE_DIRECTORY_FAILED",
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
+        },
       );
       accessToken = listed.accessToken;
       const page = listPage(listed.body);

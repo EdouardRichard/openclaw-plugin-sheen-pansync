@@ -447,6 +447,17 @@ export class CredentialStore {
     );
     let backupCreated = false;
     let preserveBackup = false;
+    let canonicalDeleted = false;
+    const restoreCanonical = async (): Promise<void> => {
+      if (!canonicalDeleted) {
+        return;
+      }
+      preserveBackup = true;
+      await this.#files.link(backupPath, this.#credentialsPath);
+      canonicalDeleted = false;
+      await this.#files.syncDirectory(this.dataDir);
+      preserveBackup = false;
+    };
     try {
       try {
         await this.#files.link(this.#credentialsPath, backupPath);
@@ -463,18 +474,30 @@ export class CredentialStore {
         throw new Error("credential mutation aborted");
       }
       await this.#files.unlink(this.#credentialsPath);
+      canonicalDeleted = true;
+      if (mutationAborted(signal)) {
+        await restoreCanonical();
+        throw new Error("credential mutation aborted");
+      }
       try {
         await this.#files.syncDirectory(this.dataDir);
       } catch (error) {
-        preserveBackup = true;
-        await this.#files.rename(backupPath, this.#credentialsPath);
-        backupCreated = false;
-        await this.#files.syncDirectory(this.dataDir);
+        await restoreCanonical();
         throw error;
       }
+      if (mutationAborted(signal)) {
+        await restoreCanonical();
+        throw new Error("credential mutation aborted");
+      }
 
-      await this.#files.unlink(backupPath).catch(() => undefined);
+      try {
+        await this.#files.unlink(backupPath);
+      } catch (error) {
+        await restoreCanonical();
+        throw error;
+      }
       backupCreated = false;
+      await this.#files.syncDirectory(this.dataDir).catch(() => undefined);
     } finally {
       if (backupCreated && !preserveBackup) {
         await this.#files.unlink(backupPath).catch(() => undefined);

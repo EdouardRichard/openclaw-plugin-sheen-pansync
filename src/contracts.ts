@@ -52,10 +52,14 @@ export type ProviderUploadResult = {
   size: number;
 };
 
+export type ProviderOperationOptions = {
+  signal?: AbortSignal;
+};
+
 export interface CloudDriveProvider {
   readonly id: ProviderId;
   readonly aliases: readonly string[];
-  validateCredentials(candidate: CredentialInput): Promise<ValidatedCredentialRecord>;
-  ensureDirectory(remotePath: string, accessToken: string): Promise<RemoteDirectory>;
-  uploadFile(input: ProviderUploadInput): Promise<ProviderUploadResult>;
+  validateCredentials(candidate: CredentialInput, options?: ProviderOperationOptions): Promise<ValidatedCredentialRecord>;
+  ensureDirectory(remotePath: string, accessToken: string, options?: ProviderOperationOptions): Promise<RemoteDirectory>;
+  uploadFile(input: ProviderUploadInput, options?: ProviderOperationOptions): Promise<ProviderUploadResult>;
 }

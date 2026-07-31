@@ -4,6 +4,7 @@ import {
   mkdir,
   open,
   readFile,
+  readdir,
   rename,
   unlink,
   writeFile,
@@ -38,6 +39,14 @@ function record(
     },
     lastVerifiedAt: "2026-07-31T00:00:00.000Z",
   };
+}
+
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -388,6 +397,89 @@ describe("CredentialStore", () => {
 
     await expect(store.read()).resolves.toBeUndefined();
     await expect(readFile(masterKeyPath)).resolves.toEqual(key);
+  });
+
+  it("restores the exact prior credential when clear is aborted during canonical unlink", async () => {
+    const dataDir = await tempDataDir();
+    const credentialsPath = path.join(dataDir, "credentials.enc");
+    const initial = record(1);
+    const seedStore = new CredentialStore(dataDir, immediateLease);
+    await seedStore.replace(initial);
+    const ciphertext = await readFile(credentialsPath);
+    const unlinkStarted = deferred();
+    const unlinkGate = deferred();
+    const store = new CredentialStore(dataDir, immediateLease, {
+      async unlink(target) {
+        if (target === credentialsPath) {
+          unlinkStarted.resolve();
+          await unlinkGate.promise;
+        }
+        await unlink(target);
+      },
+    });
+    const controller = new AbortController();
+
+    const clearing = store.clear({ signal: controller.signal });
+    await unlinkStarted.promise;
+    controller.abort();
+    unlinkGate.resolve();
+
+    await expect(clearing).rejects.toThrow("credential store clear failed");
+    await expect(readFile(credentialsPath)).resolves.toEqual(ciphertext);
+    await expect(new CredentialStore(dataDir, immediateLease).read()).resolves.toEqual(initial);
+    expect((await readdir(dataDir)).some((name) => name.endsWith(".bak"))).toBe(false);
+  });
+
+  it("restores clear when cancellation arrives during the post-unlink directory sync", async () => {
+    const dataDir = await tempDataDir();
+    const credentialsPath = path.join(dataDir, "credentials.enc");
+    const initial = record(1);
+    const seedStore = new CredentialStore(dataDir, immediateLease);
+    await seedStore.replace(initial);
+    const ciphertext = await readFile(credentialsPath);
+    const syncStarted = deferred();
+    const syncGate = deferred();
+    let syncCalls = 0;
+    const store = new CredentialStore(dataDir, immediateLease, {
+      async syncDirectory() {
+        syncCalls += 1;
+        if (syncCalls === 2) {
+          syncStarted.resolve();
+          await syncGate.promise;
+        }
+      },
+    });
+    const controller = new AbortController();
+    const clearing = store.clear({ signal: controller.signal });
+    await syncStarted.promise;
+
+    controller.abort();
+    syncGate.resolve();
+
+    await expect(clearing).rejects.toThrow("credential store clear failed");
+    await expect(readFile(credentialsPath)).resolves.toEqual(ciphertext);
+    await expect(new CredentialStore(dataDir, immediateLease).read()).resolves.toEqual(initial);
+  });
+
+  it("restores clear when the post-unlink directory sync fails", async () => {
+    const dataDir = await tempDataDir();
+    const credentialsPath = path.join(dataDir, "credentials.enc");
+    const initial = record(1);
+    const seedStore = new CredentialStore(dataDir, immediateLease);
+    await seedStore.replace(initial);
+    const ciphertext = await readFile(credentialsPath);
+    let syncCalls = 0;
+    const store = new CredentialStore(dataDir, immediateLease, {
+      async syncDirectory() {
+        syncCalls += 1;
+        if (syncCalls === 2) throw new Error("post-unlink sync failed");
+      },
+    });
+
+    await expect(store.clear()).rejects.toThrow("credential store clear failed");
+
+    await expect(readFile(credentialsPath)).resolves.toEqual(ciphertext);
+    await expect(new CredentialStore(dataDir, immediateLease).read()).resolves.toEqual(initial);
   });
 
   it("runs every operation through the injected credential lease", async () => {

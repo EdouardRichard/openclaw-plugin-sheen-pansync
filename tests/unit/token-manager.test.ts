@@ -328,6 +328,22 @@ describe("TokenManager", () => {
     expect(server.requests).toHaveLength(1);
   });
 
+  it("propagates caller cancellation into token refresh without mutating the Vault", async () => {
+    const { store } = await tempStore();
+    const initial = expiredRecord();
+    await store.replace(initial);
+    const server = await fakeServer(successResponse());
+    const manager = new TokenManager(store, client(server), () => NOW);
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      manager.getValidAccessToken({ signal: controller.signal }),
+    ).rejects.toMatchObject({ code: "TOKEN_ENDPOINT_UNAVAILABLE" });
+    expect(server.requests).toEqual([]);
+    await expect(store.read()).resolves.toEqual(initial);
+  });
+
   it("returns the winning access token when rotated-token CAS loses", async () => {
     const { store } = await tempStore();
     const initial = expiredRecord();

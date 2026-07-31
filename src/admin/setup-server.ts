@@ -6,7 +6,8 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
-import { chmod, lstat, mkdir, mkdtemp, open, realpath, rm } from "node:fs/promises";
+import { chmod, type FileHandle, lstat, mkdir, mkdtemp, open, realpath, rm } from "node:fs/promises";
+import type { Stats } from "node:fs";
 import path from "node:path";
 import type { CredentialInput } from "../contracts.js";
 import type { CredentialStore } from "../credentials/store.js";
@@ -66,7 +67,26 @@ export type SetupServerRuntime = {
   scheduleRequestTimeout?: (callback: () => void, delay: number) => unknown;
   cancelRequestTimeout?: (timeout: unknown) => void;
   removeTemporaryDirectory?: (directory: string) => Promise<void>;
+  temporaryFiles?: Partial<SetupTemporaryFileAdapter>;
   isBrowserSafePort?: (port: number) => boolean;
+};
+
+export type SetupTemporaryFileAdapter = {
+  chmod(target: string, mode: number): Promise<void>;
+  lstat(target: string): Promise<Stats>;
+  mkdir(directory: string, options: { recursive: true; mode: number }): Promise<unknown>;
+  mkdtemp(prefix: string): Promise<string>;
+  open(target: string, flags: string, mode: number): Promise<FileHandle>;
+  realpath(target: string): Promise<string>;
+};
+
+const defaultTemporaryFiles: SetupTemporaryFileAdapter = {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  open,
+  realpath,
 };
 
 export type SetupServer = {
@@ -325,6 +345,10 @@ export async function startSetupServer(
   const cancelTimeout = runtime.cancelTimeout ?? ((timeout: unknown) => clearTimeout(timeout as NodeJS.Timeout));
   const scheduleRequestTimeout = runtime.scheduleRequestTimeout ?? ((callback: () => void, delay: number) => setTimeout(callback, delay));
   const cancelRequestTimeout = runtime.cancelRequestTimeout ?? ((timeout: unknown) => clearTimeout(timeout as NodeJS.Timeout));
+  const temporaryFiles: SetupTemporaryFileAdapter = {
+    ...defaultTemporaryFiles,
+    ...runtime.temporaryFiles,
+  };
   const removeTemporaryDirectory = runtime.removeTemporaryDirectory
     ?? ((directory: string) => rm(directory, { recursive: true, force: false }));
   let active = true;
@@ -396,10 +420,13 @@ export async function startSetupServer(
     const signal = context.controller.signal;
     const current = knownCurrent ?? await abortable(dependencies.store.read(), signal);
     assertAuthorized(context, authorization);
-    const validated = await abortable(dependencies.provider.validateCredentials({
-      ...candidate,
-      credentialVersion: (current?.credentialVersion ?? 0) + 1,
-    }), signal);
+    const validated = await abortable(dependencies.provider.validateCredentials(
+      {
+        ...candidate,
+        credentialVersion: (current?.credentialVersion ?? 0) + 1,
+      },
+      { signal },
+    ), signal);
     assertAuthorized(context, authorization);
     if (!await abortable(dependencies.store.replaceIfVersion(current?.credentialVersion, validated, { signal }), signal)) {
       throw new SetupConflictError();
@@ -468,23 +495,23 @@ export async function startSetupServer(
       }
 
       const uploadResult = await abortable((async () => {
-        await mkdir(dependencies.dataDir, { recursive: true, mode: 0o700 });
-        await chmod(dependencies.dataDir, 0o700);
-        const confinedDataDir = await realpath(dependencies.dataDir);
+        await temporaryFiles.mkdir(dependencies.dataDir, { recursive: true, mode: 0o700 });
+        await temporaryFiles.chmod(dependencies.dataDir, 0o700);
+        const confinedDataDir = await temporaryFiles.realpath(dependencies.dataDir);
         const temporaryRoot = path.join(confinedDataDir, "tmp");
-        await mkdir(temporaryRoot, { recursive: true, mode: 0o700 });
-        const temporaryRootStat = await lstat(temporaryRoot);
+        await temporaryFiles.mkdir(temporaryRoot, { recursive: true, mode: 0o700 });
+        const temporaryRootStat = await temporaryFiles.lstat(temporaryRoot);
         if (temporaryRootStat.isSymbolicLink() || !temporaryRootStat.isDirectory()) {
           throw new PanSyncError("UPLOAD_FAILED");
         }
-        const confinedTemporaryRoot = await realpath(temporaryRoot);
+        const confinedTemporaryRoot = await temporaryFiles.realpath(temporaryRoot);
         if (path.dirname(confinedTemporaryRoot) !== confinedDataDir) {
           throw new PanSyncError("UPLOAD_FAILED");
         }
-        await chmod(confinedTemporaryRoot, 0o700);
-        const workspaceDir = await mkdtemp(path.join(confinedTemporaryRoot, "pan-sync-test-"));
-        await chmod(workspaceDir, 0o700);
+        await temporaryFiles.chmod(confinedTemporaryRoot, 0o700);
+        const workspaceDir = await temporaryFiles.mkdtemp(path.join(confinedTemporaryRoot, "pan-sync-test-"));
         try {
+          await temporaryFiles.chmod(workspaceDir, 0o700);
           const filename = "payload.txt";
           const temporaryPath = path.join(workspaceDir, filename);
           const source = dependencies.randomBytes(32);
@@ -492,7 +519,7 @@ export async function startSetupServer(
           const payload = Buffer.from(`${source.toString("base64url")}\n`, "ascii");
           source.fill(0);
           try {
-            const handle = await open(temporaryPath, "wx", 0o600);
+            const handle = await temporaryFiles.open(temporaryPath, "wx", 0o600);
             try {
               await handle.writeFile(payload);
               await handle.sync();
@@ -502,11 +529,14 @@ export async function startSetupServer(
           } finally {
             payload.fill(0);
           }
-          const uploaded = await dependencies.orchestrator.upload({
-            paths: [filename],
-            remoteDirectory: DEFAULT_REMOTE_DIRECTORY,
-            workspaceDir,
-          });
+          const uploaded = await dependencies.orchestrator.upload(
+            {
+              paths: [filename],
+              remoteDirectory: DEFAULT_REMOTE_DIRECTORY,
+              workspaceDir,
+            },
+            { signal: context.controller.signal },
+          );
           const file = uploaded.files.find((entry) => entry.status === "uploaded");
           if (file?.remoteName === undefined || uploaded.status === "failed") {
             throw new PanSyncError("UPLOAD_FAILED");
