@@ -116,6 +116,33 @@ OpenClaw 部署在远程 Linux 主机时，生成文件位于远程工作区，�
 - `package.json` 同时声明源码入口和运行时入口。
 - 根目录包含有效的 `openclaw.plugin.json`。
 
+#### 6.1.1 CLI metadata 兼容入口
+
+OpenClaw `2026.7.1-2` 在解析插件 CLI 命令时优先加载包根目录的
+`cli-metadata.js`，并为社区插件提供 `registrationMode: "cli-metadata"`、空的
+`runtime` 对象和 `registerCli` 能力。该阶段不能访问完整插件运行时，也不能调用
+`api.runtime.state.resolveStateDir()`。
+
+本插件采用独立的轻量 CLI metadata 入口：
+
+- 发布包根目录必须包含 `cli-metadata.js`，它只注册 `pan-sync` 命令元数据，不初始化
+  Tool、HTTP 路由、Control UI、Provider 或凭证存储。
+- 用户实际执行 `pan-sync configure` 时，命令处理器再延迟导入 `dist/` 中的 CLI
+  运行时模块。
+- CLI 运行时通过 OpenClaw 公共导出
+  `openclaw/plugin-sdk/state-paths` 的 `resolveStateDir()` 定位 state 目录；不得依赖
+  metadata 上下文中不存在的 `api.runtime.state`，也不得访问 OpenClaw 私有 loader。
+- 完整插件入口和 CLI 入口复用同一个运行时组合函数，保证 Credential Store、SQLite
+  lease、Token Manager、Aliyun Provider、Provider Registry 和 Upload Orchestrator 的
+  构造规则一致。
+- `cli-metadata.js` 必须进入 npm 发布白名单；源码、测试、临时 OpenClaw state 和凭证
+  文件仍不得进入发布包。
+
+曾评估的替代方案包括：让完整 `dist/index.js` 在 metadata 模式下跳过部分注册，或在
+CLI metadata 阶段伪造完整 runtime。前者仍会把重量级运行时加载进命令发现流程，并
+容易产生两套条件注册逻辑；后者依赖未承诺的私有契约。独立轻量入口边界最清晰，且与
+OpenClaw 官方 CLI metadata 加载方式一致，因此作为本版本方案。
+
 ### 6.2 Control UI 页面
 
 插件使用分组后的 SDK 接口注册 Control UI 标签页：
@@ -555,6 +582,10 @@ Linux 权限：
 ### 14.3 OpenClaw 集成测试
 
 - Manifest、Config Schema 和编译产物。
+- 实际 npm tarball 包含根级 `cli-metadata.js`，并排除源码、测试和运行时秘密。
+- 将实际 tarball 安装到全新 OpenClaw state 后，官方
+  `openclaw pan-sync configure` 能被识别并启动回环配置服务，不产生 CLI metadata
+  注册诊断；测试必须精确终止服务且不得输出一次性 fragment 或凭证。
 - `pan_sync_upload` 注册。
 - 随包 Skill 发现。
 - Control UI 标签页。
