@@ -103,6 +103,20 @@ export class TokenManager {
     return "ready";
   }
 
+  clearSnapshots(): void {
+    this.#failureState = undefined;
+    const operation = this.#refreshInFlight;
+    if (operation === undefined) {
+      return;
+    }
+    this.#refreshInFlight = undefined;
+    this.#settleRefresh(operation, {
+      status: "rejected",
+      reason: cancellationError(),
+    });
+    operation.controller.abort();
+  }
+
   async #readConfiguredRecord(): Promise<CredentialRecord> {
     const record = await this.store.read();
     if (record === undefined) {

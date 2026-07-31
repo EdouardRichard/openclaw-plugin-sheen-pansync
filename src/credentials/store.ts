@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import type { Stats } from "node:fs";
 import {
   chmod as fsChmod,
   type FileHandle,
@@ -24,13 +25,22 @@ const ROLLBACK_MARKER = "rollback-v1\n";
 const READ_FAILED = "credential store read failed";
 const WRITE_FAILED = "credential store write failed";
 const CLEAR_FAILED = "credential store clear failed";
+const INITIALIZE_FAILED = "credential store initialization failed";
 
 function mutationAborted(signal: AbortSignal | undefined): boolean {
   return signal?.aborted === true;
 }
 
+export type CredentialLeaseContext = {
+  assertOwned(): Promise<void>;
+};
+
 export interface CredentialLeaseRunner {
-  <T>(key: string, run: () => Promise<T>): Promise<T>;
+  <T>(
+    key: string,
+    run: (lease: CredentialLeaseContext) => Promise<T>,
+    options?: { signal?: AbortSignal },
+  ): Promise<T>;
 }
 
 export interface CredentialFileAdapter {
@@ -82,6 +92,16 @@ function hasErrorCode(error: unknown, code: string): boolean {
   );
 }
 
+function sameFile(left: Stats, right: Stats): boolean {
+  return (
+    left.isFile()
+    && right.isFile()
+    && left.dev === right.dev
+    && left.ino === right.ino
+    && (left.dev !== 0 || left.ino !== 0)
+  );
+}
+
 export class CredentialStore {
   readonly #credentialsPath: string;
   readonly #backupPath: string;
@@ -105,7 +125,12 @@ export class CredentialStore {
     try {
       return await this.runWithLease(
         CREDENTIAL_LEASE_KEY,
-        () => this.#readUnlocked(),
+        async (lease) => {
+          await lease.assertOwned();
+          const record = await this.#readUnlocked();
+          await lease.assertOwned();
+          return record;
+        },
       );
     } catch {
       throw new Error(READ_FAILED);
@@ -116,7 +141,10 @@ export class CredentialStore {
     try {
       await this.runWithLease(
         CREDENTIAL_LEASE_KEY,
-        () => this.#writeUnlocked(candidate),
+        async (lease) => {
+          await lease.assertOwned();
+          await this.#writeUnlocked(candidate, undefined, lease);
+        },
       );
     } catch {
       throw new Error(WRITE_FAILED);
@@ -128,8 +156,12 @@ export class CredentialStore {
     candidate: CredentialRecord,
     options: { signal?: AbortSignal } = {},
   ): Promise<boolean> {
+    if (mutationAborted(options.signal)) {
+      return false;
+    }
     try {
-      return await this.runWithLease(CREDENTIAL_LEASE_KEY, async () => {
+      return await this.runWithLease(CREDENTIAL_LEASE_KEY, async (lease) => {
+        await lease.assertOwned();
         if (mutationAborted(options.signal)) {
           return false;
         }
@@ -141,26 +173,44 @@ export class CredentialStore {
           return false;
         }
 
-        await this.#writeUnlocked(candidate, options.signal);
+        await lease.assertOwned();
+        await this.#writeUnlocked(candidate, options.signal, lease);
         return true;
-      });
+      }, options.signal === undefined ? {} : { signal: options.signal });
     } catch {
       throw new Error(WRITE_FAILED);
     }
   }
 
   async clear(options: { signal?: AbortSignal } = {}): Promise<void> {
+    if (mutationAborted(options.signal)) {
+      return;
+    }
     try {
       await this.runWithLease(
         CREDENTIAL_LEASE_KEY,
-        async () => {
+        async (lease) => {
           if (!mutationAborted(options.signal)) {
-            await this.#clearUnlocked(options.signal);
+            await lease.assertOwned();
+            await this.#clearUnlocked(options.signal, lease);
           }
         },
+        options.signal === undefined ? {} : { signal: options.signal },
       );
     } catch {
       throw new Error(CLEAR_FAILED);
+    }
+  }
+
+  async initialize(): Promise<void> {
+    try {
+      await this.runWithLease(CREDENTIAL_LEASE_KEY, async (lease) => {
+        await lease.assertOwned();
+        await this.#ensureDataDirectory();
+        await lease.assertOwned();
+      });
+    } catch {
+      throw new Error(INITIALIZE_FAILED);
     }
   }
 
@@ -197,12 +247,16 @@ export class CredentialStore {
   async #writeUnlocked(
     candidate: CredentialRecord,
     signal?: AbortSignal,
+    lease?: CredentialLeaseContext,
   ): Promise<void> {
     if (mutationAborted(signal)) {
       throw new Error("credential mutation aborted");
     }
+    await lease?.assertOwned();
     await this.#ensureDataDirectory();
+    await lease?.assertOwned();
     await this.#recoverPendingTransactionForWrite();
+    await lease?.assertOwned();
     const key = await this.#loadOrCreateMasterKey();
     const envelope = encryptRecord(key, candidate);
     const temporaryPath = path.join(
@@ -210,6 +264,7 @@ export class CredentialStore {
       `.credentials.enc.${randomBytes(16).toString("hex")}.tmp`,
     );
     let temporaryFile: FileHandle | undefined;
+    let temporaryIdentity: Stats | undefined;
     let temporaryRenamed = false;
 
     try {
@@ -221,37 +276,57 @@ export class CredentialStore {
       await temporaryFile.writeFile(`${JSON.stringify(envelope)}\n`, "utf8");
       await this.#files.chmod(temporaryPath, PRIVATE_FILE_MODE);
       await temporaryFile.sync();
+      temporaryIdentity = await temporaryFile.stat();
       await temporaryFile.close();
       temporaryFile = undefined;
 
       if (mutationAborted(signal)) {
         throw new Error("credential mutation aborted");
       }
+      await lease?.assertOwned();
       await this.#prepareRollbackJournal();
+      await lease?.assertOwned();
       if (mutationAborted(signal)) {
         await this.#commitTransaction();
         throw new Error("credential mutation aborted");
       }
+      await lease?.assertOwned();
       await this.#files.rename(temporaryPath, this.#credentialsPath);
       temporaryRenamed = true;
       try {
         await this.#files.syncDirectory(this.dataDir);
       } catch (error) {
-        await this.#restorePreviousCanonical().catch(() => undefined);
+        await this.#restorePreviousCanonical(temporaryIdentity).catch(
+          () => undefined,
+        );
         throw error;
       }
 
+      try {
+        await lease?.assertOwned();
+      } catch (error) {
+        const restored = await this.#restorePreviousCanonical(
+          temporaryIdentity,
+        );
+        if (restored) await this.#commitTransaction();
+        throw error;
+      }
       if (mutationAborted(signal)) {
-        await this.#restorePreviousCanonical();
-        await this.#commitTransaction();
+        const restored = await this.#restorePreviousCanonical(
+          temporaryIdentity,
+        );
+        if (restored) await this.#commitTransaction();
         throw new Error("credential mutation aborted");
       }
 
       try {
+        await lease?.assertOwned();
         await this.#commitTransaction();
       } catch (error) {
         await this.#ensureRollbackMarker().catch(() => undefined);
-        await this.#restorePreviousCanonical().catch(() => undefined);
+        await this.#restorePreviousCanonical(temporaryIdentity).catch(
+          () => undefined,
+        );
         throw error;
       }
     } finally {
@@ -374,7 +449,28 @@ export class CredentialStore {
     await this.#files.syncDirectory(this.dataDir);
   }
 
-  async #restorePreviousCanonical(): Promise<void> {
+  async #pathIdentity(target: string): Promise<Stats | undefined> {
+    let handle: FileHandle | undefined;
+    try {
+      handle = await this.#files.open(target, "r");
+      return await handle.stat();
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) return undefined;
+      throw error;
+    } finally {
+      await handle?.close().catch(() => undefined);
+    }
+  }
+
+  async #restorePreviousCanonical(
+    expectedCanonical?: Stats,
+  ): Promise<boolean> {
+    if (expectedCanonical !== undefined) {
+      const current = await this.#pathIdentity(this.#credentialsPath);
+      if (current === undefined || !sameFile(current, expectedCanonical)) {
+        return false;
+      }
+    }
     const recoveryPath = path.join(
       this.dataDir,
       `.credentials.enc.${randomBytes(16).toString("hex")}.rollback`,
@@ -406,6 +502,7 @@ export class CredentialStore {
         await this.#files.unlink(recoveryPath).catch(() => undefined);
       }
     }
+    return true;
   }
 
   async #commitTransaction(): Promise<void> {
@@ -436,11 +533,16 @@ export class CredentialStore {
     await this.#files.syncDirectory(this.dataDir).catch(() => undefined);
   }
 
-  async #clearUnlocked(signal?: AbortSignal): Promise<void> {
+  async #clearUnlocked(
+    signal?: AbortSignal,
+    lease?: CredentialLeaseContext,
+  ): Promise<void> {
     if (mutationAborted(signal)) {
       throw new Error("credential mutation aborted");
     }
+    await lease?.assertOwned();
     await this.#recoverPendingTransactionForWrite();
+    await lease?.assertOwned();
     const backupPath = path.join(
       this.dataDir,
       `.credentials.enc.${randomBytes(16).toString("hex")}.bak`,
@@ -469,12 +571,20 @@ export class CredentialStore {
         throw error;
       }
 
+      await lease?.assertOwned();
       await this.#files.syncDirectory(this.dataDir);
       if (mutationAborted(signal)) {
         throw new Error("credential mutation aborted");
       }
+      await lease?.assertOwned();
       await this.#files.unlink(this.#credentialsPath);
       canonicalDeleted = true;
+      try {
+        await lease?.assertOwned();
+      } catch (error) {
+        await restoreCanonical();
+        throw error;
+      }
       if (mutationAborted(signal)) {
         await restoreCanonical();
         throw new Error("credential mutation aborted");
@@ -491,6 +601,7 @@ export class CredentialStore {
       }
 
       try {
+        await lease?.assertOwned();
         await this.#files.unlink(backupPath);
       } catch (error) {
         await restoreCanonical();

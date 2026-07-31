@@ -14,12 +14,16 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { CredentialRecord } from "../../src/credentials/types.js";
 import {
   type CredentialFileAdapter,
+  type CredentialLeaseContext,
   CredentialStore,
   type CredentialLeaseRunner,
 } from "../../src/credentials/store.js";
 import { createTempState, octalMode } from "../helpers/temp-state.js";
 
-const immediateLease: CredentialLeaseRunner = (_key, run) => run();
+const ownedLease: CredentialLeaseContext = {
+  assertOwned: async () => undefined,
+};
+const immediateLease: CredentialLeaseRunner = (_key, run) => run(ownedLease);
 
 function record(
   credentialVersion: number,
@@ -160,6 +164,144 @@ describe("CredentialStore", () => {
     expect(error.message).not.toContain(dataDir);
     expect(await readFile(credentialsPath)).toEqual(previousCiphertext);
     await expect(store.read()).resolves.toEqual(initial);
+  });
+
+  it("verifies lease ownership after journaling and before replacing canonical credentials", async () => {
+    const dataDir = await tempDataDir();
+    const credentialsPath = path.join(dataDir, "credentials.enc");
+    const initial = record(1);
+    await new CredentialStore(dataDir, immediateLease).replace(initial);
+    const previousCiphertext = await readFile(credentialsPath);
+    let owned = true;
+    let canonicalRenamed = false;
+    const lease: CredentialLeaseRunner = (_key, run) => run({
+      async assertOwned() {
+        if (!owned) throw new Error("lease-owner-CANARY");
+      },
+    });
+    const store = new CredentialStore(dataDir, lease, {
+      async link(existingPath, newPath) {
+        await link(existingPath, newPath);
+        if (newPath.endsWith("credentials.enc.bak")) {
+          owned = false;
+        }
+      },
+      async rename(source, destination) {
+        if (destination === credentialsPath) canonicalRenamed = true;
+        await rename(source, destination);
+      },
+    });
+
+    await expect(store.replace(record(2))).rejects.toThrow(
+      "credential store write failed",
+    );
+
+    expect(canonicalRenamed).toBe(false);
+    await expect(readFile(credentialsPath)).resolves.toEqual(previousCiphertext);
+    await expect(
+      new CredentialStore(dataDir, immediateLease).read(),
+    ).resolves.toEqual(initial);
+  });
+
+  it("never rolls a losing writer over a newer canonical credential", async () => {
+    const dataDir = await tempDataDir();
+    const credentialsPath = path.join(dataDir, "credentials.enc");
+    const transactionPath = path.join(dataDir, "credentials.txn");
+    const backupPath = path.join(dataDir, "credentials.enc.bak");
+    const seed = new CredentialStore(dataDir, immediateLease);
+    const initial = record(1);
+    const winner = record(3, "winner-refresh-CANARY");
+    await seed.replace(initial);
+    await seed.replace(winner);
+    const winnerCiphertext = await readFile(credentialsPath);
+    await seed.replace(initial);
+    let losingCanonicalInstalled = false;
+    let winnerInstalled = false;
+    const lease: CredentialLeaseRunner = (_key, run) => run({
+      async assertOwned() {
+        if (!losingCanonicalInstalled || winnerInstalled) return;
+        winnerInstalled = true;
+        const winnerPath = path.join(dataDir, ".winner.credentials.tmp");
+        await writeFile(winnerPath, winnerCiphertext, {
+          flag: "wx",
+          mode: 0o600,
+        });
+        await rename(winnerPath, credentialsPath);
+        await unlink(transactionPath).catch(() => undefined);
+        await unlink(backupPath).catch(() => undefined);
+        throw new Error("credential lease ownership lost");
+      },
+    });
+    const loser = new CredentialStore(dataDir, lease, {
+      async rename(source, destination) {
+        await rename(source, destination);
+        if (
+          destination === credentialsPath
+          && path.basename(source).endsWith(".tmp")
+        ) {
+          losingCanonicalInstalled = true;
+        }
+      },
+    });
+
+    await expect(loser.replace(record(2))).rejects.toThrow(
+      "credential store write failed",
+    );
+
+    expect(winnerInstalled).toBe(true);
+    await expect(readFile(credentialsPath)).resolves.toEqual(winnerCiphertext);
+    await expect(seed.read()).resolves.toEqual(winner);
+  });
+
+  it("verifies lease ownership after clear backup and before canonical deletion", async () => {
+    const dataDir = await tempDataDir();
+    const credentialsPath = path.join(dataDir, "credentials.enc");
+    const initial = record(1);
+    await new CredentialStore(dataDir, immediateLease).replace(initial);
+    const previousCiphertext = await readFile(credentialsPath);
+    let owned = true;
+    let canonicalUnlinked = false;
+    const lease: CredentialLeaseRunner = (_key, run) => run({
+      async assertOwned() {
+        if (!owned) throw new Error("lease-owner-CANARY");
+      },
+    });
+    const store = new CredentialStore(dataDir, lease, {
+      async link(existingPath, newPath) {
+        await link(existingPath, newPath);
+        if (newPath.endsWith(".bak")) owned = false;
+      },
+      async unlink(target) {
+        if (target === credentialsPath) canonicalUnlinked = true;
+        await unlink(target);
+      },
+    });
+
+    await expect(store.clear()).rejects.toThrow("credential store clear failed");
+
+    expect(canonicalUnlinked).toBe(false);
+    await expect(readFile(credentialsPath)).resolves.toEqual(previousCiphertext);
+    await expect(
+      new CredentialStore(dataDir, immediateLease).read(),
+    ).resolves.toEqual(initial);
+  });
+
+  it("passes mutation cancellation to filesystem lease acquisition", async () => {
+    const controller = new AbortController();
+    let observedSignal: AbortSignal | undefined;
+    const lease: CredentialLeaseRunner = (_key, run, options) => {
+      observedSignal = options?.signal;
+      return run(ownedLease);
+    };
+    const store = new CredentialStore(await tempDataDir(), lease);
+
+    await expect(
+      store.replaceIfVersion(undefined, record(1), {
+        signal: controller.signal,
+      }),
+    ).resolves.toBe(true);
+
+    expect(observedSignal).toBe(controller.signal);
   });
 
   it("sanitizes read failures without exposing filesystem paths", async () => {

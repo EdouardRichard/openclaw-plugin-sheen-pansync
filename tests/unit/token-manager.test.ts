@@ -22,7 +22,9 @@ import {
 import { createTempState } from "../helpers/temp-state.js";
 
 const NOW = Date.parse("2026-07-31T12:00:00.000Z");
-const immediateLease: CredentialLeaseRunner = (_key, run) => run();
+const immediateLease: CredentialLeaseRunner = (_key, run) => run({
+  assertOwned: async () => undefined,
+});
 const cleanups: Array<() => Promise<void>> = [];
 
 afterEach(async () => {
