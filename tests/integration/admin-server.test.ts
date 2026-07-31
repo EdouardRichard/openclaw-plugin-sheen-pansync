@@ -1216,17 +1216,32 @@ async function executePage(
 }
 
 describe("setup page browser behavior", () => {
-  it("strips the fragment before its first authenticated request and restores only the key on reload", async () => {
+  it("strips the fragment and preserves only the session key across same-tab reload", async () => {
     const key = "A".repeat(43);
     const first = await executePage(`http://127.0.0.1:43123/#${key}`);
     expect(first.dom.window.location.hash).toBe("");
     expect(first.requests[0]?.url).toBe("/api/config");
     expect(new Headers(first.requests[0]?.init?.headers).get("authorization")).toBe(`PanSyncSetup ${key}`);
     expect(first.requests[0]?.url).not.toContain(key);
-    expect(first.dom.window.sessionStorage.getItem("panSyncSetupAccessKey")).toBe(key);
+    await vi.waitFor(() => {
+      expect(first.dom.window.document.getElementById("result")?.textContent).toBe("READY");
+    });
+    first.dom.window.dispatchEvent(new first.dom.window.Event("pagehide"));
+    const storedKeyAfterPagehide = first.dom.window.sessionStorage.getItem("panSyncSetupAccessKey");
+    expect(storedKeyAfterPagehide).toBe(key);
     expect(first.dom.window.localStorage.length).toBe(0);
+    for (const id of ["clientId", "clientSecret", "refreshToken"]) {
+      expect((first.dom.window.document.getElementById(id) as HTMLInputElement).value).toBe("");
+    }
+    const requestCountAfterPagehide = first.requests.length;
+    (first.dom.window.document.getElementById("revalidate") as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(first.requests).toHaveLength(requestCountAfterPagehide);
 
-    const reload = await executePage("http://127.0.0.1:43123/", key);
+    if (storedKeyAfterPagehide === null) {
+      throw new Error("same-tab reload key was not preserved");
+    }
+    const reload = await executePage("http://127.0.0.1:43123/", storedKeyAfterPagehide);
     expect(new Headers(reload.requests[0]?.init?.headers).get("authorization")).toBe(`PanSyncSetup ${key}`);
     expect(reload.dom.window.localStorage.length).toBe(0);
   });
@@ -1313,7 +1328,7 @@ describe("setup page browser behavior", () => {
     expect((dom.window.document.getElementById("clientId") as HTMLInputElement).value).toBe("new-client");
   });
 
-  it("aborts and ignores pending work on pagehide while clearing values and the stored key", async () => {
+  it("aborts and ignores pending work on pagehide while clearing form values", async () => {
     const html = await readFile(path.resolve("ui/setup.html"), "utf8");
     const script = await readFile(path.resolve("ui/setup.js"), "utf8");
     const key = "F".repeat(43);
@@ -1332,7 +1347,6 @@ describe("setup page browser behavior", () => {
     dom.window.dispatchEvent(new dom.window.Event("pagehide"));
 
     expect(signal?.aborted).toBe(true);
-    expect(dom.window.sessionStorage.getItem("panSyncSetupAccessKey")).toBeNull();
     pending.resolve(new Response(JSON.stringify({
       configured: true,
       credentials: { clientId: "late-client", clientSecret: "late-secret", refreshToken: "late-refresh" },

@@ -178,11 +178,6 @@
     invalidateRequests();
     clearFormValues();
     accessKey = "";
-    try {
-      window.sessionStorage.removeItem(keyName);
-    } catch {
-      // Storage may be unavailable by policy.
-    }
   });
   void run((generation) => api("/api/config", undefined, generation), "READY", false);
 })();
