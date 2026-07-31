@@ -6,7 +6,7 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
-import { chmod, mkdir, open, unlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 import type { CredentialInput } from "../contracts.js";
 import type { CredentialStore } from "../credentials/store.js";
@@ -17,11 +17,11 @@ import type { UploadOrchestrator } from "../upload/orchestrator.js";
 import { readSetupPageAssets } from "./setup-page.js";
 
 const ACCESS_KEY_BYTES = 32;
-const ACCESS_KEY_PATTERN = /^[A-Za-z0-9_-]{43}$/u;
 const AUTHORIZATION_PATTERN = /^PanSyncSetup ([A-Za-z0-9_-]{43})$/u;
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_CREDENTIAL_FIELD_LENGTH = 4096;
 const SETUP_LIFETIME_MS = 10 * 60 * 1_000;
+const REQUEST_LIFETIME_MS = 15 * 1_000;
 const RESULT_DISPLAY_MS = 60 * 1_000;
 const DEFAULT_REMOTE_DIRECTORY = "/openClawShare";
 const LOOPBACK_HOST = "127.0.0.1";
@@ -42,10 +42,7 @@ export const SETUP_SECURITY_HEADERS = {
   "Cross-Origin-Opener-Policy": "same-origin",
 } as const;
 
-type SetupCredentialStore = Pick<
-  CredentialStore,
-  "read" | "replace" | "replaceIfVersion" | "clear"
->;
+type SetupCredentialStore = Pick<CredentialStore, "read" | "replaceIfVersion" | "clear">;
 type SetupProvider = Pick<AliyunProvider, "validateCredentials">;
 type SetupOrchestrator = Pick<UploadOrchestrator, "upload">;
 
@@ -66,6 +63,9 @@ export type SetupServerRuntime = {
   createServer?: (handler: RequestListener) => Server;
   scheduleTimeout?: (callback: () => void, delay: number) => unknown;
   cancelTimeout?: (timeout: unknown) => void;
+  scheduleRequestTimeout?: (callback: () => void, delay: number) => unknown;
+  cancelRequestTimeout?: (timeout: unknown) => void;
+  removeTemporaryDirectory?: (directory: string) => Promise<void>;
   isBrowserSafePort?: (port: number) => boolean;
 };
 
@@ -79,8 +79,14 @@ export type SetupServer = {
 };
 
 const BODY_TOO_LARGE = Symbol("BODY_TOO_LARGE");
-
 class SetupConflictError extends Error {}
+class RequestTimeoutError extends Error {}
+class SetupClosedError extends Error {}
+
+type RequestContext = {
+  controller: AbortController;
+  generation: number;
+};
 
 function setSecurityHeaders(response: ServerResponse): void {
   for (const [name, value] of Object.entries(SETUP_SECURITY_HEADERS)) {
@@ -88,17 +94,15 @@ function setSecurityHeaders(response: ServerResponse): void {
   }
 }
 
-function sendJson(
-  response: ServerResponse,
-  status: number,
-  value: unknown,
-): void {
+function sendJson(response: ServerResponse, status: number, value: unknown): void {
+  if (response.destroyed || response.writableEnded) return;
   response.statusCode = status;
   response.setHeader("Content-Type", "application/json; charset=utf-8");
   response.end(`${JSON.stringify(value)}\n`);
 }
 
 function sendEmpty(response: ServerResponse, status: number): void {
+  if (response.destroyed || response.writableEnded) return;
   response.statusCode = status;
   response.end();
 }
@@ -109,97 +113,127 @@ function hasForwardingHeaders(request: IncomingMessage): boolean {
   );
 }
 
-function isAllowedHost(host: string | undefined): boolean {
-  if (host === undefined) {
-    return false;
-  }
-  return /^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?$/u.test(host);
+function isAllowedHost(host: string | undefined, port: number | undefined): boolean {
+  return port !== undefined && host === `${LOOPBACK_HOST}:${port}`;
 }
 
 function parsePathname(request: IncomingMessage): string | undefined {
   const target = request.url;
   const host = request.headers.host;
-  if (
-    target === undefined
-    || !target.startsWith("/")
-    || target.startsWith("//")
-    || host === undefined
-  ) {
+  if (target === undefined || !target.startsWith("/") || target.startsWith("//") || host === undefined) {
     return undefined;
   }
   try {
     const url = new URL(target, `http://${host}`);
-    if (url.search.length > 0) {
-      return undefined;
-    }
-    return url.pathname;
+    return url.search.length === 0 ? url.pathname : undefined;
   } catch {
     return undefined;
   }
 }
 
+function abortError(signal: AbortSignal): unknown {
+  return signal.reason instanceof Error ? signal.reason : new SetupClosedError();
+}
+
+function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(abortError(signal));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(abortError(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
 async function readBody(
   request: IncomingMessage,
+  signal: AbortSignal,
 ): Promise<Buffer | typeof BODY_TOO_LARGE> {
   const contentLength = request.headers["content-length"];
-  if (
-    typeof contentLength === "string"
-    && /^\d+$/u.test(contentLength)
-    && Number(contentLength) > MAX_BODY_BYTES
-  ) {
-    request.resume();
+  if (typeof contentLength === "string" && /^\d+$/u.test(contentLength) && Number(contentLength) > MAX_BODY_BYTES) {
+    request.pause();
     return BODY_TOO_LARGE;
   }
-
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let total = 0;
     let settled = false;
-    const finishTooLarge = (): void => {
-      if (!settled) {
-        settled = true;
-        request.removeListener("error", reject);
-        request.removeListener("end", finish);
-        request.removeListener("data", onData);
-        request.resume();
-        resolve(BODY_TOO_LARGE);
-      }
+    const wipe = (): void => {
+      for (const chunk of chunks) chunk.fill(0);
+      chunks.length = 0;
     };
-    const finish = (): void => {
-      if (!settled) {
-        settled = true;
-        resolve(Buffer.concat(chunks, total));
-      }
+    const cleanup = (): void => {
+      request.removeListener("data", onData);
+      request.removeListener("end", onEnd);
+      request.removeListener("error", onError);
+      signal.removeEventListener("abort", onAbort);
+    };
+    const settle = (value: Buffer | typeof BODY_TOO_LARGE): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(value);
+    };
+    const onAbort = (): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      wipe();
+      reject(abortError(signal));
+    };
+    const onError = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      wipe();
+      reject(error);
+    };
+    const onEnd = (): void => {
+      const body = Buffer.concat(chunks, total);
+      wipe();
+      settle(body);
     };
     const onData = (chunk: Buffer | string): void => {
-      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const buffer = Buffer.isBuffer(chunk) ? Buffer.from(chunk) : Buffer.from(chunk);
+      if (Buffer.isBuffer(chunk)) chunk.fill(0);
       total += buffer.length;
       if (total > MAX_BODY_BYTES) {
-        chunks.length = 0;
-        finishTooLarge();
-        return;
+        buffer.fill(0);
+        wipe();
+        request.pause();
+        settle(BODY_TOO_LARGE);
+      } else {
+        chunks.push(buffer);
       }
-      chunks.push(buffer);
     };
+    signal.addEventListener("abort", onAbort, { once: true });
     request.on("data", onData);
-    request.once("end", finish);
-    request.once("error", reject);
+    request.once("end", onEnd);
+    request.once("error", onError);
   });
 }
 
-async function readJson(
-  request: IncomingMessage,
-  response: ServerResponse,
-): Promise<unknown | typeof BODY_TOO_LARGE> {
-  const body = await readBody(request);
-  if (body === BODY_TOO_LARGE) {
-    sendJson(response, 413, { code: "CREDENTIALS_INVALID" });
-    return BODY_TOO_LARGE;
-  }
+function readJson(body: Buffer, contentType: string | undefined): unknown {
   try {
+    if (contentType === undefined || !/^application\/json(?:\s*;\s*charset=utf-8)?$/iu.test(contentType)) {
+      throw Object.assign(new Error("unsupported media type"), { statusCode: 415 });
+    }
     return JSON.parse(body.toString("utf8")) as unknown;
   } catch {
+    if (contentType === undefined || !/^application\/json(?:\s*;\s*charset=utf-8)?$/iu.test(contentType)) {
+      throw Object.assign(new Error("unsupported media type"), { statusCode: 415 });
+    }
     throw new PanSyncError("CREDENTIALS_INVALID");
+  } finally {
+    body.fill(0);
   }
 }
 
@@ -208,67 +242,37 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function parseCredentialInput(value: unknown): Omit<CredentialInput, "credentialVersion"> {
-  if (!isRecord(value)) {
-    throw new PanSyncError("CREDENTIALS_INVALID");
-  }
+  if (!isRecord(value)) throw new PanSyncError("CREDENTIALS_INVALID");
   const allowed = new Set(["clientId", "clientSecret", "refreshToken"]);
-  if (Object.keys(value).some((key) => !allowed.has(key))) {
-    throw new PanSyncError("CREDENTIALS_INVALID");
-  }
-  const clientId = value.clientId;
-  const clientSecret = value.clientSecret;
-  const refreshToken = value.refreshToken;
+  if (Object.keys(value).some((key) => !allowed.has(key))) throw new PanSyncError("CREDENTIALS_INVALID");
+  const { clientId, clientSecret, refreshToken } = value;
   for (const field of [clientId, clientSecret, refreshToken]) {
-    if (
-      typeof field !== "string"
-      || field.trim().length === 0
-      || field.length > MAX_CREDENTIAL_FIELD_LENGTH
-    ) {
+    if (typeof field !== "string" || field.trim().length === 0 || field.length > MAX_CREDENTIAL_FIELD_LENGTH) {
       throw new PanSyncError("CREDENTIALS_INVALID");
     }
   }
-  return {
-    clientId: clientId as string,
-    clientSecret: clientSecret as string,
-    refreshToken: refreshToken as string,
-  };
+  return { clientId: clientId as string, clientSecret: clientSecret as string, refreshToken: refreshToken as string };
 }
 
 function safeTokenGuideUrl(value: string | undefined): string | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
+  if (value === undefined) return undefined;
   try {
     const url = new URL(value);
-    return url.protocol === "https:" || url.protocol === "http:"
-      ? url.toString()
-      : undefined;
+    return url.protocol === "https:" || url.protocol === "http:" ? url.toString() : undefined;
   } catch {
     return undefined;
   }
 }
 
-function projectRecord(
-  record: CredentialRecord | undefined,
-  dependencies: SetupServerDependencies,
-): unknown {
-  const defaultDirectory = dependencies.defaultDirectory
-    ?? DEFAULT_REMOTE_DIRECTORY;
+function projectRecord(record: CredentialRecord | undefined, dependencies: SetupServerDependencies): unknown {
+  const defaultDirectory = dependencies.defaultDirectory ?? DEFAULT_REMOTE_DIRECTORY;
   const tokenGuideUrl = safeTokenGuideUrl(dependencies.tokenGuideUrl);
   if (record === undefined) {
-    return {
-      configured: false,
-      defaultDirectory,
-      ...(tokenGuideUrl === undefined ? {} : { tokenGuideUrl }),
-    };
+    return { configured: false, defaultDirectory, ...(tokenGuideUrl === undefined ? {} : { tokenGuideUrl }) };
   }
   return {
     configured: true,
-    credentials: {
-      clientId: record.clientId,
-      clientSecret: record.clientSecret,
-      refreshToken: record.refreshToken,
-    },
+    credentials: { clientId: record.clientId, clientSecret: record.clientSecret, refreshToken: record.refreshToken },
     account: record.account,
     lastVerifiedAt: record.lastVerifiedAt,
     defaultDirectory,
@@ -281,54 +285,21 @@ function isBrowserSafePort(port: number): boolean {
 }
 
 function closeListeningServer(server: Server): Promise<void> {
-  return new Promise((resolve, reject) => {
-    server.close((error) => {
-      if (error) {
-        reject(error);
-      } else {
-        resolve();
-      }
-    });
-  });
+  return new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 }
 
 function safeFailure(error: unknown): { status: number; body: { code: string } } {
-  if (error instanceof SetupConflictError) {
-    return { status: 409, body: { code: "CREDENTIALS_INVALID" } };
-  }
+  if (error instanceof SetupConflictError) return { status: 409, body: { code: "CREDENTIALS_INVALID" } };
   const details = safeErrorDetails(error);
-  const status = details.code === "TOKEN_ENDPOINT_UNAVAILABLE"
-    || details.code === "RATE_LIMITED"
-    ? 503
-    : 400;
+  const status = details.code === "TOKEN_ENDPOINT_UNAVAILABLE" || details.code === "RATE_LIMITED" ? 503 : 400;
   return { status, body: details };
 }
 
-function decodeAccessKey(value: string): Buffer | undefined {
-  if (!ACCESS_KEY_PATTERN.test(value)) {
-    return undefined;
-  }
-  try {
-    const decoded = Buffer.from(value, "base64url");
-    return decoded.length === ACCESS_KEY_BYTES ? decoded : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 function waitUntilListening(server: Server): Promise<void> {
-  if (server.listening) {
-    return Promise.resolve();
-  }
+  if (server.listening) return Promise.resolve();
   return new Promise((resolve, reject) => {
-    const onError = (error: Error): void => {
-      server.off("listening", onListening);
-      reject(error);
-    };
-    const onListening = (): void => {
-      server.off("error", onError);
-      resolve();
-    };
+    const onError = (error: Error): void => { server.off("listening", onListening); reject(error); };
+    const onListening = (): void => { server.off("error", onError); resolve(); };
     server.once("error", onError);
     server.once("listening", onListening);
   });
@@ -341,91 +312,99 @@ export async function startSetupServer(
   const assets = await readSetupPageAssets(dependencies.assetsDir);
   const generatedKey = dependencies.randomBytes(ACCESS_KEY_BYTES);
   if (generatedKey.length !== ACCESS_KEY_BYTES) {
+    generatedKey.fill(0);
     throw new Error("setup access key generation failed");
   }
   const accessKeyBuffer = Buffer.from(generatedKey);
   const oneTimeKey = accessKeyBuffer.toString("base64url");
+  const accessKeyAscii = Buffer.from(oneTimeKey, "ascii");
+  generatedKey.fill(0);
   const expiresAt = dependencies.clock() + SETUP_LIFETIME_MS;
   const createServer = runtime.createServer ?? nodeCreateServer;
-  const scheduleTimeout = runtime.scheduleTimeout
-    ?? ((callback: () => void, delay: number) => setTimeout(callback, delay));
-  const cancelTimeout = runtime.cancelTimeout
-    ?? ((timeout: unknown) => clearTimeout(timeout as NodeJS.Timeout));
+  const scheduleTimeout = runtime.scheduleTimeout ?? ((callback: () => void, delay: number) => setTimeout(callback, delay));
+  const cancelTimeout = runtime.cancelTimeout ?? ((timeout: unknown) => clearTimeout(timeout as NodeJS.Timeout));
+  const scheduleRequestTimeout = runtime.scheduleRequestTimeout ?? ((callback: () => void, delay: number) => setTimeout(callback, delay));
+  const cancelRequestTimeout = runtime.cancelRequestTimeout ?? ((timeout: unknown) => clearTimeout(timeout as NodeJS.Timeout));
+  const removeTemporaryDirectory = runtime.removeTemporaryDirectory
+    ?? ((directory: string) => rm(directory, { recursive: true, force: false }));
   let active = true;
+  let authorizationGeneration = 0;
   let closing: Promise<void> | undefined;
   let expiryTimeout: unknown;
   let resultTimeout: unknown;
+  let selectedPort: number | undefined;
+  const activeRequests = new Set<RequestContext>();
   let resolveClosed!: () => void;
-  const closed = new Promise<void>((resolve) => {
-    resolveClosed = resolve;
-  });
+  const closed = new Promise<void>((resolve) => { resolveClosed = resolve; });
 
-  const isAuthorized = (authorization: string | undefined): boolean => {
-    if (!active || dependencies.clock() >= expiresAt || authorization === undefined) {
-      return false;
-    }
+  const matchesAuthorization = (authorization: string | undefined): boolean => {
+    if (authorization === undefined) return false;
     const match = AUTHORIZATION_PATTERN.exec(authorization);
-    const candidate = match?.[1] === undefined
-      ? undefined
-      : decodeAccessKey(match[1]);
-    return candidate !== undefined && timingSafeEqual(candidate, accessKeyBuffer);
+    if (match?.[1] === undefined) return false;
+    const candidate = Buffer.from(match[1], "ascii");
+    try {
+      return candidate.length === accessKeyAscii.length && timingSafeEqual(candidate, accessKeyAscii);
+    } finally {
+      candidate.fill(0);
+    }
+  };
+  const isAuthorized = (authorization: string | undefined): boolean =>
+    active && dependencies.clock() < expiresAt && matchesAuthorization(authorization);
+  const assertAuthorized = (context: RequestContext, authorization: string | undefined): void => {
+    if (
+      context.controller.signal.aborted
+      || !active
+      || context.generation !== authorizationGeneration
+      || dependencies.clock() >= expiresAt
+      || !matchesAuthorization(authorization)
+    ) throw new SetupClosedError();
   };
 
   let server!: Server;
   const close = async (): Promise<void> => {
-    if (closing !== undefined) {
-      return closing;
-    }
+    if (closing !== undefined) return closing;
     active = false;
+    authorizationGeneration += 1;
     accessKeyBuffer.fill(0);
-    if (expiryTimeout !== undefined) {
-      cancelTimeout(expiryTimeout);
-    }
-    if (resultTimeout !== undefined) {
-      cancelTimeout(resultTimeout);
-    }
+    accessKeyAscii.fill(0);
+    if (expiryTimeout !== undefined) cancelTimeout(expiryTimeout);
+    if (resultTimeout !== undefined) cancelTimeout(resultTimeout);
+    for (const context of activeRequests) context.controller.abort(new SetupClosedError());
     closing = new Promise<void>((resolve) => {
       if (!server.listening) {
         resolveClosed();
         resolve();
         return;
       }
-      server.close(() => {
-        resolveClosed();
-        resolve();
-      });
+      server.close(() => { resolveClosed(); resolve(); });
+      server.closeAllConnections();
     });
     return closing;
   };
 
   const scheduleResultClose = (): void => {
-    if (resultTimeout !== undefined) {
-      cancelTimeout(resultTimeout);
-    }
-    resultTimeout = scheduleTimeout(() => {
-      void close();
-    }, RESULT_DISPLAY_MS);
+    if (resultTimeout !== undefined) cancelTimeout(resultTimeout);
+    resultTimeout = scheduleTimeout(() => { void close(); }, RESULT_DISPLAY_MS);
   };
 
   const validateAndReplace = async (
+    context: RequestContext,
+    authorization: string | undefined,
     candidate: Omit<CredentialInput, "credentialVersion">,
     knownCurrent?: CredentialRecord,
   ): Promise<CredentialRecord> => {
-    const current = knownCurrent ?? await dependencies.store.read();
-    const validated = await dependencies.provider.validateCredentials({
+    const signal = context.controller.signal;
+    const current = knownCurrent ?? await abortable(dependencies.store.read(), signal);
+    assertAuthorized(context, authorization);
+    const validated = await abortable(dependencies.provider.validateCredentials({
       ...candidate,
       credentialVersion: (current?.credentialVersion ?? 0) + 1,
-    });
-    if (current === undefined) {
-      await dependencies.store.replace(validated);
-    } else if (
-      !await dependencies.store.replaceIfVersion(
-        current.credentialVersion,
-        validated,
-      )
-    ) {
+    }), signal);
+    assertAuthorized(context, authorization);
+    if (!await abortable(dependencies.store.replaceIfVersion(current?.credentialVersion, validated, { signal }), signal)) {
       throw new SetupConflictError();
     }
+    assertAuthorized(context, authorization);
     return validated;
   };
 
@@ -433,152 +412,179 @@ export async function startSetupServer(
     request: IncomingMessage,
     response: ServerResponse,
     pathname: string,
+    body: Buffer,
+    context: RequestContext,
   ): Promise<boolean> => {
     const method = request.method ?? "GET";
     const isKnown =
       (pathname === "/api/config" && ["GET", "PUT", "DELETE"].includes(method))
       || (pathname === "/api/revalidate" && method === "POST")
       || (pathname === "/api/test-upload" && method === "POST");
-    if (!isKnown) {
-      return false;
-    }
-    const authorization = Array.isArray(request.headers.authorization)
-      ? undefined
-      : request.headers.authorization;
+    if (!isKnown) return false;
+    const authorization = Array.isArray(request.headers.authorization) ? undefined : request.headers.authorization;
     if (!isAuthorized(authorization)) {
       sendJson(response, 401, { code: "CREDENTIALS_REQUIRED" });
       return true;
     }
-
     try {
-      if (method === "POST") {
-        const body = await readBody(request);
-        if (body === BODY_TOO_LARGE) {
-          sendJson(response, 413, { code: "CREDENTIALS_INVALID" });
-          return true;
-        }
-      }
+      assertAuthorized(context, authorization);
+      if (method === "POST" && body.length !== 0) throw new PanSyncError("CREDENTIALS_INVALID");
       if (pathname === "/api/config" && method === "GET") {
-        sendJson(
-          response,
-          200,
-          projectRecord(await dependencies.store.read(), dependencies),
-        );
+        const record = await abortable(dependencies.store.read(), context.controller.signal);
+        assertAuthorized(context, authorization);
+        sendJson(response, 200, projectRecord(record, dependencies));
         return true;
       }
       if (pathname === "/api/config" && method === "PUT") {
-        const value = await readJson(request, response);
-        if (value === BODY_TOO_LARGE) {
-          return true;
-        }
-        const record = await validateAndReplace(parseCredentialInput(value));
+        const value = readJson(body, Array.isArray(request.headers["content-type"]) ? undefined : request.headers["content-type"]);
+        const record = await validateAndReplace(context, authorization, parseCredentialInput(value));
+        assertAuthorized(context, authorization);
         sendJson(response, 200, projectRecord(record, dependencies));
         scheduleResultClose();
         return true;
       }
       if (pathname === "/api/config" && method === "DELETE") {
-        const value = await readJson(request, response);
-        if (value === BODY_TOO_LARGE) {
-          return true;
-        }
-        if (
-          !isRecord(value)
-          || Object.keys(value).length !== 1
-          || value.confirm !== "CLEAR"
-        ) {
-          throw new PanSyncError("CREDENTIALS_INVALID");
-        }
-        await dependencies.store.clear();
+        const value = readJson(body, Array.isArray(request.headers["content-type"]) ? undefined : request.headers["content-type"]);
+        if (!isRecord(value) || Object.keys(value).length !== 1 || value.confirm !== "CLEAR") throw new PanSyncError("CREDENTIALS_INVALID");
+        assertAuthorized(context, authorization);
+        await abortable(dependencies.store.clear({ signal: context.controller.signal }), context.controller.signal);
+        assertAuthorized(context, authorization);
         sendJson(response, 200, projectRecord(undefined, dependencies));
         scheduleResultClose();
         return true;
       }
       if (pathname === "/api/revalidate") {
-        const current = await dependencies.store.read();
-        if (current === undefined) {
-          throw new PanSyncError("CREDENTIALS_REQUIRED");
-        }
-        const record = await validateAndReplace({
+        const current = await abortable(dependencies.store.read(), context.controller.signal);
+        assertAuthorized(context, authorization);
+        if (current === undefined) throw new PanSyncError("CREDENTIALS_REQUIRED");
+        const record = await validateAndReplace(context, authorization, {
           clientId: current.clientId,
           clientSecret: current.clientSecret,
           refreshToken: current.refreshToken,
         }, current);
+        assertAuthorized(context, authorization);
         sendJson(response, 200, projectRecord(record, dependencies));
         return true;
       }
 
-      const temporaryDirectory = path.join(dependencies.dataDir, "tmp");
-      await mkdir(temporaryDirectory, { recursive: true, mode: 0o700 });
-      await chmod(temporaryDirectory, 0o700);
-      const filename = `pan-sync-test-${dependencies.randomBytes(16).toString("hex")}.txt`;
-      const temporaryPath = path.join(temporaryDirectory, filename);
-      try {
-        const handle = await open(temporaryPath, "wx", 0o600);
-        try {
-          await handle.writeFile(dependencies.randomBytes(32));
-          await handle.sync();
-        } finally {
-          await handle.close();
-        }
-        const uploaded = await dependencies.orchestrator.upload({
-          paths: [filename],
-          remoteDirectory: DEFAULT_REMOTE_DIRECTORY,
-          workspaceDir: temporaryDirectory,
-        });
-        const file = uploaded.files.find((entry) => entry.status === "uploaded");
-        if (file?.remoteName === undefined || uploaded.status === "failed") {
+      const uploadResult = await abortable((async () => {
+        await mkdir(dependencies.dataDir, { recursive: true, mode: 0o700 });
+        await chmod(dependencies.dataDir, 0o700);
+        const confinedDataDir = await realpath(dependencies.dataDir);
+        const temporaryRoot = path.join(confinedDataDir, "tmp");
+        await mkdir(temporaryRoot, { recursive: true, mode: 0o700 });
+        const temporaryRootStat = await lstat(temporaryRoot);
+        if (temporaryRootStat.isSymbolicLink() || !temporaryRootStat.isDirectory()) {
           throw new PanSyncError("UPLOAD_FAILED");
         }
-        sendJson(response, 200, {
-          remoteName: file.remoteName,
-          remoteDirectory: uploaded.remoteDirectory,
-        });
-      } finally {
-        await unlink(temporaryPath).catch(() => undefined);
-      }
+        const confinedTemporaryRoot = await realpath(temporaryRoot);
+        if (path.dirname(confinedTemporaryRoot) !== confinedDataDir) {
+          throw new PanSyncError("UPLOAD_FAILED");
+        }
+        await chmod(confinedTemporaryRoot, 0o700);
+        const workspaceDir = await mkdtemp(path.join(confinedTemporaryRoot, "pan-sync-test-"));
+        await chmod(workspaceDir, 0o700);
+        try {
+          const filename = "payload.txt";
+          const temporaryPath = path.join(workspaceDir, filename);
+          const source = dependencies.randomBytes(32);
+          if (source.length !== 32) throw new PanSyncError("UPLOAD_FAILED");
+          const payload = Buffer.from(`${source.toString("base64url")}\n`, "ascii");
+          source.fill(0);
+          try {
+            const handle = await open(temporaryPath, "wx", 0o600);
+            try {
+              await handle.writeFile(payload);
+              await handle.sync();
+            } finally {
+              await handle.close();
+            }
+          } finally {
+            payload.fill(0);
+          }
+          const uploaded = await dependencies.orchestrator.upload({
+            paths: [filename],
+            remoteDirectory: DEFAULT_REMOTE_DIRECTORY,
+            workspaceDir,
+          });
+          const file = uploaded.files.find((entry) => entry.status === "uploaded");
+          if (file?.remoteName === undefined || uploaded.status === "failed") {
+            throw new PanSyncError("UPLOAD_FAILED");
+          }
+          return { remoteName: file.remoteName, remoteDirectory: uploaded.remoteDirectory };
+        } finally {
+          await removeTemporaryDirectory(workspaceDir);
+        }
+      })(), context.controller.signal);
+      assertAuthorized(context, authorization);
+      sendJson(response, 200, uploadResult);
       return true;
     } catch (error) {
-      const failure = safeFailure(error);
-      sendJson(response, failure.status, failure.body);
+      if (error instanceof SetupClosedError || context.controller.signal.aborted) throw error;
+      if ((error as { statusCode?: unknown }).statusCode === 415) {
+        sendJson(response, 415, { code: "CREDENTIALS_INVALID" });
+      } else {
+        const failure = safeFailure(error);
+        sendJson(response, failure.status, failure.body);
+      }
       return true;
     }
   };
 
   const requestListener: RequestListener = (request, response) => {
     setSecurityHeaders(response);
+    const context: RequestContext = { controller: new AbortController(), generation: authorizationGeneration };
+    activeRequests.add(context);
+    const requestTimeout = scheduleRequestTimeout(() => context.controller.abort(new RequestTimeoutError()), REQUEST_LIFETIME_MS);
     void (async () => {
-      if (hasForwardingHeaders(request) || !isAllowedHost(request.headers.host)) {
-        sendJson(response, 400, { code: "CREDENTIALS_INVALID" });
-        return;
-      }
-      const pathname = parsePathname(request);
-      if (pathname === undefined) {
-        sendEmpty(response, 400);
-        return;
-      }
-      if (request.method === "GET") {
-        const asset = assets.get(pathname);
-        if (asset !== undefined) {
-          response.statusCode = 200;
-          response.setHeader("Content-Type", asset.contentType);
-          response.end(asset.body);
+      try {
+        const body = await readBody(request, context.controller.signal);
+        if (body === BODY_TOO_LARGE) {
+          response.setHeader("Connection", "close");
+          sendJson(response, 413, { code: "CREDENTIALS_INVALID" });
           return;
         }
+        try {
+          if (hasForwardingHeaders(request) || !isAllowedHost(request.headers.host, selectedPort)) {
+            sendJson(response, 400, { code: "CREDENTIALS_INVALID" });
+            return;
+          }
+          const pathname = parsePathname(request);
+          if (pathname === undefined) { sendEmpty(response, 400); return; }
+          if (request.method === "GET") {
+            const asset = assets.get(pathname);
+            if (asset !== undefined) {
+              response.statusCode = 200;
+              response.setHeader("Content-Type", asset.contentType);
+              response.end(asset.body);
+              return;
+            }
+          }
+          if (await handleApi(request, response, pathname, body, context)) return;
+          sendEmpty(response, 404);
+        } finally {
+          body.fill(0);
+        }
+      } catch (error) {
+        if (error instanceof RequestTimeoutError) {
+          response.setHeader("Connection", "close");
+          sendJson(response, 408, { code: "CREDENTIALS_INVALID" });
+        } else if (error instanceof SetupClosedError || context.controller.signal.aborted) {
+          response.destroy();
+          request.destroy();
+        } else if (!response.headersSent) {
+          sendJson(response, 500, { code: "UPLOAD_FAILED" });
+        } else {
+          response.destroy();
+        }
+      } finally {
+        activeRequests.delete(context);
+        cancelRequestTimeout(requestTimeout);
       }
-      if (await handleApi(request, response, pathname)) {
-        return;
-      }
-      sendEmpty(response, 404);
-    })().catch(() => {
-      if (!response.headersSent) {
-        sendJson(response, 500, { code: "UPLOAD_FAILED" });
-      } else {
-        response.destroy();
-      }
-    });
+    })();
   };
+
   const portIsSafe = runtime.isBrowserSafePort ?? isBrowserSafePort;
-  let port: number | undefined;
   try {
     for (let attempt = 0; attempt < 16; attempt += 1) {
       server = createServer(requestListener);
@@ -589,35 +595,31 @@ export async function startSetupServer(
         await closeListeningServer(server);
         throw new Error("setup server address unavailable");
       }
-      if (portIsSafe(address.port)) {
-        port = address.port;
-        break;
-      }
+      if (portIsSafe(address.port)) { selectedPort = address.port; break; }
       await closeListeningServer(server);
-      if (runtime.port !== undefined && runtime.port !== 0) {
-        throw new Error("setup server port rejected by browsers");
-      }
+      if (runtime.port !== undefined && runtime.port !== 0) throw new Error("setup server port rejected by browsers");
     }
   } catch (error) {
     accessKeyBuffer.fill(0);
+    accessKeyAscii.fill(0);
     throw error;
   }
-  if (port === undefined) {
+  if (selectedPort === undefined) {
     accessKeyBuffer.fill(0);
+    accessKeyAscii.fill(0);
     throw new Error("setup server could not select a browser-safe port");
   }
   server.once("close", () => {
     active = false;
     accessKeyBuffer.fill(0);
+    accessKeyAscii.fill(0);
     resolveClosed();
   });
-  expiryTimeout = scheduleTimeout(() => {
-    void close();
-  }, SETUP_LIFETIME_MS);
+  expiryTimeout = scheduleTimeout(() => { void close(); }, SETUP_LIFETIME_MS);
 
   return {
-    url: `http://${LOOPBACK_HOST}:${port}/#${oneTimeKey}`,
-    port,
+    url: `http://${LOOPBACK_HOST}:${selectedPort}/#${oneTimeKey}`,
+    port: selectedPort,
     accessKeyBuffer,
     closed,
     close,

@@ -3,7 +3,7 @@ import {
   request as nodeRequest,
   type Server,
 } from "node:http";
-import { access, mkdtemp, readFile, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { JSDOM } from "jsdom";
@@ -42,8 +42,20 @@ type HarnessOptions = {
   record?: CredentialRecord | undefined;
   validate?: SetupServerDependencies["provider"]["validateCredentials"];
   upload?: SetupServerDependencies["orchestrator"]["upload"];
-  replaceIfVersion?: (expected: number, candidate: CredentialRecord) => Promise<boolean>;
+  replaceIfVersion?: (
+    expected: number | undefined,
+    candidate: CredentialRecord,
+    options?: { signal?: AbortSignal },
+  ) => Promise<boolean>;
 };
+
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
 
 async function createHarness(options: HarnessOptions = {}) {
   let record = options.record;
@@ -52,8 +64,16 @@ async function createHarness(options: HarnessOptions = {}) {
   });
   const replaceIfVersion = vi.fn(
     options.replaceIfVersion
-      ?? (async (expected: number, candidate: CredentialRecord) => {
-        if (record?.credentialVersion !== expected) {
+      ?? (async (
+        expected: number | undefined,
+        candidate: CredentialRecord,
+        mutationOptions?: { signal?: AbortSignal },
+      ) => {
+        if (mutationOptions?.signal?.aborted === true) {
+          return false;
+        }
+        const currentVersion = record?.credentialVersion;
+        if (currentVersion !== expected) {
           return false;
         }
         record = structuredClone(candidate);
@@ -92,7 +112,7 @@ async function createHarness(options: HarnessOptions = {}) {
   );
   const root = await mkdtemp(path.join(tmpdir(), "pan-sync-admin-"));
   const deps: SetupServerDependencies = {
-    store: { read, replace, replaceIfVersion, clear },
+    store: { read, replaceIfVersion, clear },
     provider: { validateCredentials },
     orchestrator: { upload },
     dataDir: path.join(root, "data"),
@@ -301,6 +321,42 @@ describe("one-time setup server", () => {
     });
   });
 
+  it("rejects a noncanonical base64url spelling that decodes to the same key bytes", async () => {
+    const harness = await createHarness({ record: savedRecord });
+    cleanups.push(harness.cleanup);
+    const result = await startSetupServer(harness.deps);
+    runningServers.push(result);
+    const baseUrl = result.url.split("/#")[0] ?? "";
+    const key = accessKey(result.url);
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const finalIndex = alphabet.indexOf(key.at(-1) ?? "");
+    const alternate = `${key.slice(0, -1)}${alphabet[(finalIndex + 1) % alphabet.length]}`;
+    expect(Buffer.from(alternate, "base64url")).toEqual(Buffer.from(key, "base64url"));
+
+    const response = await apiRequest(baseUrl, "/api/config", alternate);
+
+    expect(response.status).toBe(401);
+    expect(await response.text()).not.toContain(savedRecord.clientSecret);
+  });
+
+  it("accepts only the exact selected IPv4 loopback Host with its port", async () => {
+    const harness = await createHarness({ record: savedRecord });
+    cleanups.push(harness.cleanup);
+    const result = await startSetupServer(harness.deps);
+    runningServers.push(result);
+    const baseUrl = result.url.split("/#")[0] ?? "";
+
+    expect((await requestWithHost(baseUrl, "/", `127.0.0.1:${result.port}`)).status).toBe(200);
+    for (const host of [
+      "127.0.0.1",
+      `127.0.0.1:${result.port + 1}`,
+      `localhost:${result.port}`,
+      `[::1]:${result.port}`,
+    ]) {
+      expect((await requestWithHost(baseUrl, "/", host)).status).toBe(400);
+    }
+  });
+
   it("projects configured page guidance only after authorization", async () => {
     const harness = await createHarness({ record: savedRecord });
     harness.deps.defaultDirectory = "/teamShare";
@@ -348,6 +404,7 @@ describe("one-time setup server", () => {
     expect(harness.replaceIfVersion).toHaveBeenCalledWith(
       7,
       expect.objectContaining({ credentialVersion: 8 }),
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
     expect(harness.record).toMatchObject({
       credentialVersion: 8,
@@ -394,6 +451,96 @@ describe("one-time setup server", () => {
     expect(harness.record).toEqual(winner);
   });
 
+  it("allows only one concurrent first save to win the absent-state CAS", async () => {
+    const validationGate = deferred();
+    let validationCalls = 0;
+    const harness = await createHarness({
+      record: undefined,
+      validate: async (candidate) => {
+        validationCalls += 1;
+        await validationGate.promise;
+        return {
+          ...savedRecord,
+          credentialVersion: candidate.credentialVersion ?? 1,
+          clientId: candidate.clientId,
+          clientSecret: candidate.clientSecret,
+          refreshToken: candidate.refreshToken,
+        };
+      },
+    });
+    cleanups.push(harness.cleanup);
+    const result = await startSetupServer(harness.deps);
+    runningServers.push(result);
+    const baseUrl = result.url.split("/#")[0] ?? "";
+    const key = accessKey(result.url);
+    const save = (suffix: string) => apiRequest(baseUrl, "/api/config", key, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        clientId: `client-${suffix}`,
+        clientSecret: `secret-${suffix}`,
+        refreshToken: `refresh-${suffix}`,
+      }),
+    });
+
+    const first = save("first");
+    const second = save("second");
+    await vi.waitFor(() => expect(validationCalls).toBe(2));
+    validationGate.resolve();
+    const responses = await Promise.all([first, second]);
+
+    expect(responses.map(({ status }) => status).sort()).toEqual([200, 409]);
+    expect(harness.replace).not.toHaveBeenCalled();
+    expect(harness.replaceIfVersion).toHaveBeenCalledTimes(2);
+    expect(["client-first", "client-second"]).toContain(harness.record?.clientId);
+  });
+
+  it("does not resurrect credentials when clear wins a race with an in-flight save", async () => {
+    const validationGate = deferred();
+    let validationStarted = false;
+    const harness = await createHarness({
+      record: savedRecord,
+      validate: async (candidate) => {
+        validationStarted = true;
+        await validationGate.promise;
+        return {
+          ...savedRecord,
+          credentialVersion: candidate.credentialVersion ?? 8,
+          clientId: candidate.clientId,
+          clientSecret: candidate.clientSecret,
+          refreshToken: candidate.refreshToken,
+        };
+      },
+    });
+    cleanups.push(harness.cleanup);
+    const result = await startSetupServer(harness.deps);
+    runningServers.push(result);
+    const baseUrl = result.url.split("/#")[0] ?? "";
+    const key = accessKey(result.url);
+    const save = apiRequest(baseUrl, "/api/config", key, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        clientId: "stale-client",
+        clientSecret: "stale-secret",
+        refreshToken: "stale-refresh",
+      }),
+    });
+    await vi.waitFor(() => expect(validationStarted).toBe(true));
+
+    const cleared = await apiRequest(baseUrl, "/api/config", key, {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ confirm: "CLEAR" }),
+    });
+    validationGate.resolve();
+    const saved = await save;
+
+    expect(cleared.status).toBe(200);
+    expect(saved.status).toBe(409);
+    expect(harness.record).toBeUndefined();
+  });
+
   it("preserves the old Vault and authorization when official candidate validation fails", async () => {
     const rawOfficialBody = "official-body-client-secret-CANARY";
     const harness = await createHarness({
@@ -427,6 +574,147 @@ describe("one-time setup server", () => {
     expect(harness.record).toEqual(savedRecord);
     expect(failedBody).not.toContain(rawOfficialBody);
     expect((await apiRequest(baseUrl, "/api/config", key)).status).toBe(200);
+  });
+
+  it("expires an in-flight GET promptly without echoing credentials", async () => {
+    const readStarted = deferred();
+    const readGate = deferred<CredentialRecord | undefined>();
+    const harness = await createHarness({ record: savedRecord });
+    harness.deps.store.read = vi.fn(async () => {
+      readStarted.resolve();
+      return readGate.promise;
+    });
+    cleanups.push(harness.cleanup);
+    let now = 10_000;
+    let expire: (() => void) | undefined;
+    harness.deps.clock = () => now;
+    const result = await startSetupServer(harness.deps, {
+      scheduleTimeout(callback, delay) {
+        if (delay === 10 * 60 * 1_000) {
+          expire = callback;
+        }
+        return callback;
+      },
+      cancelTimeout() {},
+    });
+    runningServers.push(result);
+    const baseUrl = result.url.split("/#")[0] ?? "";
+    const key = accessKey(result.url);
+    const responseText = apiRequest(baseUrl, "/api/config", key)
+      .then((response) => response.text())
+      .catch(() => "REQUEST_ABORTED");
+    await readStarted.promise;
+
+    now += 10 * 60 * 1_000 + 1;
+    expire?.();
+    await expect(Promise.race([
+      result.closed.then(() => "closed"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("timeout"), 500)),
+    ])).resolves.toBe("closed");
+    readGate.resolve(savedRecord);
+
+    expect(await responseText).not.toContain(savedRecord.clientSecret);
+  });
+
+  it("expires during provider validation without mutating or echoing the candidate", async () => {
+    const validationStarted = deferred();
+    const validationGate = deferred<CredentialRecord>();
+    const harness = await createHarness({
+      record: savedRecord,
+      validate: async () => {
+        validationStarted.resolve();
+        return validationGate.promise;
+      },
+    });
+    cleanups.push(harness.cleanup);
+    let now = 20_000;
+    let expire: (() => void) | undefined;
+    harness.deps.clock = () => now;
+    const result = await startSetupServer(harness.deps, {
+      scheduleTimeout(callback, delay) {
+        if (delay === 10 * 60 * 1_000) {
+          expire = callback;
+        }
+        return callback;
+      },
+      cancelTimeout() {},
+    });
+    runningServers.push(result);
+    const baseUrl = result.url.split("/#")[0] ?? "";
+    const key = accessKey(result.url);
+    const candidateSecret = "expiry-candidate-secret";
+    const responseText = apiRequest(baseUrl, "/api/config", key, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        clientId: "expiry-client",
+        clientSecret: candidateSecret,
+        refreshToken: "expiry-refresh",
+      }),
+    }).then((response) => response.text()).catch(() => "REQUEST_ABORTED");
+    await validationStarted.promise;
+
+    now += 10 * 60 * 1_000 + 1;
+    expire?.();
+    validationGate.resolve({ ...savedRecord, clientSecret: candidateSecret });
+    await result.closed;
+
+    expect(harness.replaceIfVersion).not.toHaveBeenCalled();
+    expect(harness.record).toEqual(savedRecord);
+    expect(await responseText).not.toContain(candidateSecret);
+  });
+
+  it("passes expiry cancellation into a delayed Vault CAS so it cannot commit", async () => {
+    const casStarted = deferred();
+    const casGate = deferred();
+    let committed = false;
+    const harness = await createHarness({
+      record: savedRecord,
+      replaceIfVersion: async (_expected, _candidate, mutationOptions) => {
+        casStarted.resolve();
+        await casGate.promise;
+        if (mutationOptions?.signal?.aborted === true) {
+          return false;
+        }
+        committed = true;
+        return true;
+      },
+    });
+    cleanups.push(harness.cleanup);
+    let now = 30_000;
+    let expire: (() => void) | undefined;
+    harness.deps.clock = () => now;
+    const result = await startSetupServer(harness.deps, {
+      scheduleTimeout(callback, delay) {
+        if (delay === 10 * 60 * 1_000) {
+          expire = callback;
+        }
+        return callback;
+      },
+      cancelTimeout() {},
+    });
+    runningServers.push(result);
+    const baseUrl = result.url.split("/#")[0] ?? "";
+    const key = accessKey(result.url);
+    const save = apiRequest(baseUrl, "/api/config", key, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        clientId: "cas-client",
+        clientSecret: "cas-secret",
+        refreshToken: "cas-refresh",
+      }),
+    }).catch(() => undefined);
+    await casStarted.promise;
+
+    now += 10 * 60 * 1_000 + 1;
+    expire?.();
+    casGate.resolve();
+    await result.closed;
+    await save;
+
+    expect(committed).toBe(false);
+    expect(harness.record).toEqual(savedRecord);
   });
 
   it("requires exact clear confirmation and rejects streaming bodies over 64 KiB", async () => {
@@ -485,8 +773,156 @@ describe("one-time setup server", () => {
     expect(harness.upload).not.toHaveBeenCalled();
   });
 
-  it("revalidates saved credentials and test-uploads through the normal orchestrator with cleanup", async () => {
+  it("enforces the 64 KiB cap on a real chunked body before static and unknown routing", async () => {
     const harness = await createHarness({ record: savedRecord });
+    cleanups.push(harness.cleanup);
+    const result = await startSetupServer(harness.deps);
+    runningServers.push(result);
+    const target = new URL(result.url.split("/#")[0] ?? "");
+
+    for (const requestTarget of ["/", "/unknown"]) {
+      const status = await new Promise<number>((resolve, reject) => {
+        const request = nodeRequest({
+          hostname: target.hostname,
+          port: target.port,
+          path: requestTarget,
+          method: requestTarget === "/" ? "GET" : "PATCH",
+          headers: {
+            host: `127.0.0.1:${result.port}`,
+            "transfer-encoding": "chunked",
+          },
+        }, (response) => {
+          response.resume();
+          response.once("end", () => resolve(response.statusCode ?? 0));
+        });
+        request.once("error", reject);
+        request.write(Buffer.alloc(40 * 1024, 0x61));
+        request.end(Buffer.alloc(30 * 1024, 0x62));
+      });
+      expect(status).toBe(413);
+    }
+
+    const rejectedHostStatus = await new Promise<number>((resolve, reject) => {
+      const request = nodeRequest({
+        hostname: target.hostname,
+        port: target.port,
+        path: "/",
+        method: "PATCH",
+        headers: {
+          host: `localhost:${result.port}`,
+          "content-length": 64 * 1024 + 1,
+        },
+      }, (response) => {
+        response.resume();
+        response.once("end", () => resolve(response.statusCode ?? 0));
+      });
+      request.once("error", reject);
+      request.end();
+    });
+    expect(rejectedHostStatus).toBe(413);
+  });
+
+  it("requires JSON media type for JSON routes and empty bodies for POST actions", async () => {
+    const harness = await createHarness({ record: savedRecord });
+    cleanups.push(harness.cleanup);
+    const result = await startSetupServer(harness.deps);
+    runningServers.push(result);
+    const baseUrl = result.url.split("/#")[0] ?? "";
+    const key = accessKey(result.url);
+    const body = JSON.stringify({
+      clientId: "media-client",
+      clientSecret: "media-secret",
+      refreshToken: "media-refresh",
+    });
+
+    const wrong = await apiRequest(baseUrl, "/api/config", key, {
+      method: "PUT",
+      headers: { "content-type": "text/plain" },
+      body,
+    });
+    const missing = await apiRequest(baseUrl, "/api/config", key, {
+      method: "PUT",
+      body,
+    });
+    const nonemptyPost = await apiRequest(baseUrl, "/api/revalidate", key, {
+      method: "POST",
+      body: "{}",
+    });
+
+    expect([wrong.status, missing.status]).toEqual([415, 415]);
+    expect(nonemptyPost.status).toBe(400);
+    expect(harness.validateCredentials).not.toHaveBeenCalled();
+  });
+
+  it("settles a slow chunked body at the owned request deadline", async () => {
+    const harness = await createHarness({ record: savedRecord });
+    cleanups.push(harness.cleanup);
+    let deadline: (() => void) | undefined;
+    const result = await startSetupServer(harness.deps, {
+      scheduleRequestTimeout(callback, delay) {
+        expect(delay).toBeGreaterThan(0);
+        deadline = callback;
+        return callback;
+      },
+      cancelRequestTimeout() {},
+    });
+    runningServers.push(result);
+    const target = new URL(result.url.split("/#")[0] ?? "");
+    const settled = new Promise<number>((resolve) => {
+      const request = nodeRequest({
+        hostname: target.hostname,
+        port: target.port,
+        path: "/api/config",
+        method: "PUT",
+        headers: {
+          host: `127.0.0.1:${result.port}`,
+          authorization: `PanSyncSetup ${accessKey(result.url)}`,
+          "content-type": "application/json",
+          "transfer-encoding": "chunked",
+        },
+      }, (response) => {
+        response.resume();
+        response.once("end", () => resolve(response.statusCode ?? 0));
+      });
+      request.once("error", () => resolve(0));
+      request.write("{\"clientId\":");
+    });
+    await vi.waitFor(() => expect(deadline).toBeTypeOf("function"));
+
+    deadline?.();
+
+    await expect(Promise.race([
+      settled,
+      new Promise<number>((resolve) => setTimeout(() => resolve(-1), 500)),
+    ])).resolves.toBe(408);
+  });
+
+  it("revalidates saved credentials and test-uploads through the normal orchestrator with cleanup", async () => {
+    let uploadWorkspace = "";
+    let uploadPayload = "";
+    let uploadMode = 0;
+    let uploadPaths: string[] = [];
+    const harness = await createHarness({
+      record: savedRecord,
+      upload: async (input) => {
+        uploadWorkspace = input.workspaceDir;
+        uploadPaths = input.paths;
+        const payloadPath = path.join(input.workspaceDir, "payload.txt");
+        uploadPayload = await readFile(payloadPath, "utf8");
+        uploadMode = (await stat(payloadPath)).mode & 0o777;
+        return {
+          provider: "aliyun" as const,
+          remoteDirectory: "/openClawShare",
+          status: "success" as const,
+          files: [{
+            inputName: "payload.txt",
+            remoteName: "setup-test (1).txt",
+            size: Buffer.byteLength(uploadPayload),
+            status: "uploaded" as const,
+          }],
+        };
+      },
+    });
     cleanups.push(harness.cleanup);
     const result = await startSetupServer(harness.deps);
     runningServers.push(result);
@@ -512,14 +948,62 @@ describe("one-time setup server", () => {
       remoteName: "setup-test (1).txt",
       remoteDirectory: "/openClawShare",
     });
+    expect(path.dirname(uploadWorkspace)).toBe(path.join(harness.deps.dataDir, "tmp"));
+    expect(path.basename(uploadWorkspace)).toMatch(/^pan-sync-test-/u);
+    expect(uploadPaths).toEqual(["payload.txt"]);
+    expect(uploadPayload).toMatch(/^[A-Za-z0-9_-]{43}\n$/u);
+    if (process.platform !== "win32") {
+      expect(uploadMode).toBe(0o600);
+    }
     const uploadInput = harness.upload.mock.calls[0]?.[0];
     expect(uploadInput).toMatchObject({
       remoteDirectory: "/openClawShare",
-      workspaceDir: path.join(harness.deps.dataDir, "tmp"),
+      workspaceDir: uploadWorkspace,
+      paths: ["payload.txt"],
     });
-    const localName = uploadInput?.paths[0];
-    expect(localName).toMatch(/^pan-sync-test-[0-9a-f]+\.txt$/);
-    await expect(access(path.join(uploadInput?.workspaceDir ?? "", localName ?? ""))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(access(uploadWorkspace)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects a symlinked temporary root without writing outside dataDir", async () => {
+    const harness = await createHarness({ record: savedRecord });
+    cleanups.push(harness.cleanup);
+    const outside = await mkdtemp(path.join(tmpdir(), "pan-sync-admin-outside-"));
+    cleanups.push(() => rm(outside, { recursive: true, force: true }));
+    await mkdir(harness.deps.dataDir, { recursive: true });
+    await symlink(outside, path.join(harness.deps.dataDir, "tmp"), "junction");
+    const result = await startSetupServer(harness.deps);
+    runningServers.push(result);
+    const baseUrl = result.url.split("/#")[0] ?? "";
+
+    const response = await apiRequest(baseUrl, "/api/test-upload", accessKey(result.url), { method: "POST" });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ code: "UPLOAD_FAILED" });
+    expect(await readdir(outside)).toEqual([]);
+    expect(harness.upload).not.toHaveBeenCalled();
+  });
+
+  it("does not report test-upload success when private workspace cleanup fails", async () => {
+    const harness = await createHarness({ record: savedRecord });
+    cleanups.push(harness.cleanup);
+    let workspace = "";
+    const result = await startSetupServer(harness.deps, {
+      async removeTemporaryDirectory(directory) {
+        workspace = directory;
+        throw new Error("cleanup failed");
+      },
+    });
+    runningServers.push(result);
+    const response = await apiRequest(
+      result.url.split("/#")[0] ?? "",
+      "/api/test-upload",
+      accessKey(result.url),
+      { method: "POST" },
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ code: "UPLOAD_FAILED" });
+    expect(workspace).toMatch(/pan-sync-test-/u);
   });
 });
 
@@ -606,6 +1090,90 @@ describe("setup page browser behavior", () => {
     page.dom.window.dispatchEvent(new page.dom.window.Event("pagehide"));
     for (const id of ["clientId", "clientSecret", "refreshToken"]) {
       expect((page.dom.window.document.getElementById(id) as HTMLInputElement).value).toBe("");
+    }
+  });
+
+  it("strips the fragment before guarded session storage access", async () => {
+    const html = await readFile(path.resolve("ui/setup.html"), "utf8");
+    const script = await readFile(path.resolve("ui/setup.js"), "utf8");
+    const key = "D".repeat(43);
+    const dom = new JSDOM(html, {
+      runScripts: "outside-only",
+      url: `http://127.0.0.1:43123/#${key}`,
+    });
+    Object.defineProperty(dom.window, "sessionStorage", {
+      configurable: true,
+      get() {
+        expect(dom.window.location.hash).toBe("");
+        throw new Error("storage disabled");
+      },
+    });
+    const requests: RequestInit[] = [];
+    dom.window.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(init ?? {});
+      return new Response(JSON.stringify({ configured: false }), { status: 200 });
+    }) as typeof dom.window.fetch;
+
+    expect(() => dom.window.eval(script)).not.toThrow();
+    await vi.waitFor(() => expect(requests).toHaveLength(1));
+    expect(new Headers(requests[0]?.headers).get("authorization")).toBe(`PanSyncSetup ${key}`);
+  });
+
+  it("ignores an older config response after a newer revalidation starts", async () => {
+    const html = await readFile(path.resolve("ui/setup.html"), "utf8");
+    const script = await readFile(path.resolve("ui/setup.js"), "utf8");
+    const dom = new JSDOM(html, {
+      runScripts: "outside-only",
+      url: `http://127.0.0.1:43123/#${"E".repeat(43)}`,
+    });
+    const responses = [deferred<Response>(), deferred<Response>()];
+    let call = 0;
+    dom.window.fetch = vi.fn(async () => responses[call++]?.promise) as typeof dom.window.fetch;
+    dom.window.eval(script);
+    await vi.waitFor(() => expect(call).toBe(1));
+    (dom.window.document.getElementById("revalidate") as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(call).toBe(2));
+    responses[1]?.resolve(new Response(JSON.stringify({
+      configured: true,
+      credentials: { clientId: "new-client", clientSecret: "new-secret", refreshToken: "new-refresh" },
+    }), { status: 200 }));
+    await vi.waitFor(() => expect((dom.window.document.getElementById("clientId") as HTMLInputElement).value).toBe("new-client"));
+    responses[0]?.resolve(new Response(JSON.stringify({
+      configured: true,
+      credentials: { clientId: "stale-client", clientSecret: "stale-secret", refreshToken: "stale-refresh" },
+    }), { status: 200 }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect((dom.window.document.getElementById("clientId") as HTMLInputElement).value).toBe("new-client");
+  });
+
+  it("aborts and ignores pending work on pagehide while clearing values and the stored key", async () => {
+    const html = await readFile(path.resolve("ui/setup.html"), "utf8");
+    const script = await readFile(path.resolve("ui/setup.js"), "utf8");
+    const key = "F".repeat(43);
+    const dom = new JSDOM(html, {
+      runScripts: "outside-only",
+      url: `http://127.0.0.1:43123/#${key}`,
+    });
+    const pending = deferred<Response>();
+    let signal: AbortSignal | undefined;
+    dom.window.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      signal = init?.signal ?? undefined;
+      return pending.promise;
+    }) as typeof dom.window.fetch;
+    dom.window.eval(script);
+    await vi.waitFor(() => expect(signal).toBeDefined());
+    dom.window.dispatchEvent(new dom.window.Event("pagehide"));
+
+    expect(signal?.aborted).toBe(true);
+    expect(dom.window.sessionStorage.getItem("panSyncSetupAccessKey")).toBeNull();
+    pending.resolve(new Response(JSON.stringify({
+      configured: true,
+      credentials: { clientId: "late-client", clientSecret: "late-secret", refreshToken: "late-refresh" },
+    }), { status: 200 }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    for (const id of ["clientId", "clientSecret", "refreshToken"]) {
+      expect((dom.window.document.getElementById(id) as HTMLInputElement).value).toBe("");
     }
   });
 

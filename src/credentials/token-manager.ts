@@ -13,8 +13,9 @@ export type TokenManagerStatus =
 export interface TokenCredentialVault {
   read(): Promise<CredentialRecord | undefined>;
   replaceIfVersion(
-    expected: number,
+    expected: number | undefined,
     candidate: CredentialRecord,
+    options?: { signal?: AbortSignal },
   ): Promise<boolean>;
 }
 

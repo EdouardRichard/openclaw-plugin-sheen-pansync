@@ -25,6 +25,10 @@ const READ_FAILED = "credential store read failed";
 const WRITE_FAILED = "credential store write failed";
 const CLEAR_FAILED = "credential store clear failed";
 
+function mutationAborted(signal: AbortSignal | undefined): boolean {
+  return signal?.aborted === true;
+}
+
 export interface CredentialLeaseRunner {
   <T>(key: string, run: () => Promise<T>): Promise<T>;
 }
@@ -120,17 +124,24 @@ export class CredentialStore {
   }
 
   async replaceIfVersion(
-    expected: number,
+    expected: number | undefined,
     candidate: CredentialRecord,
+    options: { signal?: AbortSignal } = {},
   ): Promise<boolean> {
     try {
       return await this.runWithLease(CREDENTIAL_LEASE_KEY, async () => {
+        if (mutationAborted(options.signal)) {
+          return false;
+        }
         const current = await this.#readUnlocked();
-        if (current?.credentialVersion !== expected) {
+        if (
+          mutationAborted(options.signal)
+          || current?.credentialVersion !== expected
+        ) {
           return false;
         }
 
-        await this.#writeUnlocked(candidate);
+        await this.#writeUnlocked(candidate, options.signal);
         return true;
       });
     } catch {
@@ -138,11 +149,15 @@ export class CredentialStore {
     }
   }
 
-  async clear(): Promise<void> {
+  async clear(options: { signal?: AbortSignal } = {}): Promise<void> {
     try {
       await this.runWithLease(
         CREDENTIAL_LEASE_KEY,
-        () => this.#clearUnlocked(),
+        async () => {
+          if (!mutationAborted(options.signal)) {
+            await this.#clearUnlocked(options.signal);
+          }
+        },
       );
     } catch {
       throw new Error(CLEAR_FAILED);
@@ -179,7 +194,13 @@ export class CredentialStore {
     return decryptRecord<CredentialRecord>(key, envelope);
   }
 
-  async #writeUnlocked(candidate: CredentialRecord): Promise<void> {
+  async #writeUnlocked(
+    candidate: CredentialRecord,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (mutationAborted(signal)) {
+      throw new Error("credential mutation aborted");
+    }
     await this.#ensureDataDirectory();
     await this.#recoverPendingTransactionForWrite();
     const key = await this.#loadOrCreateMasterKey();
@@ -203,7 +224,14 @@ export class CredentialStore {
       await temporaryFile.close();
       temporaryFile = undefined;
 
+      if (mutationAborted(signal)) {
+        throw new Error("credential mutation aborted");
+      }
       await this.#prepareRollbackJournal();
+      if (mutationAborted(signal)) {
+        await this.#commitTransaction();
+        throw new Error("credential mutation aborted");
+      }
       await this.#files.rename(temporaryPath, this.#credentialsPath);
       temporaryRenamed = true;
       try {
@@ -211,6 +239,12 @@ export class CredentialStore {
       } catch (error) {
         await this.#restorePreviousCanonical().catch(() => undefined);
         throw error;
+      }
+
+      if (mutationAborted(signal)) {
+        await this.#restorePreviousCanonical();
+        await this.#commitTransaction();
+        throw new Error("credential mutation aborted");
       }
 
       try {
@@ -402,7 +436,10 @@ export class CredentialStore {
     await this.#files.syncDirectory(this.dataDir).catch(() => undefined);
   }
 
-  async #clearUnlocked(): Promise<void> {
+  async #clearUnlocked(signal?: AbortSignal): Promise<void> {
+    if (mutationAborted(signal)) {
+      throw new Error("credential mutation aborted");
+    }
     await this.#recoverPendingTransactionForWrite();
     const backupPath = path.join(
       this.dataDir,
@@ -422,6 +459,9 @@ export class CredentialStore {
       }
 
       await this.#files.syncDirectory(this.dataDir);
+      if (mutationAborted(signal)) {
+        throw new Error("credential mutation aborted");
+      }
       await this.#files.unlink(this.#credentialsPath);
       try {
         await this.#files.syncDirectory(this.dataDir);

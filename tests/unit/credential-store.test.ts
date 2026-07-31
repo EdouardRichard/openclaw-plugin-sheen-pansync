@@ -104,6 +104,28 @@ describe("CredentialStore", () => {
     expect(await store.read()).toEqual(newer);
   });
 
+  it("creates only when the expected credential state is absent", async () => {
+    const store = new CredentialStore(await tempDataDir(), immediateLease);
+    const first = record(1);
+    const staleFirst = record(1, "stale-first-refresh");
+
+    await expect(store.replaceIfVersion(undefined, first)).resolves.toBe(true);
+    await expect(store.replaceIfVersion(undefined, staleFirst)).resolves.toBe(false);
+    await expect(store.read()).resolves.toEqual(first);
+  });
+
+  it("does not mutate when a Vault operation is already cancelled", async () => {
+    const store = new CredentialStore(await tempDataDir(), immediateLease);
+    const initial = record(1);
+    await store.replace(initial);
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(store.replaceIfVersion(1, record(2), { signal: controller.signal })).resolves.toBe(false);
+    await expect(store.clear({ signal: controller.signal })).resolves.toBeUndefined();
+    await expect(store.read()).resolves.toEqual(initial);
+  });
+
   it("preserves the previous ciphertext when atomic rename fails", async () => {
     const dataDir = await tempDataDir();
     const credentialsPath = path.join(dataDir, "credentials.enc");
