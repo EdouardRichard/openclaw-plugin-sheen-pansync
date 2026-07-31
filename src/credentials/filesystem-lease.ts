@@ -56,6 +56,9 @@ export type FilesystemCredentialLeaseOptions = {
   scheduleHeartbeat?: (callback: () => void, delayMs: number) => unknown;
   cancelHeartbeat?: (timer: unknown) => void;
   beforePublish?: () => void | Promise<void>;
+  onRecoveryReadyToRemove?: () => void | Promise<void>;
+  onRecoveryObserved?: () => void | Promise<void>;
+  onContention?: () => void | Promise<void>;
 };
 
 function stableUnavailable(): Error {
@@ -208,6 +211,10 @@ export function createFilesystemCredentialLeaseRunner(
   const cancelHeartbeat = options.cancelHeartbeat
     ?? ((timer: unknown) => clearTimeout(timer as NodeJS.Timeout));
   const beforePublish = options.beforePublish ?? (() => undefined);
+  const onRecoveryReadyToRemove = options.onRecoveryReadyToRemove
+    ?? (() => undefined);
+  const onRecoveryObserved = options.onRecoveryObserved ?? (() => undefined);
+  const onContention = options.onContention ?? (() => undefined);
 
   const recoveryPath = (key: string): string => path.join(
     lockDir,
@@ -231,31 +238,58 @@ export function createFilesystemCredentialLeaseRunner(
     ) {
       return false;
     }
+    await onRecoveryObserved();
 
     const quarantine = recoveryPath(key);
+    let moved = false;
     try {
-      await link(target, quarantine);
+      await rename(target, quarantine);
+      moved = true;
     } catch (error) {
       return hasErrorCode(error, "ENOENT");
     }
+    const restoreMovedLock = async (): Promise<void> => {
+      try {
+        await link(quarantine, target);
+      } catch (error) {
+        if (hasErrorCode(error, "EEXIST")) {
+          throw stableUnavailable();
+        }
+        throw error;
+      }
+      await unlink(quarantine);
+      moved = false;
+    };
     try {
       const quarantined = await readRegularRecord(quarantine);
-      if (quarantined?.ownerToken !== observed.ownerToken) {
+      if (
+        quarantined?.ownerToken !== observed.ownerToken
+        || clock() - quarantined.heartbeatAt < staleMs
+        || processStatus(quarantined.pid) !== "dead"
+      ) {
+        await restoreMovedLock();
         return false;
       }
-      const [currentIdentity, quarantineIdentity] = await Promise.all([
-        lstat(target),
-        lstat(quarantine),
-      ]);
-      if (!sameFile(currentIdentity, quarantineIdentity)) {
-        return false;
-      }
-      await unlink(target);
+      await onRecoveryReadyToRemove();
+      await unlink(quarantine);
+      moved = false;
       return true;
     } catch (error) {
+      if (moved) {
+        try {
+          await restoreMovedLock();
+        } catch {
+          throw stableUnavailable();
+        }
+      }
+      if (error instanceof Error && error.message === UNAVAILABLE) {
+        throw error;
+      }
       return hasErrorCode(error, "ENOENT");
     } finally {
-      await unlink(quarantine).catch(() => undefined);
+      if (!moved) {
+        await unlink(quarantine).catch(() => undefined);
+      }
     }
   };
 
@@ -332,6 +366,7 @@ export function createFilesystemCredentialLeaseRunner(
         throw stableUnavailable();
       }
 
+      await onContention();
       if (await tryRecover(target, key)) continue;
       if (clock() - startedAt >= waitTimeoutMs) {
         throw stableUnavailable();

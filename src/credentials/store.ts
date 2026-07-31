@@ -7,6 +7,7 @@ import {
   mkdir as fsMkdir,
   open as fsOpen,
   readFile,
+  readdir as fsReaddir,
   rename as fsRename,
   unlink as fsUnlink,
 } from "node:fs/promises";
@@ -21,7 +22,6 @@ const CREDENTIAL_LEASE_KEY = "credentials";
 const DATA_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 const MASTER_KEY_BYTES = 32;
-const ROLLBACK_MARKER = "rollback-v1\n";
 const READ_FAILED = "credential store read failed";
 const WRITE_FAILED = "credential store write failed";
 const CLEAR_FAILED = "credential store clear failed";
@@ -52,6 +52,7 @@ export interface CredentialFileAdapter {
   ): Promise<void>;
   open(target: string, flags: string, mode?: number): Promise<FileHandle>;
   readBuffer(target: string): Promise<Buffer>;
+  readdir(directory: string): Promise<string[]>;
   readText(target: string): Promise<string>;
   rename(source: string, destination: string): Promise<void>;
   unlink(target: string): Promise<void>;
@@ -66,6 +67,7 @@ const defaultFileAdapter: CredentialFileAdapter = {
   },
   open: fsOpen,
   readBuffer: (target) => readFile(target),
+  readdir: fsReaddir,
   readText: (target) => readFile(target, "utf8"),
   rename: fsRename,
   unlink: fsUnlink,
@@ -102,11 +104,26 @@ function sameFile(left: Stats, right: Stats): boolean {
   );
 }
 
+type RollbackTransaction = {
+  transactionId: string;
+  markerPath: string;
+  backupPath: string;
+  hadCanonical: boolean;
+  legacy?: boolean;
+};
+
+type RollbackMarkerV2 = {
+  formatVersion: 2;
+  transactionId: string;
+  hadCanonical: boolean;
+  backupName: string;
+};
+
 export class CredentialStore {
   readonly #credentialsPath: string;
-  readonly #backupPath: string;
+  readonly #legacyBackupPath: string;
   readonly #masterKeyPath: string;
-  readonly #transactionPath: string;
+  readonly #legacyTransactionPath: string;
   readonly #files: CredentialFileAdapter;
 
   constructor(
@@ -115,9 +132,9 @@ export class CredentialStore {
     files: Partial<CredentialFileAdapter> = {},
   ) {
     this.#credentialsPath = path.join(dataDir, "credentials.enc");
-    this.#backupPath = path.join(dataDir, "credentials.enc.bak");
+    this.#legacyBackupPath = path.join(dataDir, "credentials.enc.bak");
     this.#masterKeyPath = path.join(dataDir, "master.key");
-    this.#transactionPath = path.join(dataDir, "credentials.txn");
+    this.#legacyTransactionPath = path.join(dataDir, "credentials.txn");
     this.#files = { ...defaultFileAdapter, ...files };
   }
 
@@ -215,9 +232,21 @@ export class CredentialStore {
   }
 
   async #readUnlocked(): Promise<CredentialRecord | undefined> {
-    const credentialPaths = await this.#hasPendingTransaction()
-      ? [this.#backupPath, this.#credentialsPath]
-      : [this.#credentialsPath];
+    const pendingTransactions = await this.#pendingTransactions();
+    if (pendingTransactions.length > 1) {
+      throw new Error("credential transaction rejected");
+    }
+    if (
+      pendingTransactions.some((transaction) =>
+        !transaction.legacy && !transaction.hadCanonical
+      )
+    ) {
+      return undefined;
+    }
+    const credentialPaths = [
+      ...pendingTransactions.map((transaction) => transaction.backupPath),
+      this.#credentialsPath,
+    ];
     let serialized: string | undefined;
     for (const credentialsPath of credentialPaths) {
       try {
@@ -255,10 +284,11 @@ export class CredentialStore {
     await lease?.assertOwned();
     await this.#ensureDataDirectory();
     await lease?.assertOwned();
-    await this.#recoverPendingTransactionForWrite();
+    await this.#recoverPendingTransactionForWrite(lease);
     await lease?.assertOwned();
     const key = await this.#loadOrCreateMasterKey();
     const envelope = encryptRecord(key, candidate);
+    const transaction = this.#newTransaction();
     const temporaryPath = path.join(
       this.dataDir,
       `.credentials.enc.${randomBytes(16).toString("hex")}.tmp`,
@@ -284,10 +314,10 @@ export class CredentialStore {
         throw new Error("credential mutation aborted");
       }
       await lease?.assertOwned();
-      await this.#prepareRollbackJournal();
+      await this.#prepareRollbackJournal(transaction);
       await lease?.assertOwned();
       if (mutationAborted(signal)) {
-        await this.#commitTransaction();
+        await this.#commitTransaction(transaction, lease);
         throw new Error("credential mutation aborted");
       }
       await lease?.assertOwned();
@@ -296,35 +326,38 @@ export class CredentialStore {
       try {
         await this.#files.syncDirectory(this.dataDir);
       } catch (error) {
-        await this.#restorePreviousCanonical(temporaryIdentity).catch(
+        await this.#restorePreviousCanonical(
+          temporaryIdentity,
+          lease,
+          transaction,
+        ).catch(
           () => undefined,
         );
         throw error;
       }
 
-      try {
-        await lease?.assertOwned();
-      } catch (error) {
-        const restored = await this.#restorePreviousCanonical(
-          temporaryIdentity,
-        );
-        if (restored) await this.#commitTransaction();
-        throw error;
-      }
+      await lease?.assertOwned();
       if (mutationAborted(signal)) {
         const restored = await this.#restorePreviousCanonical(
           temporaryIdentity,
+          lease,
+          transaction,
         );
-        if (restored) await this.#commitTransaction();
+        if (restored) await this.#commitTransaction(transaction, lease);
         throw new Error("credential mutation aborted");
       }
 
+      await lease?.assertOwned();
       try {
-        await lease?.assertOwned();
-        await this.#commitTransaction();
+        await this.#commitTransaction(transaction, lease);
       } catch (error) {
-        await this.#ensureRollbackMarker().catch(() => undefined);
-        await this.#restorePreviousCanonical(temporaryIdentity).catch(
+        await lease?.assertOwned();
+        await this.#ensureRollbackMarker(transaction).catch(() => undefined);
+        await this.#restorePreviousCanonical(
+          temporaryIdentity,
+          lease,
+          transaction,
+        ).catch(
           () => undefined,
         );
         throw error;
@@ -388,46 +421,109 @@ export class CredentialStore {
     return key;
   }
 
-  async #hasPendingTransaction(): Promise<boolean> {
-    try {
-      await this.#files.readText(this.#transactionPath);
-      return true;
-    } catch (error) {
-      if (hasErrorCode(error, "ENOENT")) {
-        return false;
-      }
-      throw error;
-    }
+  #newTransaction(): RollbackTransaction {
+    const transactionId = randomBytes(16).toString("hex");
+    return {
+      transactionId,
+      markerPath: path.join(this.dataDir, `.credentials.${transactionId}.txn`),
+      backupPath: path.join(
+        this.dataDir,
+        `.credentials.enc.${transactionId}.bak`,
+      ),
+      hadCanonical: false,
+    };
   }
 
-  async #prepareRollbackJournal(): Promise<void> {
-    await this.#files.unlink(this.#backupPath).catch((error: unknown) => {
-      if (!hasErrorCode(error, "ENOENT")) {
+  async #pendingTransactions(): Promise<RollbackTransaction[]> {
+    const transactions: RollbackTransaction[] = [];
+    const names = await this.#files.readdir(this.dataDir).catch(
+      (error: unknown) => {
+        if (hasErrorCode(error, "ENOENT")) return [];
+        throw error;
+      },
+    );
+    for (const name of names.sort()) {
+      const match = /^\.credentials\.([a-f0-9]{32})\.txn$/.exec(name);
+      if (match === null) continue;
+      const transactionId = match[1]!;
+      const markerPath = path.join(this.dataDir, name);
+      let serialized: string;
+      try {
+        serialized = await this.#files.readText(markerPath);
+      } catch (error) {
+        if (hasErrorCode(error, "ENOENT")) continue;
         throw error;
       }
-    });
+      let marker: RollbackMarkerV2;
+      try {
+        marker = JSON.parse(serialized) as RollbackMarkerV2;
+      } catch {
+        throw new Error("credential transaction rejected");
+      }
+      const backupName = `.credentials.enc.${transactionId}.bak`;
+      if (
+        marker.formatVersion !== 2
+        || marker.transactionId !== transactionId
+        || typeof marker.hadCanonical !== "boolean"
+        || marker.backupName !== backupName
+      ) {
+        throw new Error("credential transaction rejected");
+      }
+      transactions.push({
+        transactionId,
+        markerPath,
+        backupPath: path.join(this.dataDir, backupName),
+        hadCanonical: marker.hadCanonical,
+      });
+    }
+
     try {
-      await this.#files.link(this.#credentialsPath, this.#backupPath);
+      await this.#files.readText(this.#legacyTransactionPath);
+      transactions.push({
+        transactionId: "legacy",
+        markerPath: this.#legacyTransactionPath,
+        backupPath: this.#legacyBackupPath,
+        hadCanonical: true,
+        legacy: true,
+      });
+    } catch (error) {
+      if (!hasErrorCode(error, "ENOENT")) throw error;
+    }
+    return transactions;
+  }
+
+  async #prepareRollbackJournal(
+    transaction: RollbackTransaction,
+  ): Promise<void> {
+    try {
+      await this.#files.link(this.#credentialsPath, transaction.backupPath);
+      transaction.hadCanonical = true;
     } catch (error) {
       if (!hasErrorCode(error, "ENOENT")) {
         throw error;
       }
     }
 
-    await this.#writeRollbackMarker();
+    await this.#writeRollbackMarker(transaction);
     await this.#files.syncDirectory(this.dataDir);
   }
 
-  async #writeRollbackMarker(): Promise<void> {
+  async #writeRollbackMarker(transaction: RollbackTransaction): Promise<void> {
     let markerFile: FileHandle | undefined;
     try {
       markerFile = await this.#files.open(
-        this.#transactionPath,
+        transaction.markerPath,
         "wx",
         PRIVATE_FILE_MODE,
       );
-      await markerFile.writeFile(ROLLBACK_MARKER, "utf8");
-      await this.#files.chmod(this.#transactionPath, PRIVATE_FILE_MODE);
+      const marker: RollbackMarkerV2 = {
+        formatVersion: 2,
+        transactionId: transaction.transactionId,
+        hadCanonical: transaction.hadCanonical,
+        backupName: path.basename(transaction.backupPath),
+      };
+      await markerFile.writeFile(`${JSON.stringify(marker)}\n`, "utf8");
+      await this.#files.chmod(transaction.markerPath, PRIVATE_FILE_MODE);
       await markerFile.sync();
       await markerFile.close();
       markerFile = undefined;
@@ -438,9 +534,9 @@ export class CredentialStore {
     }
   }
 
-  async #ensureRollbackMarker(): Promise<void> {
+  async #ensureRollbackMarker(transaction: RollbackTransaction): Promise<void> {
     try {
-      await this.#writeRollbackMarker();
+      await this.#writeRollbackMarker(transaction);
     } catch (error) {
       if (!hasErrorCode(error, "EEXIST")) {
         throw error;
@@ -464,6 +560,8 @@ export class CredentialStore {
 
   async #restorePreviousCanonical(
     expectedCanonical?: Stats,
+    lease?: CredentialLeaseContext,
+    transaction?: RollbackTransaction,
   ): Promise<boolean> {
     if (expectedCanonical !== undefined) {
       const current = await this.#pathIdentity(this.#credentialsPath);
@@ -471,6 +569,9 @@ export class CredentialStore {
         return false;
       }
     }
+    await lease?.assertOwned();
+    const backupPath = transaction?.backupPath ?? this.#legacyBackupPath;
+    const hadCanonical = transaction?.hadCanonical ?? true;
     const recoveryPath = path.join(
       this.dataDir,
       `.credentials.enc.${randomBytes(16).toString("hex")}.rollback`,
@@ -478,7 +579,9 @@ export class CredentialStore {
     let recoveryLinked = false;
     try {
       try {
-        await this.#files.link(this.#backupPath, recoveryPath);
+        if (hadCanonical) {
+          await this.#files.link(backupPath, recoveryPath);
+        }
         recoveryLinked = true;
       } catch (error) {
         if (!hasErrorCode(error, "ENOENT")) {
@@ -505,10 +608,15 @@ export class CredentialStore {
     return true;
   }
 
-  async #commitTransaction(): Promise<void> {
-    await this.#files.unlink(this.#transactionPath);
+  async #commitTransaction(
+    transaction: RollbackTransaction,
+    lease?: CredentialLeaseContext,
+  ): Promise<void> {
+    await lease?.assertOwned();
+    await this.#files.unlink(transaction.markerPath);
     await this.#files.syncDirectory(this.dataDir);
-    await this.#files.unlink(this.#backupPath).catch((error: unknown) => {
+    await lease?.assertOwned();
+    await this.#files.unlink(transaction.backupPath).catch((error: unknown) => {
       if (!hasErrorCode(error, "ENOENT")) {
         throw error;
       }
@@ -516,20 +624,22 @@ export class CredentialStore {
     await this.#files.syncDirectory(this.dataDir).catch(() => undefined);
   }
 
-  async #recoverPendingTransactionForWrite(): Promise<void> {
-    if (!(await this.#hasPendingTransaction())) {
-      await this.#files.unlink(this.#backupPath).catch((error: unknown) => {
-        if (!hasErrorCode(error, "ENOENT")) {
-          throw error;
-        }
-      });
-      return;
+  async #recoverPendingTransactionForWrite(
+    lease?: CredentialLeaseContext,
+  ): Promise<void> {
+    const transactions = await this.#pendingTransactions();
+    if (transactions.length > 1) {
+      throw new Error("credential transaction rejected");
     }
+    const transaction = transactions[0];
+    if (transaction === undefined) return;
 
-    await this.#restorePreviousCanonical();
-    await this.#files.unlink(this.#transactionPath);
+    await this.#restorePreviousCanonical(undefined, lease, transaction);
+    await lease?.assertOwned();
+    await this.#files.unlink(transaction.markerPath);
     await this.#files.syncDirectory(this.dataDir);
-    await this.#files.unlink(this.#backupPath).catch(() => undefined);
+    await lease?.assertOwned();
+    await this.#files.unlink(transaction.backupPath).catch(() => undefined);
     await this.#files.syncDirectory(this.dataDir).catch(() => undefined);
   }
 
@@ -541,7 +651,7 @@ export class CredentialStore {
       throw new Error("credential mutation aborted");
     }
     await lease?.assertOwned();
-    await this.#recoverPendingTransactionForWrite();
+    await this.#recoverPendingTransactionForWrite(lease);
     await lease?.assertOwned();
     const backupPath = path.join(
       this.dataDir,
@@ -550,6 +660,14 @@ export class CredentialStore {
     let backupCreated = false;
     let preserveBackup = false;
     let canonicalDeleted = false;
+    const assertOwned = async (): Promise<void> => {
+      try {
+        await lease?.assertOwned();
+      } catch (error) {
+        preserveBackup = true;
+        throw error;
+      }
+    };
     const restoreCanonical = async (): Promise<void> => {
       if (!canonicalDeleted) {
         return;
@@ -571,20 +689,15 @@ export class CredentialStore {
         throw error;
       }
 
-      await lease?.assertOwned();
+      await assertOwned();
       await this.#files.syncDirectory(this.dataDir);
       if (mutationAborted(signal)) {
         throw new Error("credential mutation aborted");
       }
-      await lease?.assertOwned();
+      await assertOwned();
       await this.#files.unlink(this.#credentialsPath);
       canonicalDeleted = true;
-      try {
-        await lease?.assertOwned();
-      } catch (error) {
-        await restoreCanonical();
-        throw error;
-      }
+      await assertOwned();
       if (mutationAborted(signal)) {
         await restoreCanonical();
         throw new Error("credential mutation aborted");
@@ -600,8 +713,8 @@ export class CredentialStore {
         throw new Error("credential mutation aborted");
       }
 
+      await assertOwned();
       try {
-        await lease?.assertOwned();
         await this.#files.unlink(backupPath);
       } catch (error) {
         await restoreCanonical();

@@ -88,6 +88,12 @@ export class TokenManager {
 
   async status(): Promise<TokenManagerStatus> {
     const record = await this.store.read();
+    return this.statusForSnapshot(record);
+  }
+
+  statusForSnapshot(
+    record: CredentialRecord | undefined,
+  ): TokenManagerStatus {
     if (record === undefined) {
       this.#failureState = undefined;
       return "unconfigured";

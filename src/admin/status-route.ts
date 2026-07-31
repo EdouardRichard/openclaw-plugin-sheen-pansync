@@ -17,7 +17,7 @@ export const STATUS_SECURITY_HEADERS = {
 
 export type PanSyncStatusRouteDependencies = {
   store: Pick<CredentialStore, "read">;
-  tokenManager: Pick<TokenManager, "status">;
+  tokenManager: Pick<TokenManager, "statusForSnapshot">;
   config: Pick<PluginConfig, "defaultDirectory">;
 };
 
@@ -126,7 +126,9 @@ export function createPanSyncStatusRoute(
     let status: TokenManagerStatus;
     try {
       record = await dependencies.store.read();
-      status = boundedStatus(await dependencies.tokenManager.status());
+      status = boundedStatus(
+        dependencies.tokenManager.statusForSnapshot(record),
+      );
     } catch {
       record = undefined;
       status = "degraded";

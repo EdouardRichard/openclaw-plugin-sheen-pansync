@@ -1,5 +1,6 @@
 import {
   chmod,
+  type FileHandle,
   link,
   mkdir,
   open,
@@ -182,7 +183,7 @@ describe("CredentialStore", () => {
     const store = new CredentialStore(dataDir, lease, {
       async link(existingPath, newPath) {
         await link(existingPath, newPath);
-        if (newPath.endsWith("credentials.enc.bak")) {
+        if (/\.credentials\.enc\.[a-f0-9]{32}\.bak$/.test(newPath)) {
           owned = false;
         }
       },
@@ -206,8 +207,6 @@ describe("CredentialStore", () => {
   it("never rolls a losing writer over a newer canonical credential", async () => {
     const dataDir = await tempDataDir();
     const credentialsPath = path.join(dataDir, "credentials.enc");
-    const transactionPath = path.join(dataDir, "credentials.txn");
-    const backupPath = path.join(dataDir, "credentials.enc.bak");
     const seed = new CredentialStore(dataDir, immediateLease);
     const initial = record(1);
     const winner = record(3, "winner-refresh-CANARY");
@@ -227,8 +226,11 @@ describe("CredentialStore", () => {
           mode: 0o600,
         });
         await rename(winnerPath, credentialsPath);
-        await unlink(transactionPath).catch(() => undefined);
-        await unlink(backupPath).catch(() => undefined);
+        for (const name of await readdir(dataDir)) {
+          if (name.endsWith(".txn") || name.endsWith(".bak")) {
+            await unlink(path.join(dataDir, name)).catch(() => undefined);
+          }
+        }
         throw new Error("credential lease ownership lost");
       },
     });
@@ -249,6 +251,139 @@ describe("CredentialStore", () => {
     );
 
     expect(winnerInstalled).toBe(true);
+    await expect(readFile(credentialsPath)).resolves.toEqual(winnerCiphertext);
+    await expect(seed.read()).resolves.toEqual(winner);
+  });
+
+  it("performs no rollback mutation when ownership is lost after its last identity observation", async () => {
+    const dataDir = await tempDataDir();
+    const credentialsPath = path.join(dataDir, "credentials.enc");
+    const seed = new CredentialStore(dataDir, immediateLease);
+    const initial = record(1);
+    const winner = record(3, "winner-after-observation-CANARY");
+    await seed.replace(initial);
+    await seed.replace(winner);
+    const winnerCiphertext = await readFile(credentialsPath);
+    await seed.replace(initial);
+    let owned = true;
+    let losingCanonicalInstalled = false;
+    let failPostRenameSync = true;
+    let winnerInstalled = false;
+    const lease: CredentialLeaseRunner = (_key, run) => run({
+      async assertOwned() {
+        if (!owned) throw new Error("credential lease ownership lost");
+      },
+    });
+    const store = new CredentialStore(dataDir, lease, {
+      async open(target, flags, mode) {
+        const handle = await open(target, flags, mode);
+        if (
+          target !== credentialsPath
+          || flags !== "r"
+          || !losingCanonicalInstalled
+          || winnerInstalled
+        ) {
+          return handle;
+        }
+        return {
+          async stat() {
+            const observed = await handle.stat();
+            await handle.close();
+            winnerInstalled = true;
+            const winnerPath = path.join(dataDir, ".winner-after-observation.tmp");
+            await writeFile(winnerPath, winnerCiphertext, {
+              flag: "wx",
+              mode: 0o600,
+            });
+            await rename(winnerPath, credentialsPath);
+            for (const name of await readdir(dataDir)) {
+              if (name.endsWith(".txn") || name.endsWith(".bak")) {
+                await unlink(path.join(dataDir, name)).catch(() => undefined);
+              }
+            }
+            owned = false;
+            return observed;
+          },
+          async close() {},
+        } as FileHandle;
+      },
+      async rename(source, destination) {
+        await rename(source, destination);
+        if (
+          destination === credentialsPath
+          && path.basename(source).endsWith(".tmp")
+        ) {
+          losingCanonicalInstalled = true;
+        }
+      },
+      async syncDirectory() {
+        if (losingCanonicalInstalled && failPostRenameSync) {
+          failPostRenameSync = false;
+          throw new Error("post-rename-sync-CANARY");
+        }
+      },
+    });
+
+    await expect(store.replace(record(2))).rejects.toThrow(
+      "credential store write failed",
+    );
+
+    expect(winnerInstalled).toBe(true);
+    await expect(readFile(credentialsPath)).resolves.toEqual(winnerCiphertext);
+    await expect(seed.read()).resolves.toEqual(winner);
+  });
+
+  it("does not restore or clean up after clear observes ownership loss", async () => {
+    const dataDir = await tempDataDir();
+    const credentialsPath = path.join(dataDir, "credentials.enc");
+    const seed = new CredentialStore(dataDir, immediateLease);
+    const winner = record(3, "winner-during-clear-CANARY");
+    await seed.replace(record(1));
+    await seed.replace(winner);
+    const winnerCiphertext = await readFile(credentialsPath);
+    await seed.replace(record(1));
+    let canonicalDeleted = false;
+    let ownershipLost = false;
+    const postLossMutations: string[] = [];
+    const lease: CredentialLeaseRunner = (_key, run) => run({
+      async assertOwned() {
+        if (!canonicalDeleted || ownershipLost) {
+          if (ownershipLost) throw new Error("credential lease ownership lost");
+          return;
+        }
+        const winnerPath = path.join(dataDir, ".winner-during-clear.tmp");
+        await writeFile(winnerPath, winnerCiphertext, {
+          flag: "wx",
+          mode: 0o600,
+        });
+        await rename(winnerPath, credentialsPath);
+        for (const name of await readdir(dataDir)) {
+          if (name.endsWith(".txn") || name.endsWith(".bak")) {
+            await unlink(path.join(dataDir, name)).catch(() => undefined);
+          }
+        }
+        ownershipLost = true;
+        throw new Error("credential lease ownership lost");
+      },
+    });
+    const store = new CredentialStore(dataDir, lease, {
+      async link(existingPath, newPath) {
+        if (ownershipLost) postLossMutations.push(`link:${newPath}`);
+        await link(existingPath, newPath);
+      },
+      async unlink(target) {
+        if (ownershipLost) postLossMutations.push(`unlink:${target}`);
+        await unlink(target);
+        if (target === credentialsPath) canonicalDeleted = true;
+      },
+      async syncDirectory(directory) {
+        if (ownershipLost) postLossMutations.push(`sync:${directory}`);
+      },
+    });
+
+    await expect(store.clear()).rejects.toThrow("credential store clear failed");
+
+    expect(postLossMutations).toEqual([]);
     await expect(readFile(credentialsPath)).resolves.toEqual(winnerCiphertext);
     await expect(seed.read()).resolves.toEqual(winner);
   });
@@ -412,10 +547,10 @@ describe("CredentialStore", () => {
   it("recovers from a durable marker after repeated directory sync failure", async () => {
     const dataDir = await tempDataDir();
     const credentialsPath = path.join(dataDir, "credentials.enc");
-    const transactionPath = path.join(dataDir, "credentials.txn");
     const initial = record(1);
     const seedStore = new CredentialStore(dataDir, immediateLease);
     await seedStore.replace(initial);
+    const previousCiphertext = await readFile(credentialsPath);
     let replacementInstalled = false;
     let syncCalls = 0;
     const rollbackSyncFailureAdapter: Partial<CredentialFileAdapter> = {
@@ -444,7 +579,26 @@ describe("CredentialStore", () => {
     expect(error.message).not.toContain("ROLLBACK_SYNC_CANARY");
     expect(error.message).not.toContain(dataDir);
     expect(syncCalls).toBeGreaterThanOrEqual(3);
-    await expect(readFile(transactionPath, "utf8")).resolves.toBe("rollback-v1\n");
+    const transactionNames = (await readdir(dataDir)).filter((name) =>
+      /^\.credentials\.[a-f0-9]{32}\.txn$/.test(name)
+    );
+    expect(transactionNames).toHaveLength(1);
+    const transactionId = transactionNames[0]!.slice(
+      ".credentials.".length,
+      -".txn".length,
+    );
+    const marker = JSON.parse(
+      await readFile(path.join(dataDir, transactionNames[0]!), "utf8"),
+    ) as Record<string, unknown>;
+    expect(marker).toEqual({
+      formatVersion: 2,
+      transactionId,
+      hadCanonical: true,
+      backupName: `.credentials.enc.${transactionId}.bak`,
+    });
+    await expect(
+      readFile(path.join(dataDir, marker.backupName as string)),
+    ).resolves.toEqual(previousCiphertext);
     const freshStore = new CredentialStore(dataDir, immediateLease);
     await expect(freshStore.read()).resolves.toEqual(initial);
   });

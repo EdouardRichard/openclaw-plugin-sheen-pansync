@@ -30,7 +30,10 @@ import {
   type CredentialLeaseRunner,
   CredentialStore,
 } from "../../src/credentials/store.js";
-import type { TokenManagerStatus } from "../../src/credentials/token-manager.js";
+import {
+  TokenManager,
+  type TokenManagerStatus,
+} from "../../src/credentials/token-manager.js";
 import type { CredentialRecord } from "../../src/credentials/types.js";
 import { createTempState, octalMode } from "../helpers/temp-state.js";
 
@@ -281,7 +284,7 @@ describe("read-only status route", () => {
     await store.replace(record);
     const handler = createPanSyncStatusRoute({
       store,
-      tokenManager: { status: async () => "ready" },
+      tokenManager: { statusForSnapshot: () => "ready" },
       config: { defaultDirectory: "/openClawShare" },
     });
 
@@ -326,7 +329,7 @@ describe("read-only status route", () => {
           ? undefined
           : credentialRecord(),
       },
-      tokenManager: { status: async () => status },
+      tokenManager: { statusForSnapshot: () => status },
       config: { defaultDirectory: "/openClawShare" },
     });
 
@@ -339,7 +342,7 @@ describe("read-only status route", () => {
   it("allows only GET and HEAD, emits no HEAD body, and secures rejection responses", async () => {
     const handler = createPanSyncStatusRoute({
       store: { read: async () => undefined },
-      tokenManager: { status: async () => "unconfigured" },
+      tokenManager: { statusForSnapshot: () => "unconfigured" },
       config: { defaultDirectory: "/openClawShare" },
     });
 
@@ -366,7 +369,7 @@ describe("read-only status route", () => {
         },
       },
       tokenManager: {
-        status: async () => {
+        statusForSnapshot: () => {
           throw new Error("upstream-body-CANARY");
         },
       },
@@ -380,6 +383,35 @@ describe("read-only status route", () => {
     expect(response.body).toContain("/openClawShare&lt;script&gt;");
     expect(response.body).not.toContain("native-status-CANARY");
     expect(response.body).not.toContain("upstream-body-CANARY");
+  });
+
+  it("renders status and credential projection from one coherent Vault snapshot", async () => {
+    const configured = credentialRecord();
+    let reads = 0;
+    const vault = {
+      async read() {
+        reads += 1;
+        return reads === 1 ? configured : undefined;
+      },
+      async replaceIfVersion() {
+        return false;
+      },
+    };
+    const tokenManager = new TokenManager(vault, {
+      refreshToken: vi.fn(),
+    } as never);
+    const handler = createPanSyncStatusRoute({
+      store: vault as never,
+      tokenManager,
+      config: { defaultDirectory: "/openClawShare" },
+    });
+
+    const response = await invokeRoute(handler, "GET");
+
+    expect(reads).toBe(1);
+    expect(response.body).toContain("ready");
+    expect(response.body).toContain("Configured</dt><dd>yes");
+    expect(response.body).toContain("cl****34");
   });
 });
 
@@ -551,7 +583,7 @@ describe("OpenClaw plugin entry", () => {
   it(
     "installs and registers the actual package artifact in OpenClaw without privileged state access",
     async () => {
-      const root = await mkdtemp(path.join(process.cwd(), ".pan-sync-entry-runtime-"));
+      const root = await mkdtemp(path.join(tmpdir(), "pan-sync-entry-runtime-"));
       cleanups.push(() => rm(root, { recursive: true, force: true }));
       const stateDir = path.join(root, "state");
       await mkdir(stateDir);
