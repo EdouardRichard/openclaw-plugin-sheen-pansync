@@ -60,7 +60,7 @@ Refresh Token
 openclaw pan-sync configure
 ```
 
-命令启动一个只监听 `127.0.0.1` 的一次性配置页，最长可用 10 分钟，并打印带一次性访问密钥的 `Remote URL`。在本机浏览器打开该 URL，录入三项值并选择“Save and verify”。
+命令启动一个只监听 `127.0.0.1` 的一次性配置页，最长可用 10 分钟，并打印带一次性访问密钥的 `Remote URL`。访问密钥位于 URL fragment：必须完整打开命令打印的 URL（包括末尾的 `#<one-time-key>`），不能省略或改写该片段。页面加载后会立即将有效密钥移入浏览器的 `sessionStorage`，并从可见地址栏移除 fragment；因此加载后地址栏不再显示密钥是预期行为。在本机浏览器打开该完整 URL，录入三项值并选择“Save and verify”。
 
 `client_secret` 与 `refresh_token` 的完整值只会在这个经授权的一次性回环配置页中显示；它们不会出现在 Control UI、上传工具结果、日志或错误信息中。
 
@@ -72,7 +72,7 @@ openclaw pan-sync configure
 ssh -L <port>:127.0.0.1:<port> user@linux.example.com
 ```
 
-在你的本地电脑建立该 SSH 隧道后，在本地浏览器打开远程命令打印的 `Remote URL`。不要把配置页改为监听 `0.0.0.0`，也不要把它直接暴露到网络。
+在你的本地电脑建立该 SSH 隧道后，在本地浏览器完整打开远程命令打印的 `Remote URL`，包括 `#<one-time-key>` fragment。页面会将密钥立即移入本地浏览器的 `sessionStorage`，再从可见地址栏移除该 fragment。不要把配置页改为监听 `0.0.0.0`，也不要把它直接暴露到网络。
 
 ## 7. 保存、验证凭证并测试上传
 

@@ -37,7 +37,7 @@ Plugin runtime refresh                    -> official Aliyun endpoint, no AList 
 openclaw pan-sync configure
 ```
 
-仅在命令打开的、经一次性访问密钥授权的 `127.0.0.1` 配置页填写三项值。选择“Save and verify”后，插件会直接用阿里云盘官方刷新端点验证凭证；成功时加密保存，失败时保留旧凭证。
+仅在命令打开的、经一次性访问密钥授权的 `127.0.0.1` 配置页填写三项值。必须完整打开命令打印的 URL（包括 URL fragment 中的 `#<one-time-key>`）；页面加载时会立即把有效密钥移入浏览器的 `sessionStorage`，再从可见地址栏移除 fragment。选择“Save and verify”后，插件会直接用阿里云盘官方刷新端点验证凭证；成功时加密保存，失败时保留旧凭证。
 
 ## 令牌失效或泄露后的恢复
 
