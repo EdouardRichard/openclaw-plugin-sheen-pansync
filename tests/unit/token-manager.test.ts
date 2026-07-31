@@ -1,8 +1,12 @@
 import { readFile } from "node:fs/promises";
-import { createServer } from "node:net";
+import { createServer as createHttpServer } from "node:http";
+import { createServer as createNetServer, type Socket } from "node:net";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { TokenManager } from "../../src/credentials/token-manager.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  TokenManager,
+  type TokenCredentialVault,
+} from "../../src/credentials/token-manager.js";
 import {
   CredentialStore,
   type CredentialLeaseRunner,
@@ -67,7 +71,7 @@ async function fakeServer(
 }
 
 async function refusedLocalBaseUrl(): Promise<string> {
-  const listener = createServer();
+  const listener = createNetServer();
   await new Promise<void>((resolve, reject) => {
     listener.once("error", reject);
     listener.listen(0, "127.0.0.1", () => {
@@ -89,6 +93,181 @@ async function refusedLocalBaseUrl(): Promise<string> {
     });
   });
   return `http://127.0.0.1:${address.port}`;
+}
+
+type PromiseOutcome<T> =
+  | { status: "fulfilled"; value: T }
+  | { status: "rejected"; reason: unknown }
+  | { status: "timeout" };
+
+async function outcomeWithin<T>(
+  promise: Promise<T>,
+  timeoutMs = 500,
+): Promise<PromiseOutcome<T>> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then<PromiseOutcome<T>, PromiseOutcome<T>>(
+        (value) => ({ status: "fulfilled", value }),
+        (reason: unknown) => ({ status: "rejected", reason }),
+      ),
+      new Promise<PromiseOutcome<T>>((resolve) => {
+        timeout = setTimeout(() => resolve({ status: "timeout" }), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) {
+      clearTimeout(timeout);
+    }
+  }
+}
+
+async function flushTurn(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+function memoryVault(initial: CredentialRecord): {
+  vault: TokenCredentialVault;
+  current(): CredentialRecord;
+} {
+  let record = initial;
+  return {
+    vault: {
+      async read() {
+        return record;
+      },
+      async replaceIfVersion(expected, candidate, options) {
+        if (options?.signal?.aborted === true) {
+          throw new PanSyncError("TOKEN_ENDPOINT_UNAVAILABLE");
+        }
+        if (record.credentialVersion !== expected) {
+          return false;
+        }
+        record = candidate;
+        return true;
+      },
+    },
+    current: () => record,
+  };
+}
+
+function controlledRefresh(): {
+  aliyun: Pick<AliyunHttpClient, "refreshToken">;
+  started: Promise<void>;
+  calls(): number;
+  upstreamSignal(): AbortSignal | undefined;
+  succeed(result?: Awaited<ReturnType<AliyunHttpClient["refreshToken"]>>): void;
+  fail(error: unknown): void;
+} {
+  let resolveStarted: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => {
+    resolveStarted = resolve;
+  });
+  let resolveResult: (
+    result: Awaited<ReturnType<AliyunHttpClient["refreshToken"]>>,
+  ) => void = () => undefined;
+  let rejectResult: (error: unknown) => void = () => undefined;
+  const result = new Promise<
+    Awaited<ReturnType<AliyunHttpClient["refreshToken"]>>
+  >((resolve, reject) => {
+    resolveResult = resolve;
+    rejectResult = reject;
+  });
+  let callCount = 0;
+  let capturedSignal: AbortSignal | undefined;
+
+  return {
+    aliyun: {
+      async refreshToken(input) {
+        callCount += 1;
+        capturedSignal = input.signal;
+        const rejectForAbort = () => {
+          rejectResult(new PanSyncError("TOKEN_ENDPOINT_UNAVAILABLE"));
+        };
+        if (input.signal?.aborted === true) {
+          rejectForAbort();
+        } else {
+          input.signal?.addEventListener("abort", rejectForAbort, { once: true });
+        }
+        resolveStarted?.();
+        try {
+          return await result;
+        } finally {
+          input.signal?.removeEventListener("abort", rejectForAbort);
+        }
+      },
+    },
+    started,
+    calls: () => callCount,
+    upstreamSignal: () => capturedSignal,
+    succeed: (value = {
+      accessToken: "access-2",
+      refreshToken: "refresh-2",
+      expiresInSeconds: 7_200,
+    }) => resolveResult(value),
+    fail: rejectResult,
+  };
+}
+
+async function hangingTokenServer(): Promise<{
+  baseUrl: string;
+  requestReceived: Promise<void>;
+  upstreamSocketClosed: Promise<void>;
+  activeSockets(): number;
+  close(): Promise<void>;
+}> {
+  let resolveRequest: (() => void) | undefined;
+  const requestReceived = new Promise<void>((resolve) => {
+    resolveRequest = resolve;
+  });
+  let resolveSocketClosed: (() => void) | undefined;
+  const upstreamSocketClosed = new Promise<void>((resolve) => {
+    resolveSocketClosed = resolve;
+  });
+  const sockets = new Set<Socket>();
+  let requestWasReceived = false;
+  const server = createHttpServer((request) => {
+    request.resume();
+    request.once("end", () => {
+      requestWasReceived = true;
+      resolveRequest?.();
+    });
+  });
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.once("close", () => {
+      sockets.delete(socket);
+      if (requestWasReceived) {
+        resolveSocketClosed?.();
+      }
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("hanging token server did not bind a TCP port");
+  }
+
+  return {
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    requestReceived,
+    upstreamSocketClosed,
+    activeSockets: () => sockets.size,
+    async close() {
+      for (const socket of sockets) {
+        socket.destroy();
+      }
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => error ? reject(error) : resolve());
+      });
+    },
+  };
 }
 
 function successResponse(
@@ -326,6 +505,164 @@ describe("TokenManager", () => {
 
     await expect(manager.getValidAccessToken()).resolves.toBe("access-2");
     expect(server.requests).toHaveLength(1);
+  });
+
+  it("rejects an aborted signaled joiner promptly without cancelling an unsignaled leader", async () => {
+    const initial = expiredRecord();
+    const store = memoryVault(initial);
+    const refresh = controlledRefresh();
+    const manager = new TokenManager(store.vault, refresh.aliyun, () => NOW);
+    const leader = manager.getValidAccessToken();
+    await refresh.started;
+    const joinerController = new AbortController();
+    const removeListener = vi.spyOn(
+      joinerController.signal,
+      "removeEventListener",
+    );
+    const joiner = manager.getValidAccessToken({
+      signal: joinerController.signal,
+    });
+    await flushTurn();
+
+    joinerController.abort();
+    const joinerOutcome = await outcomeWithin(joiner);
+    refresh.succeed();
+
+    await expect(leader).resolves.toBe("access-2");
+    expect(joinerOutcome).toEqual({
+      status: "rejected",
+      reason: expect.objectContaining({ code: "TOKEN_ENDPOINT_UNAVAILABLE" }),
+    });
+    expect(removeListener).toHaveBeenCalledTimes(1);
+    expect(refresh.upstreamSignal()?.aborted).toBe(false);
+    expect(refresh.calls()).toBe(1);
+    expect(store.current()).toMatchObject({
+      credentialVersion: 2,
+      accessToken: "access-2",
+      refreshToken: "refresh-2",
+    });
+    await expect(manager.status()).resolves.toBe("ready");
+  });
+
+  it("rejects an aborted signaled leader promptly without cancelling an ordinary joiner", async () => {
+    const initial = expiredRecord();
+    const store = memoryVault(initial);
+    const refresh = controlledRefresh();
+    const manager = new TokenManager(store.vault, refresh.aliyun, () => NOW);
+    const leaderController = new AbortController();
+    const leader = manager.getValidAccessToken({
+      signal: leaderController.signal,
+    });
+    await refresh.started;
+    const joiner = manager.getValidAccessToken();
+    await flushTurn();
+
+    leaderController.abort();
+    const leaderOutcome = await outcomeWithin(leader);
+    const upstreamWasAborted = refresh.upstreamSignal()?.aborted;
+    refresh.succeed();
+    const joinerOutcome = await outcomeWithin(joiner);
+
+    expect(leaderOutcome).toEqual({
+      status: "rejected",
+      reason: expect.objectContaining({ code: "TOKEN_ENDPOINT_UNAVAILABLE" }),
+    });
+    expect(upstreamWasAborted).toBe(false);
+    expect(joinerOutcome).toEqual({
+      status: "fulfilled",
+      value: "access-2",
+    });
+    expect(refresh.calls()).toBe(1);
+    expect(store.current()).toMatchObject({
+      credentialVersion: 2,
+      accessToken: "access-2",
+      refreshToken: "refresh-2",
+    });
+    await expect(manager.status()).resolves.toBe("ready");
+  });
+
+  it("removes every caller abort listener after a shared refresh settles", async () => {
+    const store = memoryVault(expiredRecord());
+    const refresh = controlledRefresh();
+    const manager = new TokenManager(store.vault, refresh.aliyun, () => NOW);
+    const firstController = new AbortController();
+    const secondController = new AbortController();
+    const firstAdded = vi.spyOn(firstController.signal, "addEventListener");
+    const firstRemoved = vi.spyOn(firstController.signal, "removeEventListener");
+    const secondAdded = vi.spyOn(secondController.signal, "addEventListener");
+    const secondRemoved = vi.spyOn(secondController.signal, "removeEventListener");
+    const first = manager.getValidAccessToken({ signal: firstController.signal });
+    await refresh.started;
+    const second = manager.getValidAccessToken({ signal: secondController.signal });
+    await flushTurn();
+
+    refresh.succeed();
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      "access-2",
+      "access-2",
+    ]);
+
+    expect(firstAdded).toHaveBeenCalledTimes(1);
+    expect(firstRemoved).toHaveBeenCalledTimes(1);
+    expect(secondAdded).toHaveBeenCalledTimes(1);
+    expect(secondRemoved).toHaveBeenCalledTimes(1);
+  });
+
+  it("aborts the real upstream socket when its only subscriber cancels without changing Vault or status", async () => {
+    const { dataDir, store } = await tempStore();
+    const initial = expiredRecord();
+    await store.replace(initial);
+    const encryptedPath = path.join(dataDir, "credentials.enc");
+    const ciphertextBefore = await readFile(encryptedPath);
+    const server = await hangingTokenServer();
+    cleanups.push(server.close);
+    const manager = new TokenManager(
+      store,
+      new AliyunHttpClient({ baseUrl: server.baseUrl, clock: () => NOW }),
+      () => NOW,
+    );
+    const controller = new AbortController();
+    const caller = manager.getValidAccessToken({ signal: controller.signal });
+    await server.requestReceived;
+
+    controller.abort();
+    const [callerOutcome, socketOutcome] = await Promise.all([
+      outcomeWithin(caller),
+      outcomeWithin(server.upstreamSocketClosed),
+    ]);
+    await flushTurn();
+
+    expect(callerOutcome).toEqual({
+      status: "rejected",
+      reason: expect.objectContaining({ code: "TOKEN_ENDPOINT_UNAVAILABLE" }),
+    });
+    expect(socketOutcome).toEqual({ status: "fulfilled", value: undefined });
+    expect(server.activeSockets()).toBe(0);
+    expect(await readFile(encryptedPath)).toEqual(ciphertextBefore);
+    await expect(store.read()).resolves.toEqual(initial);
+    await expect(manager.status()).resolves.toBe("ready");
+  });
+
+  it("shares one genuine upstream failure across live subscribers and records degraded status", async () => {
+    const initial = expiredRecord();
+    const store = memoryVault(initial);
+    const refresh = controlledRefresh();
+    const manager = new TokenManager(store.vault, refresh.aliyun, () => NOW);
+    const first = manager.getValidAccessToken();
+    await refresh.started;
+    const second = manager.getValidAccessToken();
+    await flushTurn();
+    const failure = new PanSyncError("TOKEN_ENDPOINT_UNAVAILABLE");
+
+    refresh.fail(failure);
+    const outcomes = await Promise.allSettled([first, second]);
+
+    expect(outcomes).toHaveLength(2);
+    expect(outcomes[0]).toEqual({ status: "rejected", reason: failure });
+    expect(outcomes[1]).toEqual({ status: "rejected", reason: failure });
+    expect(refresh.calls()).toBe(1);
+    expect(store.current()).toBe(initial);
+    await expect(manager.status()).resolves.toBe("degraded");
   });
 
   it("propagates caller cancellation into token refresh without mutating the Vault", async () => {

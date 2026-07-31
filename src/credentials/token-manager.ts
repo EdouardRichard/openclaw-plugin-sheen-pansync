@@ -25,8 +25,28 @@ type FailureState = {
   status: "degraded" | "reauth_required";
 };
 
+type RefreshSubscriber = {
+  signal: AbortSignal | undefined;
+  onAbort: (() => void) | undefined;
+  resolve(token: string): void;
+  reject(error: unknown): void;
+};
+
+type RefreshOperation = {
+  controller: AbortController;
+  subscribers: Set<RefreshSubscriber>;
+};
+
+type RefreshOutcome =
+  | { status: "fulfilled"; value: string }
+  | { status: "rejected"; reason: unknown };
+
+function cancellationError(): PanSyncError {
+  return new PanSyncError("TOKEN_ENDPOINT_UNAVAILABLE");
+}
+
 export class TokenManager {
-  #refreshInFlight: Promise<string> | undefined;
+  #refreshInFlight: RefreshOperation | undefined;
   #failureState: FailureState | undefined;
 
   constructor(
@@ -102,18 +122,88 @@ export class TokenManager {
     record: CredentialRecord,
     options: ProviderOperationOptions,
   ): Promise<string> {
-    if (this.#refreshInFlight !== undefined) {
-      return this.#refreshInFlight;
+    if (options.signal?.aborted === true) {
+      return Promise.reject(cancellationError());
     }
 
-    const refresh = this.#refresh(record, options);
-    const tracked = refresh.finally(() => {
-      if (this.#refreshInFlight === tracked) {
-        this.#refreshInFlight = undefined;
+    let operation = this.#refreshInFlight;
+    if (operation === undefined) {
+      const created: RefreshOperation = {
+        controller: new AbortController(),
+        subscribers: new Set(),
+      };
+      operation = created;
+      this.#refreshInFlight = created;
+      void this.#refresh(record, { signal: created.controller.signal }).then(
+        (value) => this.#settleRefresh(created, {
+          status: "fulfilled",
+          value,
+        }),
+        (reason: unknown) => this.#settleRefresh(created, {
+          status: "rejected",
+          reason,
+        }),
+      );
+    }
+
+    return this.#subscribe(operation, options.signal);
+  }
+
+  #subscribe(
+    operation: RefreshOperation,
+    signal: AbortSignal | undefined,
+  ): Promise<string> {
+    return new Promise<string>((resolve, reject) => {
+      const subscriber: RefreshSubscriber = {
+        signal,
+        onAbort: undefined,
+        resolve,
+        reject,
+      };
+      const onAbort = (): void => {
+        if (!operation.subscribers.delete(subscriber)) {
+          return;
+        }
+        signal?.removeEventListener("abort", onAbort);
+        subscriber.onAbort = undefined;
+        reject(cancellationError());
+        if (
+          operation.subscribers.size === 0
+          && this.#refreshInFlight === operation
+        ) {
+          this.#refreshInFlight = undefined;
+          operation.controller.abort();
+        }
+      };
+      subscriber.onAbort = onAbort;
+      operation.subscribers.add(subscriber);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted === true) {
+        onAbort();
       }
     });
-    this.#refreshInFlight = tracked;
-    return tracked;
+  }
+
+  #settleRefresh(
+    operation: RefreshOperation,
+    outcome: RefreshOutcome,
+  ): void {
+    if (this.#refreshInFlight === operation) {
+      this.#refreshInFlight = undefined;
+    }
+    const subscribers = [...operation.subscribers];
+    operation.subscribers.clear();
+    for (const subscriber of subscribers) {
+      if (subscriber.onAbort !== undefined) {
+        subscriber.signal?.removeEventListener("abort", subscriber.onAbort);
+        subscriber.onAbort = undefined;
+      }
+      if (outcome.status === "fulfilled") {
+        subscriber.resolve(outcome.value);
+      } else {
+        subscriber.reject(outcome.reason);
+      }
+    }
   }
 
   async #refresh(
@@ -137,6 +227,9 @@ export class TokenManager {
         ...(options.signal === undefined ? {} : { signal: options.signal }),
       });
     } catch (error) {
+      if (options.signal?.aborted === true) {
+        throw error instanceof PanSyncError ? error : cancellationError();
+      }
       if (
         error instanceof PanSyncError
         && error.code === "REFRESH_TOKEN_REJECTED"
