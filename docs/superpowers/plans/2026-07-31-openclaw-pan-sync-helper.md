@@ -1430,7 +1430,7 @@ git add package.json package-lock.json scripts/copy-assets.mjs tests/integration
 git commit -m "test: add package and secret leakage gates"
 ```
 
-## Task 13: Repair CLI metadata loading, then perform OpenClaw acceptance
+## Task 13: Repair CLI metadata loading
 
 **Files:**
 
@@ -1442,8 +1442,6 @@ git commit -m "test: add package and secret leakage gates"
 - Modify: `package.json`
 - Modify: `tests/integration/admin-cli.test.ts`
 - Modify: `tests/integration/package.test.ts`
-- Modify: `README.md`
-- Create: `docs/verification/2026-07-31-v0.1.0.md`
 
 **Interfaces:**
 
@@ -1555,14 +1553,21 @@ git add cli-metadata.js src/runtime-composition.ts src/cli-entry.ts src/index.ts
 git commit -m "fix: support openclaw cli metadata loading"
 ```
 
-- [ ] **Step 7: Install the repaired packed plugin into an isolated OpenClaw test state**
+## Task 14: Perform OpenClaw smoke testing and real-account acceptance
+
+**Files:**
+
+- Modify: `README.md`
+- Create: `docs/verification/2026-07-31-v0.1.0.md`
+
+- [ ] **Step 1: Install the repaired packed plugin into an isolated OpenClaw test state**
 
 Create a new exact tarball from the reviewed repair commit and a fresh temporary OpenClaw
 state directory. Do not reuse the pre-fix Task 12 artifact as acceptance evidence. Record the
 artifact SHA-256, OpenClaw version, and Node version in the verification note; do not record
 tokens, URL fragments, dynamic ports, paths outside the temporary state, or raw logs.
 
-- [ ] **Step 8: Verify plugin discovery without credentials**
+- [ ] **Step 2: Verify plugin discovery without credentials**
 
 Confirm:
 
@@ -1572,7 +1577,7 @@ Confirm:
 - Control UI shows the status tab only to an `operator.write` session;
 - Tool returns `CREDENTIALS_REQUIRED` with safe setup guidance.
 
-- [ ] **Step 9: Verify the official loopback configuration flow**
+- [ ] **Step 3: Verify the official loopback configuration flow**
 
 Run the official installed `openclaw pan-sync configure`. If a remote Linux host is
 available, establish the printed SSH tunnel; otherwise record the remote-tunnel criterion as
@@ -1586,7 +1591,7 @@ Verify:
 - server closes after save/clear completion or ten-minute timeout;
 - file modes are `0700/0600/0600`.
 
-- [ ] **Step 10: Run the dedicated real-account matrix**
+- [ ] **Step 4: Run the dedicated real-account matrix**
 
 With a dedicated Aliyun test application and account:
 
@@ -1601,7 +1606,7 @@ With a dedicated Aliyun test application and account:
 9. Confirm Chinese and English trigger phrases.
 10. Inspect sanitized logs and conversation output for credential/path leakage.
 
-- [ ] **Step 11: Record evidence with separate gate statuses**
+- [ ] **Step 5: Record evidence with separate gate statuses**
 
 The verification note must contain:
 
@@ -1615,7 +1620,7 @@ Release decision: READY/BLOCKED
 
 If the real-account gate is not run, use `NOT RUN` and keep the release decision `BLOCKED`.
 
-- [ ] **Step 12: Run final diff and repository checks**
+- [ ] **Step 6: Run final diff and repository checks**
 
 Run:
 
@@ -1627,7 +1632,7 @@ npm run verify
 
 Expected: no unexpected files, no whitespace errors, all automated checks pass.
 
-- [ ] **Step 13: Commit the verified documentation**
+- [ ] **Step 7: Commit the verified documentation**
 
 ```bash
 git add README.md docs/verification/2026-07-31-v0.1.0.md
