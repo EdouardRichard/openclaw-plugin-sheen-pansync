@@ -7,6 +7,7 @@ import {
   rename,
   rm,
   symlink,
+  unlink,
   writeFile,
   type FileHandle,
 } from "node:fs/promises";
@@ -280,6 +281,85 @@ describe("resolveWorkspaceFile", () => {
     expect(rejected).toBeInstanceOf(Error);
     expect(rejected).toMatchObject({ code: "WORKSPACE_PATH_REJECTED" });
     expect(openedDuringRace).toBeDefined();
+    await expect(openedDuringRace?.stat()).rejects.toMatchObject({
+      code: "EBADF",
+    });
+  });
+
+  it("rejects a redirect between the post-open realpath and identity stat", async () => {
+    const nestedDirectory = path.join(workspace, "nested");
+    const movedDirectory = path.join(workspace, "nested-original");
+    const outsideDirectory = path.join(fixtureRoot, "outside-interval");
+    const candidate = path.join(nestedDirectory, "notes.txt");
+    await mkdir(outsideDirectory);
+    await writeFile(
+      path.join(outsideDirectory, "notes.txt"),
+      "outside interval contents",
+    );
+    let openedDuringRace: FileHandle | undefined;
+    let redirectedForIdentityStat = false;
+
+    vi.resetModules();
+    vi.doMock("node:fs/promises", async () => {
+      const actual =
+        await vi.importActual<typeof import("node:fs/promises")>(
+          "node:fs/promises",
+        );
+      const linkType = process.platform === "win32" ? "junction" : "dir";
+      return {
+        ...actual,
+        async open(target: string, flags: number) {
+          if (path.resolve(target) !== path.resolve(candidate)) {
+            return actual.open(target, flags);
+          }
+
+          await rename(nestedDirectory, movedDirectory);
+          await symlink(outsideDirectory, nestedDirectory, linkType);
+          const handle = await actual.open(target, flags);
+          openedDuringRace = handle;
+          await unlink(nestedDirectory);
+          await rename(movedDirectory, nestedDirectory);
+          return handle;
+        },
+        async stat(
+          target: string,
+          options?: Parameters<typeof actual.stat>[1],
+        ) {
+          if (
+            path.resolve(target) === path.resolve(candidate) &&
+            !redirectedForIdentityStat
+          ) {
+            redirectedForIdentityStat = true;
+            await rename(nestedDirectory, movedDirectory);
+            await symlink(outsideDirectory, nestedDirectory, linkType);
+          }
+          return actual.stat(target, options as never);
+        },
+      };
+    });
+
+    let resolved:
+      | Awaited<ReturnType<typeof resolveWorkspaceFile>>
+      | undefined;
+    let rejected: unknown;
+    try {
+      const racedPathGuard = await import("../../src/workspace/path-guard.js");
+      resolved = await racedPathGuard.resolveWorkspaceFile(
+        workspace,
+        path.join("nested", "notes.txt"),
+      );
+    } catch (error) {
+      rejected = error;
+    } finally {
+      await resolved?.handle.close();
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
+    }
+
+    expect(openedDuringRace).toBeDefined();
+    expect(redirectedForIdentityStat).toBe(true);
+    expect(rejected).toBeInstanceOf(Error);
+    expect(rejected).toMatchObject({ code: "WORKSPACE_PATH_REJECTED" });
     await expect(openedDuringRace?.stat()).rejects.toMatchObject({
       code: "EBADF",
     });

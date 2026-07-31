@@ -123,9 +123,10 @@ export async function resolveWorkspaceFile(
       throw new PanSyncError("WORKSPACE_PATH_REJECTED");
     }
 
-    // Node has no portable openat-style API or cross-platform descriptor path.
-    // Rechecking containment and (dev, ino) proves that this handle matched a
-    // contained name at verification time; callers must keep using the handle.
+    // These repeated checks detect common replacement races on a best-effort
+    // basis. True atomic pathname/descriptor binding needs platform-specific
+    // openat/handle APIs unavailable through portable Node fs; callers must
+    // keep using the returned handle.
     let verifiedCanonicalPath: string;
     try {
       verifiedCanonicalPath = await realpath(candidate);
@@ -139,6 +140,14 @@ export async function resolveWorkspaceFile(
       if (
         openedMetadata.dev !== verifiedPathMetadata.dev ||
         openedMetadata.ino !== verifiedPathMetadata.ino
+      ) {
+        throw new PanSyncError("WORKSPACE_PATH_REJECTED");
+      }
+
+      const stableCanonicalPath = await realpath(candidate);
+      if (
+        stableCanonicalPath !== verifiedCanonicalPath ||
+        !isContained(workspace.canonical, stableCanonicalPath)
       ) {
         throw new PanSyncError("WORKSPACE_PATH_REJECTED");
       }
