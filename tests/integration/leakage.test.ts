@@ -28,6 +28,15 @@ const REFRESH_TOKEN = "refresh-token-CANARY-19d4";
 const ACCESS_TOKEN = "access-token-CANARY-62a1";
 const ABSOLUTE_PATH = "/srv/private/openclaw/workspace/report.pdf";
 const NOW = Date.parse("2026-08-01T00:00:00.000Z");
+const MAP_FOR_EACH_INTRINSIC = Map.prototype.forEach;
+const SET_FOR_EACH_INTRINSIC = Set.prototype.forEach;
+const PROTECTED_ASSERTION_FAILURE = Object.freeze(
+  new Error("protected value detected"),
+);
+const UNEXPECTED_LOGGER_CALL_FAILURE = Object.freeze(
+  new Error("unexpected production logger calls"),
+);
+type RejectionKind = "none" | "protected" | "unexpected" | "unsafe";
 
 const cleanups: Array<() => Promise<void>> = [];
 const runningServers: SetupServer[] = [];
@@ -234,21 +243,8 @@ function containsProtectedValue(values: readonly unknown[]): boolean {
       }
     }
     if (isMap) {
-      let descriptor: PropertyDescriptor | undefined;
       try {
-        descriptor = Object.getOwnPropertyDescriptor(Map.prototype, "forEach");
-      } catch {
-        return true;
-      }
-      if (
-        descriptor === undefined
-        || !("value" in descriptor)
-        || typeof descriptor.value !== "function"
-      ) {
-        return true;
-      }
-      try {
-        Reflect.apply(descriptor.value, value, [
+        Reflect.apply(MAP_FOR_EACH_INTRINSIC, value, [
           (entry: unknown, key: unknown) => pending.push(key, entry),
         ]);
       } catch {
@@ -256,21 +252,8 @@ function containsProtectedValue(values: readonly unknown[]): boolean {
       }
     }
     if (isSet) {
-      let descriptor: PropertyDescriptor | undefined;
       try {
-        descriptor = Object.getOwnPropertyDescriptor(Set.prototype, "forEach");
-      } catch {
-        return true;
-      }
-      if (
-        descriptor === undefined
-        || !("value" in descriptor)
-        || typeof descriptor.value !== "function"
-      ) {
-        return true;
-      }
-      try {
-        Reflect.apply(descriptor.value, value, [
+        Reflect.apply(SET_FOR_EACH_INTRINSIC, value, [
           (entry: unknown) => pending.push(entry),
         ]);
       } catch {
@@ -293,54 +276,33 @@ function containsProtectedValue(values: readonly unknown[]): boolean {
   return false;
 }
 
-function assertNoProtectedArguments(
-  label: string,
-  values: readonly unknown[],
-): void {
+function assertNoProtectedArguments(values: readonly unknown[]): void {
   if (containsProtectedValue(values)) {
-    throw new Error(`${label} exposed a protected value`);
+    throw PROTECTED_ASSERTION_FAILURE;
   }
 }
 
 function assertNoProductionLoggerCalls(calls: readonly unknown[][]): void {
-  assertNoProtectedArguments("actual OpenClaw logger calls", calls);
+  assertNoProtectedArguments(calls);
   if (calls.length !== 0) {
-    throw new Error("production plugin emitted unexpected logger calls");
+    throw UNEXPECTED_LOGGER_CALL_FAILURE;
   }
 }
 
-function rejectionMessage(run: () => void): string | undefined {
+function rejectionKind(run: () => void): RejectionKind {
   try {
     run();
-    return undefined;
+    return "none";
   } catch (error) {
-    if (
-      (typeof error !== "object" || error === null)
-      && typeof error !== "function"
-    ) {
-      return "non-Error rejection";
-    }
-    let descriptor: PropertyDescriptor | undefined;
-    try {
-      descriptor = Object.getOwnPropertyDescriptor(error, "message");
-    } catch {
-      return "unsafe rejection";
-    }
-    return descriptor !== undefined
-      && "value" in descriptor
-      && typeof descriptor.value === "string"
-      ? descriptor.value
-      : "unsafe rejection";
+    if (error === PROTECTED_ASSERTION_FAILURE) return "protected";
+    if (error === UNEXPECTED_LOGGER_CALL_FAILURE) return "unexpected";
+    return "unsafe";
   }
 }
 
-function assertRejectedWithoutDumping(
-  label: string,
-  value: unknown,
-): void {
-  const expected = `${label} exposed a protected value`;
-  if (rejectionMessage(() => assertNoProtectedArguments(label, [value])) !== expected) {
-    throw new Error(`${label} was not rejected safely`);
+function assertRejectedWithoutDumping(value: unknown): void {
+  if (rejectionKind(() => assertNoProtectedArguments([value])) !== "protected") {
+    throw new Error("protected value was not rejected safely");
   }
 }
 
@@ -444,17 +406,15 @@ describe("release leakage canaries", () => {
       return value;
     }],
   ] as const)("inspects protected values in %s", (_name, createValue) => {
-    expect(() =>
-      assertNoProtectedArguments("host logger arguments", [createValue()])
-    ).toThrow("host logger arguments exposed a protected value");
+    assertRejectedWithoutDumping(createValue());
   });
 
   it("handles clean cyclic logger arguments", () => {
     const value: Record<string, unknown> = { nested: ["safe"] };
     value.self = value;
-    expect(() =>
-      assertNoProtectedArguments("host logger arguments", [value])
-    ).not.toThrow();
+    if (rejectionKind(() => assertNoProtectedArguments([value])) !== "none") {
+      throw new Error("clean cyclic logger arguments were rejected");
+    }
   });
 
   it("fails closed on an enumerable accessor without invoking its getter", () => {
@@ -468,7 +428,7 @@ describe("release leakage canaries", () => {
       },
     });
 
-    assertRejectedWithoutDumping("accessor logger argument", value);
+    assertRejectedWithoutDumping(value);
     expect(getterCalls).toBe(0);
   });
 
@@ -485,7 +445,7 @@ describe("release leakage canaries", () => {
     });
     Object.setPrototypeOf(error, prototype);
 
-    assertRejectedWithoutDumping("custom Error logger argument", error);
+    assertRejectedWithoutDumping(error);
     expect(getterCalls).toBe(0);
   });
 
@@ -497,23 +457,64 @@ describe("release leakage canaries", () => {
       Object.defineProperty(value, "payload", { value: ACCESS_TOKEN });
       return value;
     }],
-  ] as const)("inspects %s logger arguments", (name, createValue) => {
-    assertRejectedWithoutDumping(`${name} logger argument`, createValue());
+  ] as const)("inspects %s logger arguments", (_name, createValue) => {
+    assertRejectedWithoutDumping(createValue());
   });
+
+  it.each([
+    ["Map", Map.prototype, () => new Map([["payload", REFRESH_TOKEN]])],
+    ["Set", Set.prototype, () => new Set([ABSOLUTE_PATH])],
+  ] as const)(
+    "uses the captured %s traversal intrinsic after prototype mutation",
+    (name, prototype, createValue) => {
+      const originalDescriptor = Object.getOwnPropertyDescriptor(
+        prototype,
+        "forEach",
+      );
+      if (originalDescriptor === undefined) {
+        throw new Error(`${name} traversal intrinsic was unavailable`);
+      }
+      const value = createValue();
+      let hostileCalls = 0;
+      let protectedValueWasRejected = false;
+      try {
+        Object.defineProperty(prototype, "forEach", {
+          ...originalDescriptor,
+          value() {
+            hostileCalls += 1;
+          },
+        });
+        try {
+          assertRejectedWithoutDumping(value);
+          protectedValueWasRejected = true;
+        } catch {
+          // Do not inspect or expose the captured failure.
+        }
+      } finally {
+        Object.defineProperty(prototype, "forEach", originalDescriptor);
+      }
+      if (!protectedValueWasRejected) {
+        throw new Error(`${name} traversal did not use its captured intrinsic`);
+      }
+      if (hostileCalls !== 0) {
+        throw new Error(`${name} traversal invoked its mutable prototype method`);
+      }
+    },
+  );
 
   it("scans production logger calls before enforcing zero cardinality", () => {
     const calls = [[{ payload: CLIENT_SECRET }]];
-    const message = rejectionMessage(() => assertNoProductionLoggerCalls(calls));
-    if (message !== "actual OpenClaw logger calls exposed a protected value") {
+    const kind = rejectionKind(() => assertNoProductionLoggerCalls(calls));
+    if (kind !== "protected") {
       throw new Error("production logger failure order was not safe");
     }
   });
 
   it("uses a fixed failure for clean unexpected production logger calls", () => {
-    const message = rejectionMessage(() =>
+    const kind = rejectionKind(() =>
       assertNoProductionLoggerCalls([[{ event: "safe event" }]])
     );
-    if (message !== "production plugin emitted unexpected logger calls") {
+    if (kind !== "unexpected") {
       throw new Error("production logger cardinality failure was not fixed");
     }
   });
@@ -527,7 +528,7 @@ describe("release leakage canaries", () => {
       },
     });
 
-    assertRejectedWithoutDumping("ownKeys logger argument", value);
+    assertRejectedWithoutDumping(value);
     expect(trapCalls).toBe(1);
   });
 
@@ -543,14 +544,14 @@ describe("release leakage canaries", () => {
     error.stack = "safe stack";
     Object.setPrototypeOf(error, hostilePrototype);
 
-    assertRejectedWithoutDumping("Error prototype logger argument", error);
+    assertRejectedWithoutDumping(error);
     expect(trapCalls).toBe(1);
   });
 
   it.each([
     ["Map", () => new Map()],
     ["Set", () => new Set()],
-  ] as const)("avoids %s instanceof prototype traps", (name, createTarget) => {
+  ] as const)("avoids %s instanceof prototype traps", (_name, createTarget) => {
     let trapCalls = 0;
     const value = new Proxy(createTarget(), {
       getPrototypeOf() {
@@ -559,7 +560,7 @@ describe("release leakage canaries", () => {
       },
     });
 
-    assertRejectedWithoutDumping(`${name} proxy logger argument`, value);
+    assertRejectedWithoutDumping(value);
     expect(trapCalls).toBe(0);
   });
 
@@ -573,7 +574,7 @@ describe("release leakage canaries", () => {
       },
     });
 
-    assertRejectedWithoutDumping("descriptor logger argument", value);
+    assertRejectedWithoutDumping(value);
     expect(trapCalls).toBe(1);
   });
 
@@ -591,11 +592,11 @@ describe("release leakage canaries", () => {
     error.stack = "safe stack";
     Object.setPrototypeOf(error, cyclicPrototype);
 
-    assertRejectedWithoutDumping("cyclic Error prototype logger argument", error);
+    assertRejectedWithoutDumping(error);
     expect(trapCalls).toBeLessThanOrEqual(2);
   });
 
-  it("captures hostile thrown values without instanceof or direct message reads", () => {
+  it("classifies hostile thrown values without reflection", () => {
     let prototypeTrapCalls = 0;
     let descriptorTrapCalls = 0;
     const hostile = new Proxy({}, {
@@ -608,19 +609,38 @@ describe("release leakage canaries", () => {
         throw new Error(REFRESH_TOKEN);
       },
     });
-    let observed: string | undefined;
+    let observed: RejectionKind;
     try {
-      observed = rejectionMessage(() => {
+      observed = rejectionKind(() => {
         throw hostile;
       });
     } catch {
       throw new Error("failure capture propagated a hostile value");
     }
-    if (observed !== "unsafe rejection") {
+    if (observed !== "unsafe") {
       throw new Error("failure capture did not return its fixed label");
     }
     expect(prototypeTrapCalls).toBe(0);
-    expect(descriptorTrapCalls).toBe(1);
+    expect(descriptorTrapCalls).toBe(0);
+  });
+
+  it("does not return an attacker-controlled own message data value", () => {
+    const hostile = {};
+    Object.defineProperty(hostile, "message", {
+      value: CLIENT_SECRET,
+      enumerable: true,
+    });
+    let observed: RejectionKind;
+    try {
+      observed = rejectionKind(() => {
+        throw hostile;
+      });
+    } catch {
+      throw new Error("failure capture propagated a hostile message value");
+    }
+    if (observed !== "unsafe") {
+      throw new Error("failure capture returned hostile message data");
+    }
   });
 
   it("keeps credentials, access tokens, and workspace paths out of failure surfaces", async () => {
@@ -666,8 +686,16 @@ describe("release leakage canaries", () => {
       }),
     });
     const invalidOutput = await invalidResponse.text();
+    assertNoProtectedArguments([invalidOutput]);
+    let invalidPayload: unknown;
+    try {
+      invalidPayload = JSON.parse(invalidOutput);
+    } catch {
+      throw new Error("invalid credentials response was not JSON");
+    }
+    assertNoProtectedArguments([invalidPayload]);
     expect(invalidResponse.status).toBe(400);
-    expect(JSON.parse(invalidOutput)).toEqual({ code: "CREDENTIALS_INVALID" });
+    expect(invalidPayload).toEqual({ code: "CREDENTIALS_INVALID" });
 
     const configResponse = await setupRequest(setup, "/api/config");
     const configOutput = await configResponse.text();
@@ -692,6 +720,7 @@ describe("release leakage canaries", () => {
       refreshRuntime.orchestrator,
       workspace,
     ).execute("refresh-failure", { paths: ["report.txt"] });
+    assertNoProtectedArguments([refreshResult]);
     expect(refreshResult.details).toEqual({ code: "REFRESH_TOKEN_REJECTED" });
 
     const uploadServer = await startFakeAliyunServer([
@@ -712,6 +741,7 @@ describe("release leakage canaries", () => {
     ).execute("upload-failure", {
       paths: [ABSOLUTE_PATH, "report.txt"],
     });
+    assertNoProtectedArguments([uploadResult]);
     expect(uploadResult.details).toEqual({
       provider: "aliyun",
       remoteDirectory: "/",
@@ -735,6 +765,7 @@ describe("release leakage canaries", () => {
       tokenManager: { statusForSnapshot: () => "degraded" },
       config: { defaultDirectory: "/openClawShare" },
     }));
+    assertNoProtectedArguments([statusOutput]);
     const loggerCalls: unknown[][] = [];
     const logger = {
       debug: (...values: unknown[]) => loggerCalls.push(values),
@@ -749,13 +780,6 @@ describe("release leakage canaries", () => {
     );
     assertNoProductionLoggerCalls(loggerCalls);
 
-    assertNoProtectedArguments("invalid credentials response", [invalidOutput]);
-    assertNoProtectedArguments("refresh failure Tool result", [refreshResult]);
-    assertNoProtectedArguments("path and upload Tool result", [uploadResult]);
-    assertNoProtectedArguments("status HTML", [statusOutput]);
-    assertNoProtectedArguments(
-      "simulated host logging of projected Tool results",
-      [refreshResult, uploadResult],
-    );
+    assertNoProtectedArguments([refreshResult, uploadResult]);
   });
 });
