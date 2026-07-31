@@ -473,8 +473,19 @@ describe("OpenClaw plugin entry", () => {
     cleanups.push(state.cleanup);
     const dataDir = path.join(state.dataDir, "pan-sync-helper");
     let capturedSetupDependencies: import("../../src/admin/setup-server.js").SetupServerDependencies | undefined;
+    let capturedLeaseDatabasePath: string | undefined;
     const writes: string[] = [];
     const entry = createPanSyncPluginEntry({
+      credentialLeaseFactory(databasePath) {
+        capturedLeaseDatabasePath = databasePath;
+        return async (_key, run) => {
+          await mkdir(path.dirname(databasePath), {
+            recursive: true,
+            mode: 0o700,
+          });
+          return run({ assertOwned: async () => undefined });
+        };
+      },
       configureCliOptions: {
         async startServer(dependencies) {
           capturedSetupDependencies = dependencies;
@@ -511,6 +522,9 @@ describe("OpenClaw plugin entry", () => {
 
     expect((await stat(dataDir)).isDirectory()).toBe(true);
     expect((await stat(path.join(dataDir, "locks"))).isDirectory()).toBe(true);
+    expect(capturedLeaseDatabasePath).toBe(
+      path.join(dataDir, "locks", "lease.sqlite"),
+    );
     if (process.platform !== "win32") {
       expect(await octalMode(dataDir)).toBe("700");
       expect(await octalMode(path.join(dataDir, "locks"))).toBe("700");
@@ -608,9 +622,19 @@ describe("OpenClaw plugin entry", () => {
       ]);
       expect(pack.error).toBeUndefined();
       expect(pack.status, `${pack.stdout}\n${pack.stderr}`).toBe(0);
-      const packed = JSON.parse(pack.stdout) as Array<{ filename?: string }>;
+      const packed = JSON.parse(pack.stdout) as Array<{
+        filename?: string;
+        files?: Array<{ path?: string }>;
+      }>;
       const filename = packed[0]?.filename;
       if (filename === undefined) throw new Error("package artifact missing");
+      const packedPaths = packed[0]?.files?.map(({ path }) => path) ?? [];
+      expect(packedPaths).toContain(
+        "dist/credentials/sqlite-worker-lease.js",
+      );
+      expect(packedPaths).not.toContain(
+        "dist/credentials/filesystem-lease.js",
+      );
       const packageArtifact = path.join(root, filename);
 
       const runOpenClaw = (args: string[]) => {

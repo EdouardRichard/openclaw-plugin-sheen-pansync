@@ -12,8 +12,11 @@ import {
 } from "./admin/cli.js";
 import { createPanSyncStatusRoute } from "./admin/status-route.js";
 import { resolvePluginConfig } from "./config.js";
-import { createFilesystemCredentialLeaseRunner } from "./credentials/filesystem-lease.js";
-import { CredentialStore } from "./credentials/store.js";
+import { createSqliteWorkerCredentialLeaseRunner } from "./credentials/sqlite-worker-lease.js";
+import {
+  type CredentialLeaseRunner,
+  CredentialStore,
+} from "./credentials/store.js";
 import { TokenManager } from "./credentials/token-manager.js";
 import { ProviderRegistry } from "./provider-registry.js";
 import { AliyunHttpClient } from "./providers/aliyun/http.js";
@@ -63,6 +66,7 @@ const configSchema: OpenClawPluginConfigSchema = {
 
 export type PanSyncPluginEntryOptions = {
   configureCliOptions?: ConfigureCliOptions;
+  credentialLeaseFactory?: (databasePath: string) => CredentialLeaseRunner;
 };
 
 export function createPanSyncPluginEntry(
@@ -79,9 +83,15 @@ export function createPanSyncPluginEntry(
         api.runtime.state.resolveStateDir(),
         PLUGIN_ID,
       );
-      const lease = createFilesystemCredentialLeaseRunner(
-        path.join(dataDir, "locks"),
+      const leaseDatabasePath = path.join(
+        dataDir,
+        "locks",
+        "lease.sqlite",
       );
+      const lease = (
+        options.credentialLeaseFactory
+        ?? createSqliteWorkerCredentialLeaseRunner
+      )(leaseDatabasePath);
       const store = new CredentialStore(dataDir, lease);
       const httpClient = new AliyunHttpClient();
       const tokenManager = new TokenManager(store, httpClient);

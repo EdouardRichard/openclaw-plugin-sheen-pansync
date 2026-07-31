@@ -66,6 +66,45 @@ async function tempDataDir(): Promise<string> {
   return state.dataDir;
 }
 
+function v2TransactionPaths(dataDir: string, transactionId: string) {
+  return {
+    markerPath: path.join(dataDir, `.credentials.${transactionId}.txn`),
+    backupPath: path.join(
+      dataDir,
+      `.credentials.enc.${transactionId}.bak`,
+    ),
+  };
+}
+
+async function writeV2Marker(
+  dataDir: string,
+  transactionId: string,
+  hadCanonical: boolean,
+): Promise<{ markerPath: string; backupPath: string }> {
+  const paths = v2TransactionPaths(dataDir, transactionId);
+  await writeFile(
+    paths.markerPath,
+    `${JSON.stringify({
+      formatVersion: 2,
+      transactionId,
+      hadCanonical,
+      backupName: path.basename(paths.backupPath),
+    })}\n`,
+    { flag: "wx", mode: 0o600 },
+  );
+  return paths;
+}
+
+async function snapshotDataDirectory(
+  dataDir: string,
+): Promise<Record<string, string>> {
+  const snapshot: Record<string, string> = {};
+  for (const name of (await readdir(dataDir)).sort()) {
+    snapshot[name] = (await readFile(path.join(dataDir, name))).toString("base64");
+  }
+  return snapshot;
+}
+
 async function rejectedError(run: () => Promise<unknown>): Promise<Error> {
   let rejected: unknown;
   try {
@@ -601,6 +640,215 @@ describe("CredentialStore", () => {
     ).resolves.toEqual(previousCiphertext);
     const freshStore = new CredentialStore(dataDir, immediateLease);
     await expect(freshStore.read()).resolves.toEqual(initial);
+  });
+
+  it.each([
+    ["restart read", "credential store read failed"],
+    ["write recovery", "credential store write failed"],
+    ["clear recovery", "credential store clear failed"],
+  ] as const)(
+    "fails closed before %s when v2 claims a canonical backup that is missing",
+    async (operation, expectedError) => {
+      const dataDir = await tempDataDir();
+      const seed = new CredentialStore(dataDir, immediateLease);
+      await seed.replace(record(1));
+      const transactionId = "1".repeat(32);
+      await writeV2Marker(dataDir, transactionId, true);
+      const before = await snapshotDataDirectory(dataDir);
+      const fresh = new CredentialStore(dataDir, immediateLease);
+      const action = operation === "restart read"
+        ? () => fresh.read()
+        : operation === "write recovery"
+        ? () => fresh.replace(record(2))
+        : () => fresh.clear();
+
+      await expect(action()).rejects.toThrow(expectedError);
+
+      await expect(snapshotDataDirectory(dataDir)).resolves.toEqual(before);
+    },
+  );
+
+  it.each([
+    ["restart read", "credential store read failed"],
+    ["write recovery", "credential store write failed"],
+    ["clear recovery", "credential store clear failed"],
+  ] as const)(
+    "fails closed before %s when v2 denies a canonical but its claimed backup exists",
+    async (operation, expectedError) => {
+      const dataDir = await tempDataDir();
+      const credentialsPath = path.join(dataDir, "credentials.enc");
+      const seed = new CredentialStore(dataDir, immediateLease);
+      await seed.replace(record(1));
+      const transactionId = "2".repeat(32);
+      const transaction = await writeV2Marker(dataDir, transactionId, false);
+      await writeFile(transaction.backupPath, await readFile(credentialsPath), {
+        flag: "wx",
+        mode: 0o600,
+      });
+      const before = await snapshotDataDirectory(dataDir);
+      const fresh = new CredentialStore(dataDir, immediateLease);
+      const action = operation === "restart read"
+        ? () => fresh.read()
+        : operation === "write recovery"
+        ? () => fresh.replace(record(2))
+        : () => fresh.clear();
+
+      await expect(action()).rejects.toThrow(expectedError);
+
+      await expect(snapshotDataDirectory(dataDir)).resolves.toEqual(before);
+    },
+  );
+
+  it.each([
+    {
+      name: "a mismatched backup",
+      hadCanonical: true,
+      backupIds: ["4".repeat(32)],
+    },
+    {
+      name: "an exact plus an additional backup",
+      hadCanonical: true,
+      backupIds: ["3".repeat(32), "4".repeat(32)],
+    },
+    {
+      name: "an unexpected mismatched backup for an absent canonical",
+      hadCanonical: false,
+      backupIds: ["4".repeat(32)],
+    },
+  ])("preserves all artifacts when v2 has $name", async ({
+    hadCanonical,
+    backupIds,
+  }) => {
+    const dataDir = await tempDataDir();
+    const credentialsPath = path.join(dataDir, "credentials.enc");
+    const seed = new CredentialStore(dataDir, immediateLease);
+    await seed.replace(record(1));
+    const transactionId = "3".repeat(32);
+    await writeV2Marker(dataDir, transactionId, hadCanonical);
+    const ciphertext = await readFile(credentialsPath);
+    for (const backupId of backupIds) {
+      await writeFile(
+        v2TransactionPaths(dataDir, backupId).backupPath,
+        ciphertext,
+        { flag: "wx", mode: 0o600 },
+      );
+    }
+    const before = await snapshotDataDirectory(dataDir);
+
+    await expect(
+      new CredentialStore(dataDir, immediateLease).read(),
+    ).rejects.toThrow("credential store read failed");
+
+    await expect(snapshotDataDirectory(dataDir)).resolves.toEqual(before);
+  });
+
+  it("lets the current lease owner recover a valid v2 canonical backup before writing", async () => {
+    const dataDir = await tempDataDir();
+    const credentialsPath = path.join(dataDir, "credentials.enc");
+    const seed = new CredentialStore(dataDir, immediateLease);
+    await seed.replace(record(1));
+    const previousCiphertext = await readFile(credentialsPath);
+    await seed.replace(record(2));
+    const transactionId = "5".repeat(32);
+    const transaction = await writeV2Marker(dataDir, transactionId, true);
+    await writeFile(transaction.backupPath, previousCiphertext, {
+      flag: "wx",
+      mode: 0o600,
+    });
+    const fresh = new CredentialStore(dataDir, immediateLease);
+
+    await expect(fresh.read()).resolves.toEqual(record(1));
+    await expect(fresh.replace(record(3))).resolves.toBeUndefined();
+
+    await expect(fresh.read()).resolves.toEqual(record(3));
+    expect((await readdir(dataDir)).filter((name) =>
+      name.endsWith(".txn") || name.endsWith(".bak")
+    )).toEqual([]);
+  });
+
+  it.each(["write", "clear"] as const)(
+    "recovers a valid v2 absent-canonical transaction before %s",
+    async (operation) => {
+      const dataDir = await tempDataDir();
+      const credentialsPath = path.join(dataDir, "credentials.enc");
+      const seed = new CredentialStore(dataDir, immediateLease);
+      await seed.replace(record(1));
+      const installedCiphertext = await readFile(credentialsPath);
+      await seed.clear();
+      await writeFile(credentialsPath, installedCiphertext, {
+        flag: "wx",
+        mode: 0o600,
+      });
+      await writeV2Marker(dataDir, "6".repeat(32), false);
+      const fresh = new CredentialStore(dataDir, immediateLease);
+      await expect(fresh.read()).resolves.toBeUndefined();
+
+      if (operation === "write") {
+        await expect(fresh.replace(record(2))).resolves.toBeUndefined();
+        await expect(fresh.read()).resolves.toEqual(record(2));
+      } else {
+        await expect(fresh.clear()).resolves.toBeUndefined();
+        await expect(fresh.read()).resolves.toBeUndefined();
+      }
+      expect((await readdir(dataDir)).filter((name) =>
+        name.endsWith(".txn") || name.endsWith(".bak")
+      )).toEqual([]);
+    },
+  );
+
+  it("makes no recovery mutation after the recovering lease owner loses ownership", async () => {
+    const dataDir = await tempDataDir();
+    const credentialsPath = path.join(dataDir, "credentials.enc");
+    const seed = new CredentialStore(dataDir, immediateLease);
+    await seed.replace(record(1));
+    const previousCiphertext = await readFile(credentialsPath);
+    await seed.replace(record(2));
+    const transaction = await writeV2Marker(
+      dataDir,
+      "7".repeat(32),
+      true,
+    );
+    await writeFile(transaction.backupPath, previousCiphertext, {
+      flag: "wx",
+      mode: 0o600,
+    });
+    const before = await snapshotDataDirectory(dataDir);
+    let assertions = 0;
+    let ownershipLost = false;
+    const postLossMutations: string[] = [];
+    const losingLease: CredentialLeaseRunner = (_key, run) => run({
+      async assertOwned() {
+        assertions += 1;
+        if (assertions >= 4) {
+          ownershipLost = true;
+          throw new Error("credential lease ownership lost");
+        }
+      },
+    });
+    const store = new CredentialStore(dataDir, losingLease, {
+      async link(existingPath, newPath) {
+        if (ownershipLost) postLossMutations.push(`link:${newPath}`);
+        await link(existingPath, newPath);
+      },
+      async rename(source, destination) {
+        if (ownershipLost) postLossMutations.push(`rename:${destination}`);
+        await rename(source, destination);
+      },
+      async unlink(target) {
+        if (ownershipLost) postLossMutations.push(`unlink:${target}`);
+        await unlink(target);
+      },
+      async syncDirectory(directory) {
+        if (ownershipLost) postLossMutations.push(`sync:${directory}`);
+      },
+    });
+
+    await expect(store.replace(record(3))).rejects.toThrow(
+      "credential store write failed",
+    );
+
+    expect(postLossMutations).toEqual([]);
+    await expect(snapshotDataDirectory(dataDir)).resolves.toEqual(before);
   });
 
   it("treats a partially written transaction marker as rollback pending", async () => {
