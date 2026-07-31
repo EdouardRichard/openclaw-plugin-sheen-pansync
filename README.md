@@ -2,7 +2,7 @@
 
 ## v0.1.0 验证状态
 
-自动化与包检查已通过；OpenClaw 集成 smoke 因真实有效凭证重载、远程 SSH 隧道和 POSIX 权限模式未获验收而失败。未提供专用阿里云盘测试凭证，因此真实账号门禁为 `NOT RUN`，发布决定保持 `BLOCKED`。详见 [v0.1.0 验证记录](docs/verification/2026-07-31-v0.1.0.md)。
+自动化与包检查已通过；OpenClaw 集成 smoke 因 Tool 自身安全配置指引、Control UI 会话级可见性、真实有效凭证重载、远程 SSH 隧道和 POSIX 权限模式等必需项未获完整验收而失败。未提供专用阿里云盘测试凭证，因此真实账号门禁为 `NOT RUN`，发布决定保持 `BLOCKED`。详见 [v0.1.0 验证记录](docs/verification/2026-07-31-v0.1.0.md)。
 
 ## 1. 解决的问题
 
