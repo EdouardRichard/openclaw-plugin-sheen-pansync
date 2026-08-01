@@ -12,6 +12,7 @@ import {
   type PanSyncUploadToolApi,
 } from "../../src/tool.js";
 import type { UploadOrchestrator } from "../../src/upload/orchestrator.js";
+import { withOpenClawInstallLease } from "../helpers/openclaw-install-lease.js";
 
 type ToolRegistration = Parameters<PanSyncUploadToolApi["registerTool"]>[0];
 type CapturedTool = ReturnType<ToolRegistration>;
@@ -48,7 +49,7 @@ function runOpenClaw(args: readonly string[], stateDir: string) {
     cwd: process.cwd(),
     env,
     encoding: "utf8",
-    timeout: 45_000,
+    timeout: 90_000,
   });
 }
 
@@ -323,7 +324,9 @@ describe("OpenClaw manifest ownership", () => {
           "utf8",
         );
 
-        const install = runOpenClaw(["plugins", "install", "-l", pluginDir], stateDir);
+        const install = await withOpenClawInstallLease(() =>
+          runOpenClaw(["plugins", "install", "-l", pluginDir], stateDir)
+        );
         expect(install.error).toBeUndefined();
         expect(install.status, install.stderr).toBe(0);
 
@@ -355,7 +358,7 @@ describe("OpenClaw manifest ownership", () => {
         await rm(root, { recursive: true, force: true });
       }
     },
-    60_000,
+    360_000,
   );
 });
 

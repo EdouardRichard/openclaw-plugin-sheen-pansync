@@ -37,6 +37,7 @@ import {
 import type { CredentialRecord } from "../../src/credentials/types.js";
 import { createTempState, octalMode } from "../helpers/temp-state.js";
 import { createBuiltPackageFixture } from "../helpers/package-fixture.js";
+import { withOpenClawInstallLease } from "../helpers/openclaw-install-lease.js";
 
 type ToolFactory = OpenClawPluginToolFactory;
 
@@ -702,11 +703,13 @@ describe("OpenClaw plugin entry", () => {
           cwd: process.cwd(),
           env,
           encoding: "utf8",
-          timeout: 45_000,
+          timeout: 90_000,
         });
       };
 
-      const install = runOpenClaw(["plugins", "install", packageArtifact]);
+      const install = await withOpenClawInstallLease(() =>
+        runOpenClaw(["plugins", "install", packageArtifact])
+      );
       expect(install.error).toBeUndefined();
       expect(install.status, install.stderr).toBe(0);
       const inspect = runOpenClaw([
@@ -730,6 +733,6 @@ describe("OpenClaw plugin entry", () => {
         "openKeyedStore is only available for trusted plugins",
       );
     },
-    90_000,
+    360_000,
   );
 });

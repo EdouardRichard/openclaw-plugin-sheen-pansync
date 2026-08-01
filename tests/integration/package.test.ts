@@ -11,6 +11,7 @@ import {
   createBuiltPackageFixture,
   type BuiltPackageFixture,
 } from "../helpers/package-fixture.js";
+import { withOpenClawInstallLease } from "../helpers/openclaw-install-lease.js";
 
 type PackResult = Array<{
   filename?: string;
@@ -347,16 +348,18 @@ describe("published package", () => {
       );
       const tarball = path.join(verificationRoot, path.basename(filename ?? ""));
 
-      const installed = spawnSync(
-        process.execPath,
-        [openClawCli, "plugins", "install", tarball],
-        {
-          cwd: process.cwd(),
-          encoding: "utf8",
-          env: isolatedEnvironment,
-          timeout: 60_000,
-          windowsHide: true,
-        },
+      const installed = await withOpenClawInstallLease(() =>
+        spawnSync(
+          process.execPath,
+          [openClawCli, "plugins", "install", tarball],
+          {
+            cwd: process.cwd(),
+            encoding: "utf8",
+            env: isolatedEnvironment,
+            timeout: 90_000,
+            windowsHide: true,
+          },
+        )
       );
       expect(
         installed.error,
@@ -424,5 +427,5 @@ describe("published package", () => {
       }
       await rm(verificationRoot, { recursive: true, force: true });
     }
-  }, 120_000);
+  }, 420_000);
 });
