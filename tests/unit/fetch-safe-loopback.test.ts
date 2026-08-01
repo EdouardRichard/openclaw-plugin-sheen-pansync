@@ -43,4 +43,63 @@ describe("bindFetchSafeLoopbackServer", () => {
     expect(serverCount).toBe(2);
     expect(binding.server.listening).toBe(true);
   });
+
+  it("closes the candidate before rethrowing a Fetch safety policy error", async () => {
+    const policyError = new Error("FETCH_SAFETY_POLICY_CANARY");
+    let candidate!: Server;
+    let closeCompleted = false;
+
+    await expect(bindFetchSafeLoopbackServer({
+      createServer() {
+        candidate = createServer();
+        candidate.once("close", () => {
+          closeCompleted = true;
+        });
+        servers.push(candidate);
+        return candidate;
+      },
+      isPortSafe() {
+        throw policyError;
+      },
+    })).rejects.toBe(policyError);
+
+    expect(closeCompleted).toBe(true);
+    expect(candidate.listening).toBe(false);
+    expect(candidate.address()).toBeNull();
+  });
+
+  it("keeps the policy error primary when candidate cleanup also fails", async () => {
+    const policyError = new Error("FETCH_SAFETY_POLICY_PRIMARY_CANARY");
+    const closeError = new Error("FETCH_SAFETY_POLICY_CLOSE_CANARY");
+    let candidate!: Server;
+    let originalClose!: Server["close"];
+    let closeCompleted = false;
+
+    try {
+      await expect(bindFetchSafeLoopbackServer({
+        createServer() {
+          candidate = createServer();
+          servers.push(candidate);
+          originalClose = candidate.close.bind(candidate);
+          candidate.close = ((callback?: (error?: Error) => void) =>
+            originalClose(() => {
+              closeCompleted = true;
+              callback?.(closeError);
+            })) as Server["close"];
+          return candidate;
+        },
+        isPortSafe() {
+          throw policyError;
+        },
+      })).rejects.toBe(policyError);
+
+      expect(closeCompleted).toBe(true);
+      expect(candidate.listening).toBe(false);
+      expect(candidate.address()).toBeNull();
+    } finally {
+      if (candidate !== undefined && originalClose !== undefined) {
+        candidate.close = originalClose;
+      }
+    }
+  });
 });

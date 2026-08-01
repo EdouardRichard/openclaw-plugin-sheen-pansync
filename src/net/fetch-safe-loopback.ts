@@ -65,7 +65,18 @@ export async function bindFetchSafeLoopbackServer(
         options.addressUnavailableMessage ?? "loopback server address unavailable",
       );
     }
-    if (portIsSafe(address.port)) {
+    let safe: boolean;
+    try {
+      safe = portIsSafe(address.port);
+    } catch (error) {
+      try {
+        await closeListeningServer(server);
+      } catch {
+        // The policy failure remains primary after the cleanup attempt settles.
+      }
+      throw error;
+    }
+    if (safe) {
       return { server, address };
     }
     await closeListeningServer(server);
