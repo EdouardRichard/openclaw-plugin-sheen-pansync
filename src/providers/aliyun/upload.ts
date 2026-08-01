@@ -81,7 +81,9 @@ function responseCode(body: unknown): string {
     return "";
   }
   const code = body.code ?? body.error;
-  return typeof code === "string" ? code.toLowerCase() : "";
+  return typeof code === "string" && /^[\x00-\x7F]*$/u.test(code)
+    ? code.toLowerCase()
+    : "";
 }
 
 function isAccessTokenFailure(body: unknown): boolean {

@@ -168,6 +168,25 @@ describe("AliyunAuthorizedClient token failure retry", () => {
     expect(fetch).toHaveBeenCalledOnce();
   });
 
+  it("does not refresh for a Unicode near-match of an ASCII token code", async () => {
+    const fetch = vi.fn<AliyunFetch>(async () => jsonResponse(401, {
+      code: "AccessToKenInvalid",
+    }));
+    const forceRefresh = vi.fn(async () => "access-new");
+    const client = new AliyunAuthorizedClient({ fetch, tokenManager: {
+      forceRefresh,
+    } });
+
+    await expect(client.post(
+      "/adrive/v1.0/example",
+      "access-old",
+      {},
+      { failureCode: "REMOTE_DIRECTORY_FAILED" },
+    )).rejects.toMatchObject({ code: "REMOTE_DIRECTORY_FAILED" });
+    expect(forceRefresh).not.toHaveBeenCalled();
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
   it("does not refresh when token-failure retry is disabled", async () => {
     const fetch = vi.fn<AliyunFetch>(async () => jsonResponse(401, {
       code: "AccessTokenInvalid",
