@@ -381,5 +381,10 @@ describe("pan-sync-upload Skill discovery contract", () => {
     expect(contents).toContain("CREDENTIALS_REQUIRED");
     expect(contents).toContain("Pan Sync Helper");
     expect(contents).toContain("openclaw pan-sync configure");
+    expect(contents).toContain("OpenList");
+    expect(contents).toContain("refresh token");
+    expect(contents).toContain("api.oplist.org.cn");
+    expect(contents).toContain("directly to Aliyun");
+    expect(contents).not.toMatch(/client[ _-]?(?:id|secret)/iu);
   });
 });

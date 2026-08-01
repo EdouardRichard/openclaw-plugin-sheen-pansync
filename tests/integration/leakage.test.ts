@@ -23,9 +23,12 @@ import { registerPanSyncUploadTool, type PanSyncUploadToolApi } from "../../src/
 import { UploadOrchestrator } from "../../src/upload/orchestrator.js";
 import { startFakeAliyunServer, type FakeAliyunServer } from "../helpers/fake-aliyun-server.js";
 
-const CLIENT_SECRET = "client-secret-CANARY-8b26";
 const REFRESH_TOKEN = "refresh-token-CANARY-19d4";
 const ACCESS_TOKEN = "access-token-CANARY-62a1";
+const AUTHORIZATION_PAGE_URL = "https://authorization.example.test/openlist-auth-CANARY-4f81";
+const REFRESH_API_URL_PATH = "/openlist-renew-CANARY-0c73";
+const REFRESH_API_URL = `https://refresh.example.test${REFRESH_API_URL_PATH}`;
+const OPENLIST_ERROR_TEXT = "openlist-error-CANARY-a625";
 const ABSOLUTE_PATH = "/srv/private/openclaw/workspace/report.pdf";
 const NOW = Date.parse("2026-08-01T00:00:00.000Z");
 const MAP_FOR_EACH_INTRINSIC = Map.prototype.forEach;
@@ -48,8 +51,8 @@ function record(
   return {
     formatVersion: 2,
     credentialVersion: 1,
-    authorizationPageUrl: "http://auth.example.test/custom",
-    refreshApiUrl: "http://refresh.example.test/custom/renew",
+    authorizationPageUrl: AUTHORIZATION_PAGE_URL,
+    refreshApiUrl: REFRESH_API_URL,
     refreshToken: REFRESH_TOKEN,
     accessToken: ACCESS_TOKEN,
     account: { userIdMasked: "use***42", displayNameMasked: "R***" },
@@ -186,9 +189,11 @@ function containsProtectedValue(values: readonly unknown[]): boolean {
     const value = pending.pop();
     if (typeof value === "string") {
       if (
-        value.includes(CLIENT_SECRET)
-        || value.includes(REFRESH_TOKEN)
+        value.includes(REFRESH_TOKEN)
         || value.includes(ACCESS_TOKEN)
+        || value.includes(AUTHORIZATION_PAGE_URL)
+        || value.includes(REFRESH_API_URL_PATH)
+        || value.includes(OPENLIST_ERROR_TEXT)
         || value.includes(ABSOLUTE_PATH)
       ) {
         return true;
@@ -384,7 +389,7 @@ describe("release leakage canaries", () => {
       return error;
     }],
     ["Error cause", () => {
-      const error = new Error("safe message", { cause: CLIENT_SECRET });
+      const error = new Error("safe message", { cause: OPENLIST_ERROR_TEXT });
       error.stack = "safe stack";
       return error;
     }],
@@ -398,7 +403,7 @@ describe("release leakage canaries", () => {
     }],
     ["symbol property", () => {
       const value: Record<PropertyKey, unknown> = {};
-      value[Symbol("protected logger property")] = CLIENT_SECRET;
+      value[Symbol("protected logger property")] = OPENLIST_ERROR_TEXT;
       return value;
     }],
     ["symbol description", () => Symbol(REFRESH_TOKEN)],
@@ -445,7 +450,7 @@ describe("release leakage canaries", () => {
     Object.defineProperty(prototype, "name", {
       get() {
         getterCalls += 1;
-        return CLIENT_SECRET;
+        return OPENLIST_ERROR_TEXT;
       },
     });
     Object.setPrototypeOf(error, prototype);
@@ -508,7 +513,7 @@ describe("release leakage canaries", () => {
   );
 
   it("scans production logger calls before enforcing zero cardinality", () => {
-    const calls = [[{ payload: CLIENT_SECRET }]];
+    const calls = [[{ payload: OPENLIST_ERROR_TEXT }]];
     const kind = rejectionKind(() => assertNoProductionLoggerCalls(calls));
     if (kind !== "protected") {
       throw new Error("production logger failure order was not safe");
@@ -561,7 +566,7 @@ describe("release leakage canaries", () => {
     const value = new Proxy(createTarget(), {
       getPrototypeOf() {
         trapCalls += 1;
-        throw new Error(CLIENT_SECRET);
+        throw new Error(OPENLIST_ERROR_TEXT);
       },
     });
 
@@ -607,7 +612,7 @@ describe("release leakage canaries", () => {
     const hostile = new Proxy({}, {
       getPrototypeOf() {
         prototypeTrapCalls += 1;
-        throw new Error(CLIENT_SECRET);
+        throw new Error(OPENLIST_ERROR_TEXT);
       },
       getOwnPropertyDescriptor() {
         descriptorTrapCalls += 1;
@@ -632,7 +637,7 @@ describe("release leakage canaries", () => {
   it("does not return an attacker-controlled own message data value", () => {
     const hostile = {};
     Object.defineProperty(hostile, "message", {
-      value: CLIENT_SECRET,
+      value: OPENLIST_ERROR_TEXT,
       enumerable: true,
     });
     let observed: RejectionKind;
@@ -659,7 +664,7 @@ describe("release leakage canaries", () => {
       status: 400,
       body: {
         error: "invalid_grant",
-        error_description: `${CLIENT_SECRET} ${REFRESH_TOKEN}`,
+        error_description: `${OPENLIST_ERROR_TEXT} ${REFRESH_TOKEN}`,
       },
     });
     aliyunServers.push(invalidServer);
@@ -685,8 +690,8 @@ describe("release leakage canaries", () => {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        authorizationPageUrl: "http://auth.example.test/custom",
-        refreshApiUrl: `${invalidServer.baseUrl}/custom/renew`,
+        authorizationPageUrl: AUTHORIZATION_PAGE_URL,
+        refreshApiUrl: `${invalidServer.baseUrl}${REFRESH_API_URL_PATH}`,
         refreshToken: saved.refreshToken,
       }),
     });
@@ -705,17 +710,48 @@ describe("release leakage canaries", () => {
     const configResponse = await setupRequest(setup, "/api/config");
     const configOutput = await configResponse.text();
     expect(configResponse.status).toBe(200);
-    expect(configOutput.includes(CLIENT_SECRET)).toBe(false);
     expect(configOutput.includes(REFRESH_TOKEN)).toBe(true);
-    if (configOutput.includes(ACCESS_TOKEN) || configOutput.includes(ABSOLUTE_PATH)) {
+    expect(configOutput.includes(AUTHORIZATION_PAGE_URL)).toBe(true);
+    expect(configOutput.includes(REFRESH_API_URL_PATH)).toBe(true);
+    if (
+      configOutput.includes(ACCESS_TOKEN)
+      || configOutput.includes(OPENLIST_ERROR_TEXT)
+      || configOutput.includes(ABSOLUTE_PATH)
+    ) {
       throw new Error("authenticated config exposed a forbidden protected value");
+    }
+
+    for (const [status, expectedCode] of [
+      [429, "RATE_LIMITED"],
+      [503, "TOKEN_ENDPOINT_UNAVAILABLE"],
+    ] as const) {
+      const refreshFailureServer = await startFakeAliyunServer({
+        status,
+        body: { message: OPENLIST_ERROR_TEXT },
+      });
+      aliyunServers.push(refreshFailureServer);
+      const runtime = orchestratorFor(
+        refreshFailureServer,
+        memoryVault({
+          ...record(),
+          refreshApiUrl: `${refreshFailureServer.baseUrl}${REFRESH_API_URL_PATH}`,
+        }),
+      );
+      try {
+        await runtime.tokenManager.forceRefresh(ACCESS_TOKEN);
+        throw new Error("OpenList refresh unexpectedly succeeded");
+      } catch (error) {
+        expect(String(error)).not.toContain(OPENLIST_ERROR_TEXT);
+        expect(String(error)).not.toContain(REFRESH_API_URL_PATH);
+        expect(error).toMatchObject({ code: expectedCode });
+      }
     }
 
     const refreshServer = await startFakeAliyunServer({
       status: 400,
       body: {
         error: "invalid_grant",
-        error_description: `${REFRESH_TOKEN} ${ACCESS_TOKEN}`,
+        error_description: `${REFRESH_TOKEN} ${ACCESS_TOKEN} ${OPENLIST_ERROR_TEXT}`,
       },
     });
     aliyunServers.push(refreshServer);

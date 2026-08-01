@@ -12,3 +12,5 @@ description: Upload concrete OpenClaw workspace files when the user explicitly a
 如果请求同时要求创建产物和上传，先生成请求的产物，确认路径确实存在，再调用 Tool。不得虚构路径；同一请求中的同一规范化文件不得重复上传。
 
 如果 Tool 返回 `CREDENTIALS_REQUIRED`，请用户打开 Pan Sync Helper 状态标签页，并运行配置命令 `openclaw pan-sync configure`。
+
+Pan Sync Helper authorization uses OpenList. In the local setup page, use the default mainland-China page `https://api.oplist.org.cn`, select Aliyun Drive App Login, and paste only the resulting refresh token. The complete refresh API URL is independently editable; a custom URL receives that refresh token and has no automatic fallback. OpenList is only for authorization and token refresh: files upload directly to Aliyun.

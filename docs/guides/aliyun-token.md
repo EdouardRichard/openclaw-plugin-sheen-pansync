@@ -1,44 +1,40 @@
-# 阿里云盘初始 Refresh Token 指南
+# OpenList authorization and refresh-token guide
 
-Pan Sync Helper 需要一组彼此匹配的 OAuth 凭证：Client ID、Client Secret 和初始 Refresh Token。插件只接受你自己的阿里云盘开放平台 OAuth 应用；运行时由插件直接调用阿里云盘官方端点刷新令牌。
+Pan Sync Helper uses OpenList to obtain and refresh Aliyun Drive tokens. It does not ask you to create or enter personal OAuth application credentials. You authorize in OpenList, then paste only the refresh token into the plugin's local setup page.
 
-## 支持边界
+## Default mainland-China URLs
 
-```text
-AList public/default client mode          -> not supported by this plugin
-AList custom Client ID + Client Secret    -> acceptable source of the initial token
-Other trusted custom-client tools         -> acceptable
-Plugin runtime refresh                    -> official Aliyun endpoint, no AList dependency
-```
+The setup page starts with these independent, complete values:
 
-不要把 AList 公共/默认客户端模式获取的 Token、公共 Token 服务的 Token，或其他 OAuth 应用签发的 Token 填入插件。它们与自定义 Client ID/Client Secret 不匹配，插件不会用它们替换现有有效凭证。
+| Field | Default |
+| --- | --- |
+| OpenList authorization page URL | `https://api.oplist.org.cn` |
+| OpenList refresh API URL | `https://api.oplist.org.cn/alicloud/renewapi` |
 
-## 使用 AList 的自定义客户端模式
+Use the defaults for the mainland-China OpenList service. You may replace either field with a global or custom URL. The plugin sends the pasted refresh token only to the complete refresh API URL that is currently saved; it does not add a path, rewrite a host, or select a fallback node.
 
-请遵循 [AList Aliyundrive Open 文档](https://alist-repo.github.io/docs/guide/drivers/aliyundrive_open.html) 中关于自定义 Client ID 和 Client Secret 的说明。该文档明确指出：使用自己的开发者应用时，OAuth Token 获取也必须改为使用自己的开发者应用 ID 与密钥。
+Custom URLs can be HTTP, intranet, public, or third-party services. That flexibility is intentional, but it changes who can receive your refresh token. Verify the full address and trust boundary before saving. A custom authorization page and refresh API do not have to share a host.
 
-在 AList 中选择自定义 Client ID + Client Secret，而不是留空让 AList 使用默认客户端；再以这同一个 OAuth 应用完成授权并取得初始 Refresh Token。AList 只是可选的初始 Token 来源，不是 Pan Sync Helper 的服务依赖：配置完成后不需要运行 AList，也不会向 AList 请求刷新。
+## Authorize and save
 
-## 其他可信自定义客户端工具
+1. Run `openclaw pan-sync configure` on the OpenClaw host.
+2. Open the full one-time loopback URL printed by the command, including its `#<one-time-key>` fragment.
+3. Review the authorization page URL. Open the default OpenList page, or edit it before opening a different trusted page.
+4. In OpenList, choose **Aliyun Drive App Login**, scan the code, and copy the refresh token that OpenList displays.
+5. Return to the setup page. Paste only the refresh token, review or edit the complete refresh API URL, and save.
 
-也可以使用其他可信工具，前提是工具允许你输入自己的 Client ID 和 Client Secret，并且用这对凭证完成 OAuth 授权与换取 Token。不要使用要求共享你的 Client Secret、返回公共客户端 Token，或无法确认 Token 所属 OAuth 应用的工具。
+The setup page is authorized by the one-time URL and intentionally re-displays the complete refresh token and both URLs while you are configuring it. Treat that page as sensitive: do not screen-share it, save screenshots, or share the URL. Outside that authorized page, the plugin keeps these values out of normal configuration, status output, Tool results, logs, and errors.
 
-## 提交前的匹配检查
+The first successful save calls the selected OpenList refresh API once, verifies the returned Aliyun account, and stores the rotated tokens atomically. Later the plugin does not refresh proactively: it calls OpenList only after Aliyun Drive explicitly reports that the current access token is invalid. Aliyun Drive file operations and file bytes still go directly to Aliyun Drive.
 
-提交到 `openclaw pan-sync configure` 前，逐项确认：
+## States, cooldowns, and reauthorization
 
-1. Client ID 来自你注册的阿里云盘开放平台应用。
-2. Client Secret 是该 Client ID 对应的密钥。
-3. Refresh Token 是用上述同一 Client ID 和 Client Secret 完成授权后取得的。
+- `ready`: uploads can use the current access token.
+- `degraded`: a network failure, timeout, or OpenList 5xx response started a short persisted cooldown.
+- `rate_limited`: OpenList returned 429 and started a persisted rate-limit cooldown.
+- `reauth_required`: the refresh token was rejected or OpenList did not return both required tokens.
+- `unconfigured`: no valid authorization is stored.
 
-随后在运行 OpenClaw 的主机上执行：
+During `degraded` or `rate_limited`, wait for the cooldown instead of repeatedly retrying. The plugin does not send an immediate automatic retry.
 
-```bash
-openclaw pan-sync configure
-```
-
-仅在命令打开的、经一次性访问密钥授权的 `127.0.0.1` 配置页填写三项值。必须完整打开命令打印的 URL（包括 URL fragment 中的 `#<one-time-key>`）；页面加载时会立即把有效密钥移入浏览器的 `sessionStorage`，再从可见地址栏移除 fragment。选择“Save and verify”后，插件会直接用阿里云盘官方刷新端点验证凭证；成功时加密保存，失败时保留旧凭证。
-
-## 令牌失效或泄露后的恢复
-
-若出现授权撤销、Refresh Token 被拒绝或泄露：先在阿里云盘侧撤销旧授权，重新用同一个自定义 OAuth 应用取得初始 Refresh Token，然后再次运行配置命令。不要尝试改用 AList 默认客户端、AList 刷新服务或公共刷新服务来恢复。
+For `reauth_required`, revoke the old Aliyun Drive authorization if it may be exposed or invalid, repeat the OpenList scan, copy a new refresh token, and save it through `openclaw pan-sync configure`. A successful explicit save clears the prior failure state; a failed save keeps the previously stored authorization unchanged.

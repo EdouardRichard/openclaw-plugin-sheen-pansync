@@ -1,36 +1,7 @@
-# 独立 Token 获取 Web 系统计划
+# Superseded: separate Token web system
 
-## 目的与范围
+> **Superseded by:** [OpenList token service design](../superpowers/specs/2026-08-01-openlist-token-service-design.md)
 
-这是未来独立项目的规划文档，不实现服务、部署配置或插件运行时代码。它的唯一目标是帮助用户以**自己的**阿里云盘开放平台 OAuth 应用取得初始 Refresh Token，降低首次配置难度。
+No separate Token web system is planned for this plugin version. Authorization is performed on the configured OpenList authorization page, and the user manually pastes only the resulting refresh token into the loopback setup page.
 
-该系统不是 Pan Sync Helper 插件的一部分；插件不依赖它，且插件继续在运行时直接调用阿里云盘官方端点刷新令牌。
-
-## OAuth 流程
-
-1. 用户输入自己注册的 Client ID 和 Client Secret。
-2. 服务为本次授权生成高熵、一次性且短时有效的 `state`，然后以用户自己的 Client ID 发起 OAuth 授权。
-3. 回调仅在严格允许的地址上接收，并核对未使用且未过期的 `state`。
-4. 服务使用同一组 Client ID 和 Client Secret 交换授权码。
-5. 页面只显示一次 Refresh Token，提供复制和录入插件的说明；显示后立即清除临时会话数据。
-
-Refresh Token 永不持久化，也不得写入数据库、缓存、队列、备份、分析系统或日志。
-
-## 安全要求
-
-- 全站 HTTPS；回调地址采用严格 allowlist，不接受任意回调 URL。
-- 采用 CSP、CSRF 防护、短时会话、速率限制和安全响应头。
-- 不将请求正文交给 APM、错误追踪或遥测；不得记录 Client Secret、授权码、Refresh Token、`state` 或可关联的完整 URL。
-- 对状态、错误和审计事件进行最小化、脱敏记录；在 OAuth 完成、超时或失败后清除内存中的临时秘密。
-- 对高安全需求用户，推荐自托管模式，或使用他们信任的本地自定义客户端工具。
-
-## 明确不包含的能力
-
-- 不提供 Token 刷新 API、公共刷新服务或 Token 代理。
-- 不代理文件、上传、下载或阿里云盘数据。
-- 不依赖 Pan Sync Helper 插件，也不被插件作为运行时依赖。
-- 不使用平台公共 OAuth 应用代替用户自己的 Client ID 和 Client Secret。
-
-## 上线前的独立门槛
-
-该系统必须分别完成以下门槛后才可部署：部署与运维评审、隐私评审、滥用与速率控制评审，以及阿里云盘开放平台合规评审。每项都是独立门槛；本插件的测试、发布或文档通过都不能替代其中任何一项。
+OpenList is used for authorization and refresh only. File discovery and file uploads continue directly between Pan Sync Helper and Aliyun Drive.

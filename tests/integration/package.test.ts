@@ -3,7 +3,7 @@ import {
   spawnSync,
   type ChildProcessWithoutNullStreams,
 } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -166,6 +166,43 @@ describe("published package", () => {
     }
 
     expect(packageViolations(paths)).toEqual([]);
+    expect(paths.filter((entry) => /(?:canary|fixture|vault)/iu.test(entry))).toEqual([]);
+  });
+
+  it("keeps personal OAuth credential guidance out of shipped user-facing assets", async () => {
+    const userFacingFiles = [
+      "README.md",
+      "skills/pan-sync-upload/SKILL.md",
+      "ui/setup.html",
+      "ui/setup.js",
+    ];
+    const contents = await Promise.all(userFacingFiles.map((file) =>
+      readFile(new URL(`../../${file}`, import.meta.url), "utf8")
+    ));
+
+    for (const content of contents) {
+      expect(content).not.toMatch(/client[ _-]?(?:id|secret)/iu);
+      expect(content).not.toMatch(/oauth\/access_token/iu);
+    }
+  });
+
+  it("documents the OpenList-only setup flow and supersedes the separate web-system plan", async () => {
+    const [guide, plan] = await Promise.all([
+      readFile(new URL("../../docs/guides/aliyun-token.md", import.meta.url), "utf8"),
+      readFile(
+        new URL("../../docs/plans/token-acquisition-web-system.md", import.meta.url),
+        "utf8",
+      ),
+    ]);
+
+    expect(guide).toContain("https://api.oplist.org.cn");
+    expect(guide).toContain("https://api.oplist.org.cn/alicloud/renewapi");
+    expect(guide).toContain("paste only the refresh token");
+    expect(guide).toContain("directly to Aliyun Drive");
+    expect(guide).not.toMatch(/client[ _-]?(?:id|secret)/iu);
+    expect(plan).toMatch(/^# Superseded:/u);
+    expect(plan).toContain("2026-08-01-openlist-token-service-design.md");
+    expect(plan).toContain("No separate Token web system is planned");
   });
 
   it("rejects nested private state and undeclared static content", () => {
