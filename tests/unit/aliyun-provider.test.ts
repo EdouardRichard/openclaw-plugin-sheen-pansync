@@ -5,6 +5,8 @@ import { PanSyncError } from "../../src/errors.js";
 import { ProviderRegistry } from "../../src/provider-registry.js";
 import { OpenListTokenService } from "../../src/providers/aliyun/openlist-token-service.js";
 import { AliyunProvider } from "../../src/providers/aliyun/provider.js";
+import { AliyunAuthorizedClient } from "../../src/providers/aliyun/upload.js";
+import type { AliyunFetch } from "../../src/providers/aliyun/types.js";
 import {
   startFakeAliyunServer,
   type FakeAliyunResponse,
@@ -66,6 +68,151 @@ async function rejectedPanSyncError(
   expect(rejected).toBeInstanceOf(PanSyncError);
   return rejected as PanSyncError;
 }
+
+function jsonResponse(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+function authorizationHeader(
+  call: Parameters<AliyunFetch>,
+): string | null {
+  return new Headers(call[1]?.headers).get("authorization");
+}
+
+describe("AliyunAuthorizedClient token failure retry", () => {
+  it.each([
+    [401, { code: "AccessTokenInvalid" }],
+    [401, { code: "AccessTokenExpired" }],
+    [400, { code: "I400JD" }],
+  ] as const)(
+    "refreshes once for explicit token code at HTTP %i and retries with the winning token",
+    async (status, body) => {
+      const fetch = vi.fn<AliyunFetch>()
+        .mockResolvedValueOnce(jsonResponse(status, body))
+        .mockResolvedValueOnce(jsonResponse(200, { ok: true }));
+      const forceRefresh = vi.fn(async () => "access-new");
+      const client = new AliyunAuthorizedClient({ fetch, tokenManager: {
+        forceRefresh,
+      } });
+
+      await expect(client.post(
+        "/adrive/v1.0/example",
+        "access-old",
+        { request: true },
+        { failureCode: "REMOTE_DIRECTORY_FAILED" },
+      )).resolves.toEqual({
+        accessToken: "access-new",
+        body: { ok: true },
+        alreadyExisting: false,
+      });
+
+      expect(forceRefresh).toHaveBeenCalledOnce();
+      expect(forceRefresh).toHaveBeenCalledWith("access-old");
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(authorizationHeader(fetch.mock.calls[0]!)).toBe(
+        "Bearer access-old",
+      );
+      expect(authorizationHeader(fetch.mock.calls[1]!)).toBe(
+        "Bearer access-new",
+      );
+    },
+  );
+
+  it.each([
+    ["generic 401", 401, {}],
+    ["401 business error", 401, { code: "UserNotFound" }],
+    ["401 near-match token code", 401, { code: "AccessTokenInvalidAgain" }],
+    ["HTTP 403", 403, { code: "Forbidden" }],
+    ["HTTP 429", 429, { code: "TooManyRequests" }],
+    ["HTTP 500", 500, { code: "InternalError" }],
+  ] as const)(
+    "does not refresh for %s",
+    async (_name, status, body) => {
+      const fetch = vi.fn<AliyunFetch>(async () => jsonResponse(status, body));
+      const forceRefresh = vi.fn(async () => "access-new");
+      const client = new AliyunAuthorizedClient({ fetch, tokenManager: {
+        forceRefresh,
+      } });
+
+      await expect(client.post(
+        "/adrive/v1.0/example",
+        "access-old",
+        {},
+        { failureCode: "REMOTE_DIRECTORY_FAILED" },
+      )).rejects.toBeInstanceOf(PanSyncError);
+
+      expect(forceRefresh).not.toHaveBeenCalled();
+      expect(fetch).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("does not refresh after a network failure", async () => {
+    const fetch = vi.fn<AliyunFetch>(async () => {
+      throw new Error("network-secret-CANARY");
+    });
+    const forceRefresh = vi.fn(async () => "access-new");
+    const client = new AliyunAuthorizedClient({ fetch, tokenManager: {
+      forceRefresh,
+    } });
+
+    await expect(client.post(
+      "/adrive/v1.0/example",
+      "access-old",
+      {},
+      { failureCode: "REMOTE_DIRECTORY_FAILED" },
+    )).rejects.toMatchObject({ code: "REMOTE_DIRECTORY_FAILED" });
+    expect(forceRefresh).not.toHaveBeenCalled();
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
+  it("does not refresh when token-failure retry is disabled", async () => {
+    const fetch = vi.fn<AliyunFetch>(async () => jsonResponse(401, {
+      code: "AccessTokenInvalid",
+    }));
+    const forceRefresh = vi.fn(async () => "access-new");
+    const client = new AliyunAuthorizedClient({ fetch, tokenManager: {
+      forceRefresh,
+    } });
+
+    await expect(client.post(
+      "/adrive/v1.0/example",
+      "access-old",
+      {},
+      {
+        failureCode: "CREDENTIALS_INVALID",
+        retryTokenFailure: false,
+      },
+    )).rejects.toMatchObject({ code: "CREDENTIALS_INVALID" });
+    expect(forceRefresh).not.toHaveBeenCalled();
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
+  it("maps a repeated explicit token failure to AUTHORIZATION_REVOKED", async () => {
+    const fetch = vi.fn<AliyunFetch>()
+      .mockResolvedValueOnce(jsonResponse(401, {
+        code: "AccessTokenInvalid",
+      }))
+      .mockResolvedValueOnce(jsonResponse(400, {
+        error: "AccessTokenExpired",
+      }));
+    const forceRefresh = vi.fn(async () => "access-new");
+    const client = new AliyunAuthorizedClient({ fetch, tokenManager: {
+      forceRefresh,
+    } });
+
+    await expect(client.post(
+      "/adrive/v1.0/example",
+      "access-old",
+      {},
+      { failureCode: "REMOTE_DIRECTORY_FAILED" },
+    )).rejects.toMatchObject({ code: "AUTHORIZATION_REVOKED" });
+    expect(forceRefresh).toHaveBeenCalledOnce();
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+});
 
 describe("AliyunProvider credential validation", () => {
   it.each([
@@ -325,10 +472,10 @@ describe("AliyunProvider directory traversal", () => {
     expect(server.requests).toHaveLength(2);
   });
 
-  it("maps a second 401 to AUTHORIZATION_REVOKED", async () => {
+  it("maps a second explicit token failure to AUTHORIZATION_REVOKED", async () => {
     const server = await fakeServer([
       { status: 401, body: { code: "AccessTokenInvalid" } },
-      { status: 401, body: { code: "AccessTokenInvalidAgain" } },
+      { status: 400, body: { code: "AccessTokenExpired" } },
     ]);
     const forceRefresh = vi.fn(async () => "access-new");
 

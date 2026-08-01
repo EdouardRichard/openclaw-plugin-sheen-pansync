@@ -554,16 +554,36 @@ describe("Aliyun multipart upload", () => {
     expect(server.events).toContain("put-1-start");
   });
 
-  it("refreshes the access token once when file creation returns 401", async () => {
+  it("refreshes a multipart API request without adding Bearer auth to signed part PUTs", async () => {
     const server = await startUploadServer({
       createResponses: [
-        { status: 401, body: { code: "AccessTokenInvalid" } },
+        { status: 401, body: { code: "AccessTokenExpired" } },
       ],
     });
-    const file = await sparseFile(1);
+    const file = await sparseFile(45 * MIB);
     const forceRefresh = vi.fn(async () => "access-new");
+    const requests: Array<{
+      method: string;
+      path: string;
+      authorization: string | null;
+    }> = [];
+    const trackingFetch: AliyunFetch = async (input, init) => {
+      const requestUrl = new URL(
+        input instanceof Request ? input.url : input.toString(),
+      );
+      requests.push({
+        method:
+          init?.method ?? (input instanceof Request ? input.method : "GET"),
+        path: requestUrl.pathname,
+        authorization: new Headers(
+          init?.headers
+            ?? (input instanceof Request ? input.headers : undefined),
+        ).get("authorization"),
+      });
+      return globalThis.fetch(input, init);
+    };
 
-    await provider(server, { forceRefresh }).uploadFile({
+    await provider(server, { forceRefresh, fetch: trackingFetch }).uploadFile({
       accessToken: "access-old",
       remoteDirectory: REMOTE_DIRECTORY,
       file,
@@ -572,17 +592,26 @@ describe("Aliyun multipart upload", () => {
     expect(forceRefresh).toHaveBeenCalledOnce();
     expect(forceRefresh).toHaveBeenCalledWith("access-old");
     expect(
-      server.requests.filter(({ path: requestPath }) =>
-        requestPath.endsWith("/openFile/create")
-      ),
-    ).toHaveLength(2);
+      requests
+        .filter(({ path: requestPath }) => requestPath.startsWith("/adrive/"))
+        .map(({ authorization }) => authorization),
+    ).toEqual([
+      "Bearer access-old",
+      "Bearer access-new",
+      "Bearer access-new",
+    ]);
+    const partPuts = requests.filter(({ method }) => method === "PUT");
+    expect(partPuts).toHaveLength(3);
+    expect(partPuts.every(({ path: requestPath, authorization }) =>
+      requestPath.startsWith("/signed/") && authorization === null
+    )).toBe(true);
   });
 
-  it("maps a second file-creation 401 to AUTHORIZATION_REVOKED", async () => {
+  it("maps a second explicit file-creation token failure to AUTHORIZATION_REVOKED", async () => {
     const server = await startUploadServer({
       createResponses: [
         { status: 401, body: { code: "AccessTokenInvalid" } },
-        { status: 401, body: { code: "AccessTokenInvalidAgain" } },
+        { status: 400, body: { code: "AccessTokenExpired" } },
       ],
     });
     const file = await sparseFile(1);

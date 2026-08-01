@@ -16,6 +16,11 @@ const MAX_PARTS = 10_000;
 const MAX_CONCURRENT_PUTS = 3;
 const UPLOAD_URL_REFRESH_AGE_MS = 50 * 60 * 1_000;
 const READ_CHUNK_SIZE = 64 * 1024;
+const ACCESS_TOKEN_FAILURE_CODES = new Set([
+  "accesstokeninvalid",
+  "accesstokenexpired",
+  "i400jd",
+]);
 
 export type AliyunRemoteDirectory = RemoteDirectory & {
   providerState: {
@@ -42,7 +47,7 @@ export type AliyunAuthorizedClientOptions = {
 
 export type AliyunPostOptions = {
   failureCode: PanSyncErrorCode;
-  retryUnauthorized?: boolean;
+  retryTokenFailure?: boolean;
   allowAlreadyExisting?: boolean;
   signal?: AbortSignal;
 };
@@ -76,7 +81,11 @@ function responseCode(body: unknown): string {
     return "";
   }
   const code = body.code ?? body.error;
-  return typeof code === "string" ? code.toLocaleLowerCase("en-US") : "";
+  return typeof code === "string" ? code.toLowerCase() : "";
+}
+
+function isAccessTokenFailure(body: unknown): boolean {
+  return ACCESS_TOKEN_FAILURE_CODES.has(responseCode(body));
 }
 
 function isCapacityFailure(body: unknown): boolean {
@@ -156,7 +165,10 @@ export class AliyunAuthorizedClient {
         throw new PanSyncError(options.failureCode);
       }
 
-      if (response.status === 401 && options.retryUnauthorized !== false) {
+      if (
+        isAccessTokenFailure(body)
+        && options.retryTokenFailure !== false
+      ) {
         if (refreshed) {
           throw new PanSyncError("AUTHORIZATION_REVOKED");
         }

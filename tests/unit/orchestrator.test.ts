@@ -7,7 +7,13 @@ import type {
   RemoteDirectory,
 } from "../../src/contracts.js";
 import { TokenManager } from "../../src/credentials/token-manager.js";
+import type { CredentialRecord } from "../../src/credentials/types.js";
 import { PanSyncError } from "../../src/errors.js";
+import { AliyunAuthorizedClient } from "../../src/providers/aliyun/upload.js";
+import type {
+  AliyunFetch,
+  AliyunTokenService,
+} from "../../src/providers/aliyun/types.js";
 import {
   UploadOrchestrator,
   type UploadOrchestratorDependencies,
@@ -507,6 +513,133 @@ describe("UploadOrchestrator", () => {
       }),
     ).rejects.toMatchObject({ code: "CREDENTIALS_REQUIRED" });
     expect(events).toEqual(["provider:default", "token"]);
+  });
+
+  it("shares one refreshed token across concurrent upload paths", async () => {
+    let current: CredentialRecord = {
+      formatVersion: 2,
+      credentialVersion: 1,
+      authorizationPageUrl: "http://auth.example.test/custom",
+      refreshApiUrl: "http://refresh.example.test/custom/renew",
+      refreshToken: "refresh-old",
+      accessToken: "access-old",
+      account: { userIdMasked: "use***id" },
+      lastVerifiedAt: "2026-08-01T11:59:00.000Z",
+      refreshState: { status: "ready" },
+    };
+    const releaseRefresh = deferred<void>();
+    const refreshStarted = deferred<void>();
+    const refresh = vi.fn<AliyunTokenService["refresh"]>(async () => {
+      refreshStarted.resolve();
+      await releaseRefresh.promise;
+      return {
+        accessToken: "access-new",
+        refreshToken: "refresh-new",
+      };
+    });
+    const tokenManager = new TokenManager({
+      store: {
+        async read() {
+          return current;
+        },
+        async replaceIfVersion(expected, candidate) {
+          if (current.credentialVersion !== expected) {
+            return false;
+          }
+          current = candidate;
+          return true;
+        },
+      },
+      tokenService: { refresh },
+    });
+    const bothStaleRequests = deferred<void>();
+    let staleRequestCount = 0;
+    const authorizations: string[] = [];
+    const fetch: AliyunFetch = async (_input, init) => {
+      const authorization =
+        new Headers(init?.headers).get("authorization") ?? "";
+      authorizations.push(authorization);
+      if (authorization === "Bearer access-old") {
+        staleRequestCount += 1;
+        if (staleRequestCount === 2) {
+          bothStaleRequests.resolve();
+        }
+        await bothStaleRequests.promise;
+        return new Response(JSON.stringify({
+          code: "AccessTokenExpired",
+        }), {
+          status: 401,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const api = new AliyunAuthorizedClient({ fetch, tokenManager });
+    const provider: CloudDriveProvider = {
+      id: "aliyun",
+      aliases: ["aliyun"],
+      async validateCredentials() {
+        throw new Error("not used");
+      },
+      async ensureDirectory(remotePath) {
+        return {
+          id: "directory",
+          path: remotePath,
+          providerState: { driveId: "drive-default" },
+        };
+      },
+      async uploadFile(input) {
+        await api.post(
+          "/adrive/v1.0/openFile/create",
+          input.accessToken,
+          { name: input.file.basename },
+          { failureCode: "UPLOAD_FAILED" },
+        );
+        return {
+          remoteName: input.file.basename,
+          size: input.file.size,
+        };
+      },
+    };
+    const orchestrator = new UploadOrchestrator({
+      providerRegistry: { resolve: () => provider },
+      tokenManager,
+      config: { defaultDirectory: "/openClawShare" },
+      pathGuard: {
+        async resolveWorkspaceFile(_workspaceDir, input) {
+          return {
+            inputName: input,
+            basename: input,
+            size: 0,
+            handle: {
+              close: vi.fn(async () => undefined),
+            } as unknown as FileHandle,
+          };
+        },
+        isSameWorkspaceFile: () => false,
+      },
+    });
+
+    const uploads = ["a.txt", "b.txt"].map((input) =>
+      orchestrator.upload({ workspaceDir: "workspace", paths: [input] })
+    );
+    await refreshStarted.promise;
+    expect(refresh).toHaveBeenCalledOnce();
+    releaseRefresh.resolve();
+
+    await expect(Promise.all(uploads)).resolves.toEqual([
+      expect.objectContaining({ status: "success" }),
+      expect.objectContaining({ status: "success" }),
+    ]);
+    expect(refresh).toHaveBeenCalledOnce();
+    expect(authorizations.filter((value) => value === "Bearer access-old"))
+      .toHaveLength(2);
+    expect(authorizations.filter((value) => value === "Bearer access-new"))
+      .toHaveLength(2);
+    expect(authorizations).toHaveLength(4);
   });
 
   it("propagates CREDENTIALS_REQUIRED from an actual empty TokenManager vault", async () => {

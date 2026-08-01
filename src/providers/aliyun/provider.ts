@@ -182,7 +182,7 @@ export class AliyunProvider implements CloudDriveProvider {
       {},
       {
         failureCode: "CREDENTIALS_INVALID",
-        retryUnauthorized: false,
+        retryTokenFailure: false,
         ...(options.signal === undefined ? {} : { signal: options.signal }),
       },
     );
