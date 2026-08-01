@@ -7,6 +7,7 @@ import type {
   RemoteDirectory,
 } from "../../src/contracts.js";
 import { TokenManager } from "../../src/credentials/token-manager.js";
+import type { CredentialLeaseRunner } from "../../src/credentials/store.js";
 import type { CredentialRecord } from "../../src/credentials/types.js";
 import { PanSyncError } from "../../src/errors.js";
 import { AliyunAuthorizedClient } from "../../src/providers/aliyun/upload.js";
@@ -513,6 +514,69 @@ describe("UploadOrchestrator", () => {
       }),
     ).rejects.toMatchObject({ code: "CREDENTIALS_REQUIRED" });
     expect(events).toEqual(["provider:default", "token"]);
+  });
+
+  it("automatically refreshes an expired durable cooldown at the upload precondition", async () => {
+    const boundary = Date.parse("2026-08-01T13:00:00.000Z");
+    let now = boundary - 1;
+    let current: CredentialRecord = {
+      formatVersion: 2,
+      credentialVersion: 2,
+      authorizationPageUrl: "http://auth.example.test/custom",
+      refreshApiUrl: "http://refresh.example.test/custom/renew",
+      refreshToken: "refresh-stale",
+      accessToken: "access-stale",
+      account: { userIdMasked: "use***id" },
+      lastVerifiedAt: "2026-08-01T11:59:00.000Z",
+      refreshState: {
+        status: "rate_limited",
+        notBefore: "2026-08-01T13:00:00.000Z",
+        failureCode: "RATE_LIMITED",
+      },
+    };
+    const refresh = vi.fn<AliyunTokenService["refresh"]>(async () => ({
+      accessToken: "access-recovered",
+      refreshToken: "refresh-recovered",
+    }));
+    const lease: CredentialLeaseRunner = (_key, run) => run({
+      assertOwned: async () => undefined,
+    });
+    const tokenManager = new TokenManager({
+      store: {
+        read: async () => current,
+        async replaceIfVersion(expected, candidate) {
+          if (current.credentialVersion !== expected) return false;
+          current = candidate;
+          return true;
+        },
+      },
+      tokenService: { refresh },
+      runWithRefreshLease: lease,
+      clock: () => now,
+    });
+    const { orchestrator, events } = harness({ tokenManager });
+
+    await expect(orchestrator.upload({
+      workspaceDir: "workspace",
+      paths: ["before.txt"],
+    })).rejects.toMatchObject({ code: "RATE_LIMITED" });
+    expect(refresh).not.toHaveBeenCalled();
+
+    now = boundary;
+    await expect(orchestrator.upload({
+      workspaceDir: "workspace",
+      paths: ["boundary.txt"],
+    })).resolves.toMatchObject({ status: "success" });
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(events).toContain(
+      "ensure:/openClawShare:access-recovered",
+    );
+    expect(current).toMatchObject({
+      credentialVersion: 3,
+      accessToken: "access-recovered",
+      refreshToken: "refresh-recovered",
+      refreshState: { status: "ready" },
+    });
   });
 
   it("shares one refreshed token across concurrent upload paths", async () => {

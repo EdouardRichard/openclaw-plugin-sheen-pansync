@@ -47,6 +47,7 @@ type RefreshSubscriber = {
 type RefreshOperation = {
   controller: AbortController;
   subscribers: Set<RefreshSubscriber>;
+  phase: "refreshing" | "committing";
 };
 
 type RefreshOutcome =
@@ -107,9 +108,8 @@ export class TokenManager {
   ): Promise<string> {
     const record = await this.#readConfiguredRecord();
     if (record.refreshState.status !== "ready") {
-      throw new PanSyncError(
-        record.refreshState.failureCode ?? "CREDENTIALS_INVALID",
-      );
+      this.#assertRefreshEligible(record);
+      return this.#singleFlightRefresh(record, record.accessToken, _options);
     }
     if (record.accessToken.length === 0) {
       throw new PanSyncError("CREDENTIALS_INVALID");
@@ -151,6 +151,9 @@ export class TokenManager {
     if (operation === undefined) {
       return;
     }
+    if (operation.phase === "committing") {
+      return;
+    }
     this.#refreshInFlight = undefined;
     this.#settleRefresh(operation, {
       status: "rejected",
@@ -181,6 +184,7 @@ export class TokenManager {
       const created: RefreshOperation = {
         controller: new AbortController(),
         subscribers: new Set(),
+        phase: "refreshing",
       };
       operation = created;
       this.#refreshInFlight = created;
@@ -188,6 +192,7 @@ export class TokenManager {
         record,
         expectedAccessToken,
         { signal: created.controller.signal },
+        () => this.#beginCommit(created),
       ).then(
         (value) => this.#settleRefresh(created, {
           status: "fulfilled",
@@ -260,10 +265,24 @@ export class TokenManager {
     }
   }
 
+  #beginCommit(operation: RefreshOperation): void {
+    if (operation.phase === "committing") {
+      return;
+    }
+    operation.phase = "committing";
+    for (const subscriber of operation.subscribers) {
+      if (subscriber.onAbort !== undefined) {
+        subscriber.signal?.removeEventListener("abort", subscriber.onAbort);
+        subscriber.onAbort = undefined;
+      }
+    }
+  }
+
   async #refresh(
     initialRecord: CredentialRecord,
     expectedAccessToken: string | undefined,
     options: ProviderOperationOptions,
+    beginCommit: () => void,
   ): Promise<string> {
     try {
       return await this.#runWithRefreshLease(
@@ -305,6 +324,7 @@ export class TokenManager {
             if (cancellationRequested(options.signal)) {
               throw cancellationError();
             }
+            beginCommit();
             const failure = error instanceof PanSyncError
               ? error
               : new PanSyncError("TOKEN_ENDPOINT_UNAVAILABLE");
@@ -319,16 +339,18 @@ export class TokenManager {
               candidate,
               options,
             );
-            if (cancellationRequested(options.signal)) {
-              throw cancellationError();
+            if (replaced) {
+              throw failure;
             }
-            if (!replaced) {
-              return this.#winnerAccessToken(
-                await this.#readConfiguredRecord(),
-              );
-            }
-            throw failure;
+            return this.#winnerAccessToken(
+              await this.#readConfiguredRecord(),
+            );
           }
+
+          if (cancellationRequested(options.signal)) {
+            throw cancellationError();
+          }
+          beginCommit();
 
           const candidate: CredentialRecord = {
             ...record,
@@ -344,9 +366,6 @@ export class TokenManager {
             candidate,
             options,
           );
-          if (cancellationRequested(options.signal)) {
-            throw cancellationError();
-          }
           if (replaced) {
             return result.accessToken;
           }

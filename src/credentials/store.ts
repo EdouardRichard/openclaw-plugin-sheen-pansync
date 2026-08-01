@@ -176,8 +176,18 @@ export class CredentialStore {
     if (mutationAborted(options.signal)) {
       return false;
     }
+    const leaseController = options.signal === undefined
+      ? undefined
+      : new AbortController();
+    const forwardAbort = (): void => leaseController?.abort();
+    options.signal?.addEventListener("abort", forwardAbort, { once: true });
+    if (mutationAborted(options.signal)) forwardAbort();
+    const stopForwardingAbort = (): void => {
+      options.signal?.removeEventListener("abort", forwardAbort);
+    };
     try {
       return await this.runWithLease(CREDENTIAL_LEASE_KEY, async (lease) => {
+        stopForwardingAbort();
         await lease.assertOwned();
         if (mutationAborted(options.signal)) {
           return false;
@@ -193,9 +203,11 @@ export class CredentialStore {
         await lease.assertOwned();
         await this.#writeUnlocked(candidate, options.signal, lease);
         return true;
-      }, options.signal === undefined ? {} : { signal: options.signal });
+      }, leaseController === undefined ? {} : { signal: leaseController.signal });
     } catch {
       throw new Error(WRITE_FAILED);
+    } finally {
+      stopForwardingAbort();
     }
   }
 

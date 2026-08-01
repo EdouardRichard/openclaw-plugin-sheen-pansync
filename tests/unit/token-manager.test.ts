@@ -587,4 +587,144 @@ describe("TokenManager", () => {
     expect(refresh.input()?.signal?.aborted).toBe(true);
     expect(store.current()).toEqual(record());
   });
+
+  it("returns committed refresh success when abort arrives as the CAS completes", async () => {
+    const controller = new AbortController();
+    let current = record();
+    const manager = new TokenManager({
+      store: {
+        read: async () => current,
+        async replaceIfVersion(expected, candidate) {
+          expect(expected).toBe(1);
+          current = candidate;
+          controller.abort();
+          return true;
+        },
+      },
+      tokenService: immediateTokenService(),
+      runWithRefreshLease: immediateLease,
+      clock: () => NOW,
+    });
+
+    await expect(manager.forceRefresh(undefined, {
+      signal: controller.signal,
+    })).resolves.toBe("access-2");
+    expect(current).toMatchObject({
+      credentialVersion: 2,
+      accessToken: "access-2",
+      refreshToken: "refresh-2",
+      refreshState: { status: "ready" },
+    });
+  });
+
+  it("does not let clearSnapshots cancel a refresh after commit begins", async () => {
+    const initial = record();
+    let current = initial;
+    let notifyReplaceStarted: (() => void) | undefined;
+    const replaceStarted = new Promise<void>((resolve) => {
+      notifyReplaceStarted = resolve;
+    });
+    let releaseReplace: (() => void) | undefined;
+    const replaceReleased = new Promise<void>((resolve) => {
+      releaseReplace = resolve;
+    });
+    const manager = new TokenManager({
+      store: {
+        read: async () => current,
+        async replaceIfVersion(_expected, candidate) {
+          notifyReplaceStarted?.();
+          await replaceReleased;
+          current = candidate;
+          return true;
+        },
+      },
+      tokenService: immediateTokenService(),
+      runWithRefreshLease: immediateLease,
+      clock: () => NOW,
+    });
+    const pending = manager.forceRefresh();
+    await replaceStarted;
+
+    manager.clearSnapshots();
+    releaseReplace?.();
+
+    await expect(pending).resolves.toBe("access-2");
+    expect(current).toMatchObject({
+      credentialVersion: 2,
+      accessToken: "access-2",
+      refreshState: { status: "ready" },
+    });
+  });
+
+  it("returns the committed refresh failure when abort arrives as its CAS completes", async () => {
+    const controller = new AbortController();
+    let current = record();
+    const failure = new PanSyncError("RATE_LIMITED", {
+      retryAfterMs: 5 * 60_000,
+    });
+    const manager = new TokenManager({
+      store: {
+        read: async () => current,
+        async replaceIfVersion(expected, candidate) {
+          expect(expected).toBe(1);
+          current = candidate;
+          controller.abort();
+          return true;
+        },
+      },
+      tokenService: {
+        async refresh() {
+          throw failure;
+        },
+      },
+      runWithRefreshLease: immediateLease,
+      clock: () => NOW,
+    });
+
+    await expect(manager.forceRefresh(undefined, {
+      signal: controller.signal,
+    })).rejects.toBe(failure);
+    expect(current).toMatchObject({
+      credentialVersion: 2,
+      refreshState: {
+        status: "rate_limited",
+        notBefore: "2026-08-01T12:05:00.000Z",
+        failureCode: "RATE_LIMITED",
+      },
+    });
+  });
+
+  it("returns cancellation without mutation when abort wins after upstream success but before commit", async () => {
+    const controller = new AbortController();
+    const initial = record();
+    let current = initial;
+    let replaceCalls = 0;
+    const refresh = controlledRefresh();
+    const manager = new TokenManager({
+      store: {
+        read: async () => current,
+        async replaceIfVersion(_expected, candidate) {
+          replaceCalls += 1;
+          current = candidate;
+          return true;
+        },
+      },
+      tokenService: refresh.tokenService,
+      runWithRefreshLease: immediateLease,
+      clock: () => NOW,
+    });
+
+    const pending = manager.forceRefresh(undefined, {
+      signal: controller.signal,
+    });
+    await refresh.started;
+    refresh.succeed();
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({
+      code: "TOKEN_ENDPOINT_UNAVAILABLE",
+    });
+    expect(replaceCalls).toBe(0);
+    expect(current).toBe(initial);
+  });
 });

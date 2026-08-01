@@ -6,8 +6,8 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createSqliteWorkerCredentialLeaseRunner } from "../../src/credentials/sqlite-worker-lease.js";
 import { CredentialStore } from "../../src/credentials/store.js";
+import type { CredentialLeaseRunner } from "../../src/credentials/store.js";
 import type { CredentialRecord } from "../../src/credentials/types.js";
 import { createTempState } from "../helpers/temp-state.js";
 
@@ -23,6 +23,9 @@ const children = new Set<ChildProcess>();
 let buildCleanup: (() => Promise<void>) | undefined;
 let compiledDirectory: string;
 let node22Executable: string;
+const immediateLease: CredentialLeaseRunner = (_key, run) => run({
+  assertOwned: async () => undefined,
+});
 
 function nodeSupportsSqlite(): boolean {
   const [major = 0, minor = 0] = process.versions.node.split(".").map(Number);
@@ -90,6 +93,7 @@ function moduleUrl(...segments: string[]): string {
 function startChild(dataDir: string, databasePath: string): {
   child: ChildProcess;
   messages: ChildMessage[];
+  stderr: string[];
 } {
   const child = fork(
     path.join(process.cwd(), "tests", "helpers", "token-refresh-child.mjs"),
@@ -98,6 +102,10 @@ function startChild(dataDir: string, databasePath: string): {
       execPath: node22Executable,
       env: {
         ...process.env,
+        NODE_OPTIONS: [
+          process.env.NODE_OPTIONS,
+          "--disable-warning=ExperimentalWarning",
+        ].filter((value) => value !== undefined && value.length > 0).join(" "),
         PAN_SYNC_DATA_DIR: dataDir,
         PAN_SYNC_LEASE_DATABASE: databasePath,
         PAN_SYNC_STORE_MODULE_URL: moduleUrl("credentials", "store.js"),
@@ -120,8 +128,11 @@ function startChild(dataDir: string, databasePath: string): {
   );
   children.add(child);
   const messages: ChildMessage[] = [];
+  const stderr: string[] = [];
   child.on("message", (message) => messages.push(message as ChildMessage));
-  return { child, messages };
+  child.stderr?.setEncoding("utf8");
+  child.stderr?.on("data", (chunk: string) => stderr.push(chunk));
+  return { child, messages, stderr };
 }
 
 async function waitForCondition(
@@ -213,6 +224,7 @@ async function runTwoChildren(
   ]);
   releaseResponse();
   await Promise.all([waitForExit(first.child), waitForExit(second.child)]);
+  expect([...first.stderr, ...second.stderr].join(""), "child stderr").toBe("");
   return [
     first.messages.find(({ type }) => type === "result" || type === "error")!,
     second.messages.find(({ type }) => type === "result" || type === "error")!,
@@ -226,7 +238,7 @@ describe("TokenManager refresh lease built artifact", () => {
       const databasePath = path.join(state.dataDir, "locks", "lease.sqlite");
       const store = new CredentialStore(
         state.dataDir,
-        createSqliteWorkerCredentialLeaseRunner(databasePath),
+        immediateLease,
       );
       await withOpenList(200, async (openList) => {
         await store.replace(credentialRecord(openList.refreshApiUrl));
@@ -255,7 +267,7 @@ describe("TokenManager refresh lease built artifact", () => {
       const databasePath = path.join(state.dataDir, "locks", "lease.sqlite");
       const store = new CredentialStore(
         state.dataDir,
-        createSqliteWorkerCredentialLeaseRunner(databasePath),
+        immediateLease,
       );
       await withOpenList(429, async (openList) => {
         await store.replace(credentialRecord(openList.refreshApiUrl));

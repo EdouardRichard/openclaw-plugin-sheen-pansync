@@ -461,7 +461,7 @@ describe("CredentialStore", () => {
     ).resolves.toEqual(initial);
   });
 
-  it("passes mutation cancellation to filesystem lease acquisition", async () => {
+  it("passes scoped mutation cancellation to filesystem lease acquisition", async () => {
     const controller = new AbortController();
     let observedSignal: AbortSignal | undefined;
     const lease: CredentialLeaseRunner = (_key, run, options) => {
@@ -476,7 +476,47 @@ describe("CredentialStore", () => {
       }),
     ).resolves.toBe(true);
 
-    expect(observedSignal).toBe(controller.signal);
+    expect(observedSignal).toBeInstanceOf(AbortSignal);
+    expect(observedSignal).not.toBe(controller.signal);
+    controller.abort();
+    expect(observedSignal?.aborted).toBe(false);
+  });
+
+  it("treats abort after the durable marker commit begins as committed", async () => {
+    const dataDir = await tempDataDir();
+    const credentialsPath = path.join(dataDir, "credentials.enc");
+    const initial = record(1);
+    const replacement = record(2);
+    await new CredentialStore(dataDir, immediateLease).replace(initial);
+    const controller = new AbortController();
+    const signalAwareLease: CredentialLeaseRunner = (_key, run, options) =>
+      run({
+        async assertOwned() {
+          if (options?.signal?.aborted === true) {
+            throw new Error("credential lease ownership lost");
+          }
+        },
+      });
+    let replacementInstalled = false;
+    const store = new CredentialStore(dataDir, signalAwareLease, {
+      async rename(source, destination) {
+        await rename(source, destination);
+        if (destination === credentialsPath) replacementInstalled = true;
+      },
+      async unlink(target) {
+        await unlink(target);
+        if (replacementInstalled && target.endsWith(".txn")) {
+          controller.abort();
+        }
+      },
+    });
+
+    await expect(store.replaceIfVersion(1, replacement, {
+      signal: controller.signal,
+    })).resolves.toBe(true);
+    await expect(
+      new CredentialStore(dataDir, immediateLease).read(),
+    ).resolves.toEqual(replacement);
   });
 
   it("sanitizes read failures without exposing filesystem paths", async () => {
