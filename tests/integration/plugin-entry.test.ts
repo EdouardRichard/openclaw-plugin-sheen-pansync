@@ -36,6 +36,7 @@ import {
 } from "../../src/credentials/token-manager.js";
 import type { CredentialRecord } from "../../src/credentials/types.js";
 import { createTempState, octalMode } from "../helpers/temp-state.js";
+import { createBuiltPackageFixture } from "../helpers/package-fixture.js";
 
 type ToolFactory = OpenClawPluginToolFactory;
 
@@ -649,19 +650,18 @@ describe("OpenClaw plugin entry", () => {
       cleanups.push(() => rm(root, { recursive: true, force: true }));
       const stateDir = path.join(root, "state");
       await mkdir(stateDir);
+      const packageFixture = await createBuiltPackageFixture();
+      cleanups.push(packageFixture.cleanup);
       const npmCli = process.env.npm_execpath;
       if (npmCli === undefined) throw new Error("npm CLI path unavailable");
       const runNpm = (args: string[]) => spawnSync(process.execPath, [
         npmCli,
         ...args,
       ], {
-        cwd: process.cwd(),
+        cwd: packageFixture.root,
         encoding: "utf8",
         timeout: 45_000,
       });
-      const build = runNpm(["run", "build"]);
-      expect(build.error).toBeUndefined();
-      expect(build.status, `${build.stdout}\n${build.stderr}`).toBe(0);
       const pack = runNpm([
         "pack",
         "--json",

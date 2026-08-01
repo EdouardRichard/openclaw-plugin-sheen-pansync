@@ -7,6 +7,10 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import {
+  createBuiltPackageFixture,
+  type BuiltPackageFixture,
+} from "../helpers/package-fixture.js";
 
 type PackResult = Array<{
   filename?: string;
@@ -19,6 +23,7 @@ type ProcessExit = {
 };
 
 const temporaryDirectories: string[] = [];
+let packageFixture: BuiltPackageFixture | undefined;
 const allowedUiFiles = new Set([
   "ui/setup.html",
   "ui/setup.js",
@@ -62,11 +67,18 @@ function packageViolations(paths: readonly string[]): string[] {
   });
 }
 
+function packageFixtureRoot(): string {
+  if (packageFixture === undefined) {
+    throw new Error("built package fixture unavailable");
+  }
+  return packageFixture.root;
+}
+
 function runNpm(args: readonly string[]) {
   const npmCli = process.env.npm_execpath;
   if (npmCli === undefined) throw new Error("npm CLI path unavailable");
   return spawnSync(process.execPath, [npmCli, ...args], {
-    cwd: process.cwd(),
+    cwd: packageFixtureRoot(),
     encoding: "utf8",
     timeout: 60_000,
   });
@@ -145,13 +157,13 @@ function waitForReadiness(
   });
 }
 
-beforeAll(() => {
-  const build = runNpm(["run", "build"]);
-  expect(build.error).toBeUndefined();
-  expect(build.status, `${build.stdout}\n${build.stderr}`).toBe(0);
+beforeAll(async () => {
+  packageFixture = await createBuiltPackageFixture();
 }, 60_000);
 
 afterAll(async () => {
+  await packageFixture?.cleanup();
+  packageFixture = undefined;
   await Promise.all(
     temporaryDirectories.splice(0).map((directory) =>
       rm(directory, { recursive: true, force: true })
