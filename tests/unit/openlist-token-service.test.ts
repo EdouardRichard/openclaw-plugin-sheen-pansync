@@ -188,6 +188,20 @@ describe("OpenListTokenService", () => {
     },
   );
 
+  it("omits a future ISO timestamp that is not an HTTP-date", async () => {
+    const server = await fakeServer({
+      status: 429,
+      headers: { "retry-after": new Date(NOW + 120_000).toISOString() },
+    });
+    const error = await rejectedPanSyncError(() => client().refresh({
+      refreshApiUrl: `${server.baseUrl}/renew`,
+      refreshToken: "refresh-1",
+    }));
+
+    expectSafeError(error, "RATE_LIMITED");
+    expect(error.retryAfterMs).toBeUndefined();
+  });
+
   it("rejects a non-JSON successful response without exposing its content", async () => {
     const server = await fakeServer({ status: 200, body: "not-json-response-CANARY" });
     const error = await rejectedPanSyncError(() => client().refresh({

@@ -10,6 +10,14 @@ export const DEFAULT_OPENLIST_AUTHORIZATION_PAGE_URL = "https://api.oplist.org.c
 export const DEFAULT_OPENLIST_REFRESH_API_URL = "https://api.oplist.org.cn/alicloud/renewapi";
 
 const TOKEN_REQUEST_TIMEOUT_MS = 15_000;
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
+const MONTHS = [
+  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+] as const;
+const OBSOLETE_WEEKDAYS = [
+  "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+] as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -17,6 +25,108 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
+}
+
+function httpDateTimestamp(
+  weekday: string,
+  day: string,
+  month: string,
+  year: string,
+  hour: string,
+  minute: string,
+  second: string,
+): number | undefined {
+  const weekdayIndex = WEEKDAYS.indexOf(weekday as typeof WEEKDAYS[number]);
+  const monthIndex = MONTHS.indexOf(month as typeof MONTHS[number]);
+  const numeric = [day, year, hour, minute, second].map(Number);
+  const [numericDay, numericYear, numericHour, numericMinute, numericSecond] = numeric;
+  if (
+    weekdayIndex < 0
+    || monthIndex < 0
+    || numericDay === undefined
+    || numericYear === undefined
+    || numericHour === undefined
+    || numericMinute === undefined
+    || numericSecond === undefined
+    || numericDay < 1
+    || numericHour > 23
+    || numericMinute > 59
+    || numericSecond > 59
+  ) {
+    return undefined;
+  }
+
+  const timestamp = Date.UTC(
+    numericYear,
+    monthIndex,
+    numericDay,
+    numericHour,
+    numericMinute,
+    numericSecond,
+  );
+  const parsed = new Date(timestamp);
+  if (
+    parsed.getUTCFullYear() !== numericYear
+    || parsed.getUTCMonth() !== monthIndex
+    || parsed.getUTCDate() !== numericDay
+    || parsed.getUTCDay() !== weekdayIndex
+  ) {
+    return undefined;
+  }
+  return timestamp;
+}
+
+function parseHttpDate(value: string, now: number): number | undefined {
+  const imfFixdate = /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat), (\d{2}) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (\d{4}) (\d{2}):(\d{2}):(\d{2}) GMT$/.exec(value);
+  if (imfFixdate !== null) {
+    return httpDateTimestamp(
+      imfFixdate[1] ?? "",
+      imfFixdate[2] ?? "",
+      imfFixdate[3] ?? "",
+      imfFixdate[4] ?? "",
+      imfFixdate[5] ?? "",
+      imfFixdate[6] ?? "",
+      imfFixdate[7] ?? "",
+    );
+  }
+
+  const rfc850Date = /^(Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday), (\d{2})-(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-(\d{2}) (\d{2}):(\d{2}):(\d{2}) GMT$/.exec(value);
+  if (rfc850Date !== null) {
+    const weekday = rfc850Date[1] ?? "";
+    const weekdayIndex = OBSOLETE_WEEKDAYS.indexOf(
+      weekday as typeof OBSOLETE_WEEKDAYS[number],
+    );
+    const yearSuffix = Number(rfc850Date[4]);
+    const currentYear = new Date(now).getUTCFullYear();
+    let year = Math.floor(currentYear / 100) * 100 + yearSuffix;
+    if (year > currentYear + 50) {
+      year -= 100;
+    }
+    return httpDateTimestamp(
+      WEEKDAYS[weekdayIndex] ?? "",
+      rfc850Date[2] ?? "",
+      rfc850Date[3] ?? "",
+      String(year),
+      rfc850Date[5] ?? "",
+      rfc850Date[6] ?? "",
+      rfc850Date[7] ?? "",
+    );
+  }
+
+  const asctimeDate = /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) {1,2}(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) (\d{4})$/.exec(value);
+  if (asctimeDate !== null) {
+    return httpDateTimestamp(
+      asctimeDate[1] ?? "",
+      asctimeDate[3] ?? "",
+      asctimeDate[2] ?? "",
+      asctimeDate[7] ?? "",
+      asctimeDate[4] ?? "",
+      asctimeDate[5] ?? "",
+      asctimeDate[6] ?? "",
+    );
+  }
+
+  return undefined;
 }
 
 function parseRetryAfter(
@@ -32,8 +142,8 @@ function parseRetryAfter(
     return Number.isSafeInteger(seconds) ? seconds * 1_000 : undefined;
   }
 
-  const timestamp = Date.parse(value);
-  if (!Number.isFinite(timestamp) || timestamp <= now) {
+  const timestamp = parseHttpDate(value, now);
+  if (timestamp === undefined || timestamp <= now) {
     return undefined;
   }
   return timestamp - now;
