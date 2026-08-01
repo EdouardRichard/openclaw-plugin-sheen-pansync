@@ -15,11 +15,15 @@ export type PanSyncErrorCode =
 
 export class PanSyncError extends Error {
   readonly code: PanSyncErrorCode;
+  readonly retryAfterMs?: number;
 
-  constructor(code: PanSyncErrorCode) {
+  constructor(code: PanSyncErrorCode, options: { retryAfterMs?: number } = {}) {
     super(code);
     this.name = "PanSyncError";
     this.code = code;
+    if (options.retryAfterMs !== undefined) {
+      this.retryAfterMs = options.retryAfterMs;
+    }
   }
 }
 
