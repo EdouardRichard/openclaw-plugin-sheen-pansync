@@ -2,13 +2,14 @@
 
 - 日期：2026-08-02
 - 审查基线：`2bd0cdb6217cab6f3bb3bfed09727d8d7423c1bb`
-- 修复提交：`d966ef66b354ad7ccbc394b401f2d1ed36329ff6`
-- 范围：最终代码审查中的 2 个 Important 与 2 个 Minor
+- 第 1 轮修复提交：`d966ef66b354ad7ccbc394b401f2d1ed36329ff6`
+- 第 2 轮修复提交：`6d27a1a620f875b5f01b45eb27b48aaae5609c92`
+- 范围：初次最终代码审查中的 2 个 Important 与 2 个 Minor，以及第 2 轮审查中的 1 个 Important
 - 边界：未改变既有 URL/fetch 信任边界、Token 泄漏边界、Aliyun 直传架构或发布验收结论；未执行真实账号验收。
 
 ## 结论
 
-四项审查发现均已修复并由聚焦测试覆盖。Node.js 22.23.1 下的 fresh `npm run verify` 通过：unit 221 通过、1 个既有 Win32 平台 skip；integration 101 通过；build 与 npm pack dry-run 通过，包共 81 个文件。
+两轮共五项审查发现均已修复并由聚焦测试覆盖。Node.js 22.23.1 下的 fresh `npm run verify` 通过：unit 221 通过、1 个既有 Win32 平台 skip；integration 102 通过；build 与 npm pack dry-run 通过，包共 81 个文件。
 
 ## Important 1：Retry-After 持久冷却边界
 
@@ -81,6 +82,39 @@ package integration 新增 tarball 门禁后，修复前得到 3 个预期失败
 
 GREEN 结果：package integration 7/7 通过；npm pack dry-run 明确包含该 guide。
 
+## Round 2 Important：integration package artifact 隔离
+
+### 根因
+
+Vitest 默认并行执行测试文件。`package.test.ts` 的 `beforeAll` 与 `plugin-entry.test.ts` 的 installed-artifact 用例分别在各自 worker 中执行 checkout 级 `npm run build`。两个 build 都先由 `clean-dist.mjs` 递归删除同一个工作树 `dist`，再写入并从该目录打包，因此一个 producer 可以删除或打包另一个 producer 的部分产物。
+
+### RED
+
+先将两处现有 build producer 原样抽取到共享测试 helper，仍然构建 checkout `dist`。原 package 7/7 与 plugin-entry 13/13 聚焦测试通过，证明该重构没有提前改变 producer 行为。
+
+随后新增确定性并发回归，同时启动两个真实 producer，并要求：
+
+- 两个 producer 都成功；
+- 两个 `artifactDirectory` 的真实路径不同；
+- 两个目录都含完整的 `dist/index.js`。
+
+该测试不依赖循环等待偶发 `ENOTEMPTY`：若破坏性 build 竞态发生，fulfilled 状态断言失败；即使两个 build 偶然都成功，共享 `dist` 的真实路径相同仍会稳定失败。本次 RED 实际结果为 `rejected/fulfilled`，1/1 用例失败。
+
+### GREEN
+
+- 每次 `createBuiltPackageFixture()` 都在系统临时目录创建独立 package fixture。
+- fixture 复制真实 `src`、`scripts`、TypeScript 配置、package metadata、README、UI、Skill 与随包 guide。
+- fixture 临时 junction/symlink 当前已安装的 `node_modules`，仅在自身目录内执行原始 `npm run build`；build 结束立即移除链接。
+- `package.test.ts` 与 `plugin-entry.test.ts` 都从各自不可变的完整 fixture 执行真实 `npm pack`，并继续完成正式 OpenClaw 安装、注册、CLI 与包内容断言。
+- fixture 在 `afterAll`、`afterEach` 或回归测试 `finally` 中清理；压力与最终验证后未发现 `pan-sync-package-fixture-*` 遗留目录。
+
+GREEN 结果：
+
+- 确定性并发回归 1/1 通过，并连续压力运行 10/10 轮通过。
+- package-fixture、package、plugin-entry 默认并行聚焦运行 3 个文件、21/21 通过。
+- 完整 integration 连续压力运行 3/3 轮通过。
+- 未关闭 Vitest 文件并行，也未增加 checkout `dist` 的全局锁。
+
 ## 完整验证
 
 最终 fresh 命令：
@@ -93,15 +127,16 @@ volta run --node 22.23.1 npm run verify
 
 - typecheck：PASS。
 - unit：13 个文件，221 通过，1 个既有 Win32 平台 skip。
-- integration：8 个文件，101 通过。
+- integration：9 个文件，102 通过。
 - build：PASS。
 - npm pack dry-run：PASS，81 个文件，包含 `docs/guides/aliyun-token.md`。
 - `git diff --check`：PASS。
 
-首次完整 verify 曾出现一次与本次修复无关的并行测试构建竞态：`package.test.ts` 与 `plugin-entry.test.ts` 同时执行 build，并发清理未跟踪 `dist/admin` 时 Windows 返回 `ENOTEMPTY`，继而造成包文件缺失的连锁失败。随后完整 integration 101/101 通过，之后 fresh `npm run verify` 全部通过；未为该非稳定、非本次范围问题改动代码。
+第 1 轮首次完整 verify 曾因两个共享 artifact producer 并发清理 `dist/admin` 返回 Windows `ENOTEMPTY`，并造成包文件缺失的连锁失败。第 2 轮用确定性并发 RED 固化该根因，并以独立 fixture 消除共享可变 `dist`。修复后并发压力、三轮完整 integration 与最终 fresh `npm run verify` 均未再出现该错误。
 
 ## 疑虑与外部门
 
 - 30 秒 lease 预算覆盖 15 秒网络上限并提供 15 秒本地提交余量；若宿主文件系统异常阻塞超过该余量，waiter 仍会返回稳定的 lease unavailable 错误，这是有界等待的保留行为。
+- 独立 package fixture 依赖测试环境已安装的 `node_modules`，并要求宿主支持目录 symlink（Windows 使用 junction）；这些条件与当前 Node/npm 测试前置条件一致，Windows 压力验证已通过。
 - installed-package browser pagehide 证据、真实 OpenList/Aliyun 账号验收及既有 release BLOCKED 结论均未在本次代码修复中改写，仍属于独立外部门。
 - 未合并、未推送、未发布，也未执行真实账号操作。
