@@ -157,6 +157,37 @@ describe("OpenListTokenService", () => {
     expect(error.retryAfterMs).toBe(42_000);
   });
 
+  it("preserves a zero-second retry-after as an immediate retry", async () => {
+    const server = await fakeServer({
+      status: 429,
+      headers: { "retry-after": "0" },
+    });
+    const error = await rejectedPanSyncError(() => client().refresh({
+      refreshApiUrl: `${server.baseUrl}/renew`,
+      refreshToken: "refresh-1",
+    }));
+
+    expectSafeError(error, "RATE_LIMITED");
+    expect(error.retryAfterMs).toBe(0);
+  });
+
+  it.each([
+    ["overflows when converted to milliseconds", "9007199254741"],
+    ["would exceed the JavaScript Date range", "8640000000000"],
+  ])("omits a delta-seconds retry-after that %s", async (_reason, retryAfter) => {
+    const server = await fakeServer({
+      status: 429,
+      headers: { "retry-after": retryAfter },
+    });
+    const error = await rejectedPanSyncError(() => client().refresh({
+      refreshApiUrl: `${server.baseUrl}/renew`,
+      refreshToken: "refresh-1",
+    }));
+
+    expectSafeError(error, "RATE_LIMITED");
+    expect(error.retryAfterMs).toBeUndefined();
+  });
+
   it("parses an HTTP-date retry-after relative to the injected clock", async () => {
     const server = await fakeServer({
       status: 429,

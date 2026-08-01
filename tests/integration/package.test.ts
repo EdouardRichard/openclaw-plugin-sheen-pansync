@@ -84,6 +84,14 @@ function readPackedText(tarball: string, packagePath: string): string {
   return extracted.stdout;
 }
 
+function localMarkdownTargets(markdown: string): string[] {
+  return [...markdown.matchAll(/\[[^\]]+\]\(([^)]+)\)/gu)]
+    .flatMap((match) => match[1] === undefined ? [] : [match[1]])
+    .filter((target) => !target.startsWith("#") && !/^[a-z][a-z0-9+.-]*:/iu.test(target))
+    .map((target) => normalizePackagePath(target.split(/[?#]/u, 1)[0] ?? ""))
+    .filter((target) => target.length > 0);
+}
+
 function waitForExit(child: ChildProcessWithoutNullStreams): Promise<ProcessExit> {
   return new Promise((resolve) => {
     child.once("exit", (code, signal) => resolve({ code, signal }));
@@ -172,6 +180,7 @@ describe("published package", () => {
       "skills/pan-sync-upload/SKILL.md",
       "openclaw.plugin.json",
       "README.md",
+      "docs/guides/aliyun-token.md",
     ];
     for (const entry of required) {
       expect(paths, `missing package entry: ${entry}`).toContain(entry);
@@ -181,9 +190,37 @@ describe("published package", () => {
     expect(paths.filter((entry) => /(?:canary|fixture|vault)/iu.test(entry))).toEqual([]);
   });
 
+  it("ships every local documentation target linked by the packed README", async () => {
+    const packDirectory = await mkdtemp(path.join(tmpdir(), "pan-sync-readme-links-"));
+    temporaryDirectories.push(packDirectory);
+    const packed = runNpm([
+      "pack",
+      "--json",
+      "--pack-destination",
+      packDirectory,
+    ]);
+    expect(packed.error).toBeUndefined();
+    expect(packed.status, `${packed.stdout}\n${packed.stderr}`).toBe(0);
+    const report = JSON.parse(packed.stdout) as PackResult;
+    const filename = report[0]?.filename;
+    expect(filename).toBeTypeOf("string");
+    const tarball = path.join(packDirectory, path.basename(filename ?? ""));
+    const readme = readPackedText(tarball, "README.md");
+    const targets = localMarkdownTargets(readme);
+
+    expect(targets).not.toEqual([]);
+    for (const target of targets) {
+      expect(
+        () => readPackedText(tarball, target),
+        `missing packed README target: ${target}`,
+      ).not.toThrow();
+    }
+  });
+
   it("keeps personal OAuth credential guidance out of the generated package assets", async () => {
     const userFacingFiles = [
       "README.md",
+      "docs/guides/aliyun-token.md",
       "skills/pan-sync-upload/SKILL.md",
       "ui/setup.html",
       "ui/setup.js",

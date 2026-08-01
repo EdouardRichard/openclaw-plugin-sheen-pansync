@@ -84,6 +84,66 @@ function listenerCount(worker: FakeWorker): number {
 }
 
 describe("SQLite Worker credential lease", () => {
+  it("keeps a waiter alive beyond a near-timeout refresh and commit", async () => {
+    const workers: FakeWorker[] = [];
+    const acquisitionBudgets: number[] = [];
+    const workerFactory: SqliteLeaseWorkerFactory = (options) => {
+      acquisitionBudgets.push(options.acquisitionTimeoutMs);
+      const worker = new FakeWorker();
+      workers.push(worker);
+      return worker;
+    };
+    const runner = createSqliteWorkerCredentialLeaseRunner(
+      await tempDatabasePath(),
+      { workerFactory },
+    );
+    const allowWinnerCommit = deferred();
+    let winnerEntered = false;
+    let waiterEntered = false;
+
+    const winner = runner("aliyun-token-refresh", async () => {
+      winnerEntered = true;
+      await allowWinnerCommit.promise;
+      return "winner";
+    });
+    await waitFor(() => workers.length === 1);
+    workers[0]!.message("acquired");
+    await waitFor(() => winnerEntered);
+
+    const waiter = runner("aliyun-token-refresh", async () => {
+      waiterEntered = true;
+      return "waiter";
+    });
+    const waiterOutcome = waiter.then(
+      (value) => ({ status: "fulfilled" as const, value }),
+      (reason: unknown) => ({ status: "rejected" as const, reason }),
+    );
+    await waitFor(() => workers.length === 2);
+
+    const fullRefreshCriticalSectionMs = 15_001;
+    if (acquisitionBudgets[1]! <= fullRefreshCriticalSectionMs) {
+      workers[1]!.message("failed");
+    }
+    allowWinnerCommit.resolve();
+    await waitFor(() => workers[0]!.posted.some(({ type }) => type === "release"));
+    workers[0]!.message("released");
+    workers[0]!.exited(0);
+    await expect(winner).resolves.toBe("winner");
+
+    if (acquisitionBudgets[1]! > fullRefreshCriticalSectionMs) {
+      workers[1]!.message("acquired");
+      await waitFor(() => workers[1]!.posted.some(({ type }) => type === "release"));
+      workers[1]!.message("released");
+      workers[1]!.exited(0);
+    }
+
+    await expect(waiterOutcome).resolves.toEqual({
+      status: "fulfilled",
+      value: "waiter",
+    });
+    expect(waiterEntered).toBe(true);
+  });
+
   it("starts the callback only after acquisition and resolves after rollback, close, and Worker exit", async () => {
     const workers: FakeWorker[] = [];
     const runner = createSqliteWorkerCredentialLeaseRunner(
@@ -325,7 +385,7 @@ describe("SQLite Worker credential lease", () => {
     expect(factoryOptions).toEqual({
       databasePath,
       busyTimeoutMs: 200,
-      acquisitionTimeoutMs: 15_000,
+      acquisitionTimeoutMs: 30_000,
       cancellationBuffer: expect.any(SharedArrayBuffer),
     });
   });

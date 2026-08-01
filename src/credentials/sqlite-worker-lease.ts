@@ -9,7 +9,7 @@ import type {
 const DIRECTORY_MODE = 0o700;
 const DATABASE_MODE = 0o600;
 const BUSY_TIMEOUT_MS = 200;
-const ACQUISITION_TIMEOUT_MS = 15_000;
+const ACQUISITION_TIMEOUT_MS = 30_000;
 const SAFE_KEY = /^[A-Za-z0-9._-]{1,64}$/u;
 const UNAVAILABLE = "credential lease unavailable";
 const OWNERSHIP_LOST = "credential lease ownership lost";

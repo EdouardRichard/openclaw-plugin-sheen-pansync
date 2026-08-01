@@ -18,6 +18,11 @@ type ChildMessage = {
   code?: string;
 };
 
+type ChildClose = {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+};
+
 const execFileAsync = promisify(execFile);
 const children = new Set<ChildProcess>();
 let buildCleanup: (() => Promise<void>) | undefined;
@@ -92,6 +97,7 @@ function moduleUrl(...segments: string[]): string {
 
 function startChild(dataDir: string, databasePath: string): {
   child: ChildProcess;
+  closed: Promise<ChildClose>;
   messages: ChildMessage[];
   stderr: string[];
 } {
@@ -127,12 +133,15 @@ function startChild(dataDir: string, databasePath: string): {
     },
   );
   children.add(child);
+  const closed = new Promise<ChildClose>((resolve) => {
+    child.once("close", (code, signal) => resolve({ code, signal }));
+  });
   const messages: ChildMessage[] = [];
   const stderr: string[] = [];
   child.on("message", (message) => messages.push(message as ChildMessage));
   child.stderr?.setEncoding("utf8");
   child.stderr?.on("data", (chunk: string) => stderr.push(chunk));
-  return { child, messages, stderr };
+  return { child, closed, messages, stderr };
 }
 
 async function waitForCondition(
@@ -152,13 +161,6 @@ async function waitForType(
 ): Promise<ChildMessage> {
   await waitForCondition(() => messages.some((message) => message.type === type));
   return messages.find((message) => message.type === type)!;
-}
-
-async function waitForExit(child: ChildProcess): Promise<void> {
-  await waitForCondition(
-    () => child.exitCode !== null || child.signalCode !== null,
-  );
-  children.delete(child);
 }
 
 async function withOpenList(
@@ -223,7 +225,14 @@ async function runTwoChildren(
     waitForType(second.messages, "refreshing"),
   ]);
   releaseResponse();
-  await Promise.all([waitForExit(first.child), waitForExit(second.child)]);
+  const [firstClose, secondClose] = await Promise.all([
+    first.closed,
+    second.closed,
+  ]);
+  children.delete(first.child);
+  children.delete(second.child);
+  expect(firstClose).toEqual({ code: 0, signal: null });
+  expect(secondClose).toEqual({ code: 0, signal: null });
   expect([...first.stderr, ...second.stderr].join(""), "child stderr").toBe("");
   return [
     first.messages.find(({ type }) => type === "result" || type === "error")!,

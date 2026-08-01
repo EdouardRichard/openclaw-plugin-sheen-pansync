@@ -315,6 +315,26 @@ describe("TokenManager", () => {
       },
     ],
     [
+      "RATE_LIMITED with an immediate Retry-After",
+      new PanSyncError("RATE_LIMITED", { retryAfterMs: 0 }),
+      {
+        status: "rate_limited",
+        notBefore: "2026-08-01T12:00:00.000Z",
+        failureCode: "RATE_LIMITED",
+      },
+    ],
+    [
+      "RATE_LIMITED with an out-of-Date-range Retry-After",
+      new PanSyncError("RATE_LIMITED", {
+        retryAfterMs: 8_640_000_000_000_000,
+      }),
+      {
+        status: "rate_limited",
+        notBefore: "2026-08-01T13:00:00.000Z",
+        failureCode: "RATE_LIMITED",
+      },
+    ],
+    [
       "RATE_LIMITED without Retry-After",
       new PanSyncError("RATE_LIMITED"),
       {

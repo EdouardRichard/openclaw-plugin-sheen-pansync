@@ -7,6 +7,7 @@ import type {
 } from "./types.js";
 
 const TOKEN_REQUEST_TIMEOUT_MS = 15_000;
+const MAX_DATE_TIMESTAMP_MS = 8_640_000_000_000_000;
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
 const MONTHS = [
   "Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -136,7 +137,16 @@ function parseRetryAfter(
 
   if (/^\d+$/.test(value)) {
     const seconds = Number(value);
-    return Number.isSafeInteger(seconds) ? seconds * 1_000 : undefined;
+    if (!Number.isSafeInteger(seconds)) {
+      return undefined;
+    }
+    const milliseconds = seconds * 1_000;
+    const notBefore = now + milliseconds;
+    return Number.isSafeInteger(milliseconds)
+      && Number.isSafeInteger(notBefore)
+      && Math.abs(notBefore) <= MAX_DATE_TIMESTAMP_MS
+      ? milliseconds
+      : undefined;
   }
 
   const timestamp = parseHttpDate(value, now);

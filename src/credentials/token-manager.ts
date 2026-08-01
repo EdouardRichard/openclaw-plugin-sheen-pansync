@@ -8,6 +8,7 @@ import type { CredentialRecord, RefreshState } from "./types.js";
 const REFRESH_LEASE_KEY = "aliyun-token-refresh";
 const RATE_LIMIT_FALLBACK_MS = 60 * 60 * 1_000;
 const TRANSIENT_FAILURE_COOLDOWN_MS = 60 * 1_000;
+const MAX_DATE_TIMESTAMP_MS = 8_640_000_000_000_000;
 
 export type TokenManagerStatus =
   | "unconfigured"
@@ -60,6 +61,31 @@ function cancellationError(): PanSyncError {
 
 function cancellationRequested(signal: AbortSignal | undefined): boolean {
   return signal?.aborted === true;
+}
+
+function isRepresentableDateTimestamp(value: number): boolean {
+  return Number.isSafeInteger(value)
+    && Math.abs(value) <= MAX_DATE_TIMESTAMP_MS;
+}
+
+function cooldownNotBefore(
+  now: number,
+  requestedDelayMs: number | undefined,
+  fallbackDelayMs: number,
+): string {
+  const requestedTarget = requestedDelayMs === undefined
+    ? Number.NaN
+    : now + requestedDelayMs;
+  const delayMs = Number.isSafeInteger(requestedDelayMs)
+    && requestedDelayMs! >= 0
+    && isRepresentableDateTimestamp(requestedTarget)
+    ? requestedDelayMs!
+    : fallbackDelayMs;
+  const fallbackTarget = now + delayMs;
+  const notBefore = isRepresentableDateTimestamp(fallbackTarget)
+    ? fallbackTarget
+    : MAX_DATE_TIMESTAMP_MS;
+  return new Date(notBefore).toISOString();
 }
 
 export function makeReentrantCredentialLeaseRunner(
@@ -402,13 +428,13 @@ export class TokenManager {
 
   #refreshFailureState(error: PanSyncError): RefreshState {
     if (error.code === "RATE_LIMITED") {
-      const retryAfterMs = Number.isSafeInteger(error.retryAfterMs)
-        && (error.retryAfterMs ?? 0) > 0
-        ? error.retryAfterMs!
-        : RATE_LIMIT_FALLBACK_MS;
       return {
         status: "rate_limited",
-        notBefore: new Date(this.#clock() + retryAfterMs).toISOString(),
+        notBefore: cooldownNotBefore(
+          this.#clock(),
+          error.retryAfterMs,
+          RATE_LIMIT_FALLBACK_MS,
+        ),
         failureCode: "RATE_LIMITED",
       };
     }
@@ -420,9 +446,11 @@ export class TokenManager {
     }
     return {
       status: "degraded",
-      notBefore: new Date(
-        this.#clock() + TRANSIENT_FAILURE_COOLDOWN_MS,
-      ).toISOString(),
+      notBefore: cooldownNotBefore(
+        this.#clock(),
+        TRANSIENT_FAILURE_COOLDOWN_MS,
+        TRANSIENT_FAILURE_COOLDOWN_MS,
+      ),
       failureCode: "TOKEN_ENDPOINT_UNAVAILABLE",
     };
   }

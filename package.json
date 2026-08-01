@@ -16,6 +16,7 @@
     "dist",
     "ui",
     "skills",
+    "docs/guides/aliyun-token.md",
     "openclaw.plugin.json",
     "README.md"
   ],
