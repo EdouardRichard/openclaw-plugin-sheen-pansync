@@ -70,10 +70,22 @@ async function rejectedPanSyncError(
 describe("AliyunProvider credential validation", () => {
   it.each([
     ["authorization page URL", { authorizationPageUrl: "" }],
+    ["whitespace authorization page URL", { authorizationPageUrl: " \t\n " }],
     ["refresh API URL", { refreshApiUrl: "x".repeat(4097) }],
+    ["whitespace refresh API URL", { refreshApiUrl: " \t\n " }],
     ["refresh token", { refreshToken: "" }],
+    ["whitespace refresh token", { refreshToken: " \t\n " }],
   ] as const)("rejects an invalid %s before contacting OpenList", async (_name, override) => {
-    const server = await fakeServer([]);
+    const server = await fakeServer([
+      {
+        status: 200,
+        body: {
+          access_token: "access-must-not-be-used",
+          refresh_token: "refresh-must-not-be-used",
+        },
+      },
+      driveInfo(),
+    ]);
     const error = await rejectedPanSyncError(() => provider(server).validateCredentials({
       authorizationPageUrl: "http://auth.example.test/custom",
       refreshApiUrl: `${server.baseUrl}/custom/renew`,

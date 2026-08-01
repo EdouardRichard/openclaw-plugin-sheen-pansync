@@ -61,7 +61,7 @@ function requiredCandidate(
   ];
   if (fields.some((field) =>
     typeof field !== "string"
-    || field.length === 0
+    || field.trim().length === 0
     || field.length > MAX_CREDENTIAL_FIELD_LENGTH
   )) {
     throw new PanSyncError("CREDENTIALS_INVALID");

@@ -165,6 +165,10 @@ async function outcomeWithin<T>(promise: Promise<T>): Promise<PromiseOutcome<T>>
   ]);
 }
 
+async function flushTurn(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
 async function rejectedPanSyncError(
   run: () => Promise<unknown>,
 ): Promise<PanSyncError> {
@@ -351,6 +355,104 @@ describe("TokenManager", () => {
       reason: expect.objectContaining({ code: "TOKEN_ENDPOINT_UNAVAILABLE" }),
     });
     expect(refresh.calls()).toBe(1);
+  });
+
+  it("lets an unsignaled joiner survive cancellation of the first subscriber", async () => {
+    const store = memoryVault(record());
+    const refresh = controlledRefresh();
+    const manager = new TokenManager({
+      store: store.vault,
+      tokenService: refresh.tokenService,
+    });
+    const leaderController = new AbortController();
+    const leader = manager.forceRefresh(undefined, {
+      signal: leaderController.signal,
+    });
+    await refresh.started;
+    const joiner = manager.forceRefresh();
+    await flushTurn();
+
+    leaderController.abort();
+    const leaderOutcome = await outcomeWithin(leader);
+    const upstreamWasAborted = refresh.input()?.signal?.aborted;
+    refresh.succeed();
+    const joinerOutcome = await outcomeWithin(joiner);
+
+    expect(leaderOutcome).toEqual({
+      status: "rejected",
+      reason: expect.objectContaining({ code: "TOKEN_ENDPOINT_UNAVAILABLE" }),
+    });
+    expect(upstreamWasAborted).toBe(false);
+    expect(joinerOutcome).toEqual({
+      status: "fulfilled",
+      value: "access-2",
+    });
+    expect(refresh.calls()).toBe(1);
+    expect(store.current()).toMatchObject({
+      credentialVersion: 2,
+      accessToken: "access-2",
+      refreshToken: "refresh-2",
+    });
+  });
+
+  it("broadcasts one shared refresh failure to every live subscriber", async () => {
+    const initial = record();
+    const store = memoryVault(initial);
+    const refresh = controlledRefresh();
+    const manager = new TokenManager({
+      store: store.vault,
+      tokenService: refresh.tokenService,
+    });
+    const first = manager.forceRefresh();
+    await refresh.started;
+    const second = manager.forceRefresh();
+    await flushTurn();
+    const failure = new PanSyncError("TOKEN_ENDPOINT_UNAVAILABLE");
+
+    refresh.fail(failure);
+    const outcomes = await Promise.allSettled([first, second]);
+
+    expect(outcomes).toEqual([
+      { status: "rejected", reason: failure },
+      { status: "rejected", reason: failure },
+    ]);
+    expect(refresh.calls()).toBe(1);
+    expect(store.current()).toBe(initial);
+    await expect(manager.status()).resolves.toBe("ready");
+  });
+
+  it("removes every caller abort listener after a shared refresh settles", async () => {
+    const store = memoryVault(record());
+    const refresh = controlledRefresh();
+    const manager = new TokenManager({
+      store: store.vault,
+      tokenService: refresh.tokenService,
+    });
+    const firstController = new AbortController();
+    const secondController = new AbortController();
+    const firstAdded = vi.spyOn(firstController.signal, "addEventListener");
+    const firstRemoved = vi.spyOn(firstController.signal, "removeEventListener");
+    const secondAdded = vi.spyOn(secondController.signal, "addEventListener");
+    const secondRemoved = vi.spyOn(secondController.signal, "removeEventListener");
+    const first = manager.forceRefresh(undefined, {
+      signal: firstController.signal,
+    });
+    await refresh.started;
+    const second = manager.forceRefresh(undefined, {
+      signal: secondController.signal,
+    });
+    await flushTurn();
+
+    refresh.succeed();
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      "access-2",
+      "access-2",
+    ]);
+
+    expect(firstAdded).toHaveBeenCalledTimes(1);
+    expect(firstRemoved).toHaveBeenCalledTimes(1);
+    expect(secondAdded).toHaveBeenCalledTimes(1);
+    expect(secondRemoved).toHaveBeenCalledTimes(1);
   });
 
   it("aborts the shared refresh when its only subscriber cancels", async () => {
