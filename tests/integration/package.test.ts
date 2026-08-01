@@ -72,6 +72,18 @@ function runNpm(args: readonly string[]) {
   });
 }
 
+function readPackedText(tarball: string, packagePath: string): string {
+  const extracted = spawnSync(
+    "tar",
+    ["-xOf", tarball, `package/${packagePath}`],
+    { encoding: "utf8", timeout: 10_000 },
+  );
+  if (extracted.error !== undefined || extracted.status !== 0) {
+    throw new Error(`could not read packed asset: ${packagePath}`);
+  }
+  return extracted.stdout;
+}
+
 function waitForExit(child: ChildProcessWithoutNullStreams): Promise<ProcessExit> {
   return new Promise((resolve) => {
     child.once("exit", (code, signal) => resolve({ code, signal }));
@@ -169,20 +181,34 @@ describe("published package", () => {
     expect(paths.filter((entry) => /(?:canary|fixture|vault)/iu.test(entry))).toEqual([]);
   });
 
-  it("keeps personal OAuth credential guidance out of shipped user-facing assets", async () => {
+  it("keeps personal OAuth credential guidance out of the generated package assets", async () => {
     const userFacingFiles = [
       "README.md",
       "skills/pan-sync-upload/SKILL.md",
       "ui/setup.html",
       "ui/setup.js",
+      "ui/setup.css",
     ];
-    const contents = await Promise.all(userFacingFiles.map((file) =>
-      readFile(new URL(`../../${file}`, import.meta.url), "utf8")
-    ));
+    const packDirectory = await mkdtemp(path.join(tmpdir(), "pan-sync-packed-assets-"));
+    temporaryDirectories.push(packDirectory);
+    const packed = runNpm([
+      "pack",
+      "--json",
+      "--pack-destination",
+      packDirectory,
+    ]);
+    expect(packed.error).toBeUndefined();
+    expect(packed.status, `${packed.stdout}\n${packed.stderr}`).toBe(0);
+    const report = JSON.parse(packed.stdout) as PackResult;
+    const filename = report[0]?.filename;
+    expect(filename).toBeTypeOf("string");
+    const tarball = path.join(packDirectory, path.basename(filename ?? ""));
+    const contents = userFacingFiles.map((file) => readPackedText(tarball, file));
 
     for (const content of contents) {
       expect(content).not.toMatch(/client[ _-]?(?:id|secret)/iu);
       expect(content).not.toMatch(/oauth\/access_token/iu);
+      expect(content).not.toContain("shipped-custom-url-CANARY-e193");
     }
   });
 

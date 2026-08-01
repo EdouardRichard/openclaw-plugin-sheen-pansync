@@ -13,6 +13,7 @@ import type {
 } from "openclaw/plugin-sdk/plugin-entry";
 import { startSetupServer, type SetupServer } from "../../src/admin/setup-server.js";
 import { createPanSyncStatusRoute } from "../../src/admin/status-route.js";
+import { CredentialStore } from "../../src/credentials/store.js";
 import { TokenManager, type TokenCredentialVault } from "../../src/credentials/token-manager.js";
 import type { CredentialRecord } from "../../src/credentials/types.js";
 import { createPanSyncPluginEntry } from "../../src/index.js";
@@ -326,13 +327,44 @@ async function exercisePluginLoggerBoundary(
     error(...values: unknown[]): unknown;
   },
 ): Promise<void> {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input) => {
+    const requestUrl = new URL(
+      input instanceof URL
+        ? input.href
+        : typeof input === "string"
+        ? input
+        : input.url,
+    );
+    const sensitiveBody = JSON.stringify({
+      code: "AccessTokenExpired",
+      message: `${REFRESH_TOKEN} ${ACCESS_TOKEN} ${AUTHORIZATION_PAGE_URL} ${REFRESH_API_URL_PATH} ${OPENLIST_ERROR_TEXT}`,
+    });
+    if (requestUrl.pathname.includes(REFRESH_API_URL_PATH)) {
+      return new Response(sensitiveBody, {
+        status: 503,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(sensitiveBody, {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof globalThis.fetch;
+
+  const seedStore = new CredentialStore(
+    path.join(stateDir, "pan-sync-helper"),
+    async (_key, run) => run({ assertOwned: async () => undefined }),
+  );
+  await seedStore.replace(record());
   let toolFactory: OpenClawPluginToolFactory | undefined;
   let service: OpenClawPluginService | undefined;
-  const entry = createPanSyncPluginEntry({
-    credentialLeaseFactory: () => async (_key, run) =>
-      run({ assertOwned: async () => undefined }),
-  });
-  const api = {
+  try {
+    const entry = createPanSyncPluginEntry({
+      credentialLeaseFactory: () => async (_key, run) =>
+        run({ assertOwned: async () => undefined }),
+    });
+    const api = {
     id: "pan-sync-helper",
     name: "Pan Sync Helper",
     source: "leakage-gate",
@@ -351,16 +383,15 @@ async function exercisePluginLoggerBoundary(
     session: {
       controls: { registerControlUiDescriptor() {} },
     },
-  } as unknown as OpenClawPluginApi;
-  if (entry.register === undefined) throw new Error("plugin register missing");
-  entry.register(api);
-  if (toolFactory === undefined || service === undefined) {
-    throw new Error("plugin runtime registration missing");
-  }
+    } as unknown as OpenClawPluginApi;
+    if (entry.register === undefined) throw new Error("plugin register missing");
+    entry.register(api);
+    if (toolFactory === undefined || service === undefined) {
+      throw new Error("plugin runtime registration missing");
+    }
 
-  const context = { config: {}, stateDir, logger } as never;
-  await service.start(context);
-  try {
+    const context = { config: {}, stateDir, logger } as never;
+    await service.start(context);
     const tool = toolFactory({ workspaceDir } as never);
     if (tool === null || tool === undefined || Array.isArray(tool)) {
       throw new Error("plugin registered an invalid Tool boundary");
@@ -368,9 +399,13 @@ async function exercisePluginLoggerBoundary(
     const result = await tool.execute("plugin-logger-boundary", {
       paths: ["report.txt"],
     });
-    expect(result.details).toEqual({ code: "CREDENTIALS_REQUIRED" });
+    assertNoProtectedArguments([result]);
+    expect(result.details).toEqual({ code: "TOKEN_ENDPOINT_UNAVAILABLE" });
   } finally {
-    await service.stop?.(context);
+    if (service !== undefined) {
+      await service.stop?.({ config: {}, stateDir, logger } as never);
+    }
+    globalThis.fetch = originalFetch;
   }
 }
 
@@ -725,26 +760,31 @@ describe("release leakage canaries", () => {
       [429, "RATE_LIMITED"],
       [503, "TOKEN_ENDPOINT_UNAVAILABLE"],
     ] as const) {
-      const refreshFailureServer = await startFakeAliyunServer({
-        status,
-        body: { message: OPENLIST_ERROR_TEXT },
-      });
-      aliyunServers.push(refreshFailureServer);
+      const refreshFailureResponse = { status, body: { message: OPENLIST_ERROR_TEXT } };
+      const refreshServer = await startFakeAliyunServer([
+        {
+          status: 401,
+          body: {
+            code: "AccessTokenExpired",
+            message: `${REFRESH_TOKEN} ${ACCESS_TOKEN} ${AUTHORIZATION_PAGE_URL} ${REFRESH_API_URL_PATH} ${OPENLIST_ERROR_TEXT}`,
+          },
+        },
+        refreshFailureResponse,
+      ]);
+      aliyunServers.push(refreshServer);
       const runtime = orchestratorFor(
-        refreshFailureServer,
+        refreshServer,
         memoryVault({
           ...record(),
-          refreshApiUrl: `${refreshFailureServer.baseUrl}${REFRESH_API_URL_PATH}`,
+          refreshApiUrl: `${refreshServer.baseUrl}${REFRESH_API_URL_PATH}`,
         }),
       );
-      try {
-        await runtime.tokenManager.forceRefresh(ACCESS_TOKEN);
-        throw new Error("OpenList refresh unexpectedly succeeded");
-      } catch (error) {
-        expect(String(error)).not.toContain(OPENLIST_ERROR_TEXT);
-        expect(String(error)).not.toContain(REFRESH_API_URL_PATH);
-        expect(error).toMatchObject({ code: expectedCode });
-      }
+      const result = await toolFor(runtime.orchestrator, workspace).execute(
+        `openlist-${status}-failure`,
+        { paths: ["report.txt"] },
+      );
+      assertNoProtectedArguments([result]);
+      expect(result.details).toEqual({ code: expectedCode });
     }
 
     const refreshServer = await startFakeAliyunServer({
