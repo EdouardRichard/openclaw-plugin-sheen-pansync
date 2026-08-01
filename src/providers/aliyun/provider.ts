@@ -9,8 +9,7 @@ import type {
 import type { CredentialRecord } from "../../credentials/types.js";
 import { PanSyncError } from "../../errors.js";
 import { normalizeRemoteDirectory } from "../../workspace/path-guard.js";
-import type { AliyunHttpClient } from "./http.js";
-import type { AliyunFetch } from "./types.js";
+import type { AliyunFetch, AliyunTokenService } from "./types.js";
 import {
   AliyunAuthorizedClient,
   type AliyunProviderUploadInput,
@@ -21,12 +20,14 @@ import {
 } from "./upload.js";
 
 export type AliyunProviderOptions = {
-  httpClient: Pick<AliyunHttpClient, "refreshToken">;
+  tokenService: AliyunTokenService;
   tokenManager: AliyunTokenRefresher;
   baseUrl?: string;
   fetch?: AliyunFetch;
   clock?: () => number;
 };
+
+const MAX_CREDENTIAL_FIELD_LENGTH = 4096;
 
 type DriveSummary = {
   driveId: string;
@@ -53,14 +54,16 @@ function nonEmptyString(
 function requiredCandidate(
   candidate: CredentialInput,
 ): CredentialInput {
-  if (
-    typeof candidate.clientId !== "string"
-    || candidate.clientId.length === 0
-    || typeof candidate.clientSecret !== "string"
-    || candidate.clientSecret.length === 0
-    || typeof candidate.refreshToken !== "string"
-    || candidate.refreshToken.length === 0
-  ) {
+  const fields = [
+    candidate.authorizationPageUrl,
+    candidate.refreshApiUrl,
+    candidate.refreshToken,
+  ];
+  if (fields.some((field) =>
+    typeof field !== "string"
+    || field.length === 0
+    || field.length > MAX_CREDENTIAL_FIELD_LENGTH
+  )) {
     throw new PanSyncError("CREDENTIALS_INVALID");
   }
   return candidate;
@@ -167,26 +170,11 @@ export class AliyunProvider implements CloudDriveProvider {
     options: ProviderOperationOptions = {},
   ): Promise<CredentialRecord> {
     const completeCandidate = requiredCandidate(candidate);
-    let refreshed: Awaited<
-      ReturnType<AliyunHttpClient["refreshToken"]>
-    >;
-    try {
-      refreshed = await this.options.httpClient.refreshToken({
-        clientId: completeCandidate.clientId,
-        clientSecret: completeCandidate.clientSecret,
-        refreshToken: completeCandidate.refreshToken,
-        ...(options.signal === undefined ? {} : { signal: options.signal }),
-      });
-    } catch (error) {
-      if (
-        error instanceof PanSyncError
-        && error.code !== "REFRESH_TOKEN_REJECTED"
-        && error.code !== "CREDENTIALS_INVALID"
-      ) {
-        throw error;
-      }
-      throw new PanSyncError("CREDENTIALS_INVALID");
-    }
+    const refreshed = await this.options.tokenService.refresh({
+      refreshApiUrl: completeCandidate.refreshApiUrl,
+      refreshToken: completeCandidate.refreshToken,
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    });
 
     const driveResponse = await this.#api.post(
       "/adrive/v1.0/user/getDriveInfo",
@@ -207,17 +195,15 @@ export class AliyunProvider implements CloudDriveProvider {
         : { displayNameMasked: maskDisplayName(drive.displayName) }),
     };
     return {
-      formatVersion: 1,
+      formatVersion: 2,
       credentialVersion: completeCandidate.credentialVersion ?? 1,
-      clientId: completeCandidate.clientId,
-      clientSecret: completeCandidate.clientSecret,
+      authorizationPageUrl: completeCandidate.authorizationPageUrl,
+      refreshApiUrl: completeCandidate.refreshApiUrl,
       refreshToken: refreshed.refreshToken,
       accessToken: refreshed.accessToken,
-      accessTokenExpiresAt: new Date(
-        now + refreshed.expiresInSeconds * 1_000,
-      ).toISOString(),
       account,
       lastVerifiedAt: new Date(now).toISOString(),
+      refreshState: { status: "ready" },
     };
   }
 

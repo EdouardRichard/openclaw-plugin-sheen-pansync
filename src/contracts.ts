@@ -26,8 +26,8 @@ export type PanSyncUploadResult = {
 };
 
 export type CredentialInput = {
-  clientId: string;
-  clientSecret: string;
+  authorizationPageUrl: string;
+  refreshApiUrl: string;
   refreshToken: string;
   credentialVersion?: number;
 };

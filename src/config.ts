@@ -1,9 +1,8 @@
 export type PluginConfig = {
   defaultDirectory: string;
-  tokenGuideUrl?: string | undefined;
 };
 
-const ALLOWED_KEYS = new Set(["defaultDirectory", "tokenGuideUrl"]);
+const ALLOWED_KEYS = new Set(["defaultDirectory"]);
 
 export function resolvePluginConfig(value: unknown): PluginConfig {
   const record =
@@ -19,9 +18,5 @@ export function resolvePluginConfig(value: unknown): PluginConfig {
     typeof record.defaultDirectory === "string"
       ? record.defaultDirectory.trim()
       : "/openClawShare";
-  const tokenGuideUrl =
-    typeof record.tokenGuideUrl === "string" && record.tokenGuideUrl.trim()
-      ? new URL(record.tokenGuideUrl).toString()
-      : undefined;
-  return { defaultDirectory, tokenGuideUrl };
+  return { defaultDirectory };
 }

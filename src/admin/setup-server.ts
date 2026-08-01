@@ -13,6 +13,10 @@ import type { CredentialInput } from "../contracts.js";
 import type { CredentialStore } from "../credentials/store.js";
 import type { CredentialRecord } from "../credentials/types.js";
 import { PanSyncError, safeErrorDetails } from "../errors.js";
+import {
+  DEFAULT_OPENLIST_AUTHORIZATION_PAGE_URL,
+  DEFAULT_OPENLIST_REFRESH_API_URL,
+} from "../providers/aliyun/constants.js";
 import type { AliyunProvider } from "../providers/aliyun/provider.js";
 import type { UploadOrchestrator } from "../upload/orchestrator.js";
 import { readSetupPageAssets } from "./setup-page.js";
@@ -56,7 +60,6 @@ export type SetupServerDependencies = {
   clock: () => number;
   randomBytes: (size: number) => Buffer;
   defaultDirectory?: string | undefined;
-  tokenGuideUrl?: string | undefined;
 };
 
 export type SetupServerRuntime = {
@@ -263,40 +266,50 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function parseCredentialInput(value: unknown): Omit<CredentialInput, "credentialVersion"> {
   if (!isRecord(value)) throw new PanSyncError("CREDENTIALS_INVALID");
-  const allowed = new Set(["clientId", "clientSecret", "refreshToken"]);
+  const allowed = new Set(["authorizationPageUrl", "refreshApiUrl", "refreshToken"]);
   if (Object.keys(value).some((key) => !allowed.has(key))) throw new PanSyncError("CREDENTIALS_INVALID");
-  const { clientId, clientSecret, refreshToken } = value;
-  for (const field of [clientId, clientSecret, refreshToken]) {
+  const { authorizationPageUrl, refreshApiUrl, refreshToken } = value;
+  for (const field of [authorizationPageUrl, refreshApiUrl, refreshToken]) {
     if (typeof field !== "string" || field.trim().length === 0 || field.length > MAX_CREDENTIAL_FIELD_LENGTH) {
       throw new PanSyncError("CREDENTIALS_INVALID");
     }
   }
-  return { clientId: clientId as string, clientSecret: clientSecret as string, refreshToken: refreshToken as string };
-}
-
-function safeTokenGuideUrl(value: string | undefined): string | undefined {
-  if (value === undefined) return undefined;
   try {
-    const url = new URL(value);
-    return url.protocol === "https:" || url.protocol === "http:" ? url.toString() : undefined;
+    new URL(authorizationPageUrl as string);
+    new URL(refreshApiUrl as string);
   } catch {
-    return undefined;
+    throw new PanSyncError("CREDENTIALS_INVALID");
   }
+  return {
+    authorizationPageUrl: authorizationPageUrl as string,
+    refreshApiUrl: refreshApiUrl as string,
+    refreshToken: refreshToken as string,
+  };
 }
 
 function projectRecord(record: CredentialRecord | undefined, dependencies: SetupServerDependencies): unknown {
   const defaultDirectory = dependencies.defaultDirectory ?? DEFAULT_REMOTE_DIRECTORY;
-  const tokenGuideUrl = safeTokenGuideUrl(dependencies.tokenGuideUrl);
   if (record === undefined) {
-    return { configured: false, defaultDirectory, ...(tokenGuideUrl === undefined ? {} : { tokenGuideUrl }) };
+    return {
+      configured: false,
+      credentials: {
+        authorizationPageUrl: DEFAULT_OPENLIST_AUTHORIZATION_PAGE_URL,
+        refreshApiUrl: DEFAULT_OPENLIST_REFRESH_API_URL,
+        refreshToken: "",
+      },
+      defaultDirectory,
+    };
   }
   return {
     configured: true,
-    credentials: { clientId: record.clientId, clientSecret: record.clientSecret, refreshToken: record.refreshToken },
+    credentials: {
+      authorizationPageUrl: record.authorizationPageUrl,
+      refreshApiUrl: record.refreshApiUrl,
+      refreshToken: record.refreshToken,
+    },
     account: record.account,
     lastVerifiedAt: record.lastVerifiedAt,
     defaultDirectory,
-    ...(tokenGuideUrl === undefined ? {} : { tokenGuideUrl }),
   };
 }
 
@@ -485,8 +498,8 @@ export async function startSetupServer(
         assertAuthorized(context, authorization);
         if (current === undefined) throw new PanSyncError("CREDENTIALS_REQUIRED");
         const record = await validateAndReplace(context, authorization, {
-          clientId: current.clientId,
-          clientSecret: current.clientSecret,
+          authorizationPageUrl: current.authorizationPageUrl,
+          refreshApiUrl: current.refreshApiUrl,
           refreshToken: current.refreshToken,
         }, current);
         assertAuthorized(context, authorization);

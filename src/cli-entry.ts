@@ -29,8 +29,5 @@ export function registerPanSyncCli(
     clock: Date.now,
     randomBytes,
     defaultDirectory: runtime.config.defaultDirectory,
-    ...(runtime.config.tokenGuideUrl === undefined
-      ? {}
-      : { tokenGuideUrl: runtime.config.tokenGuideUrl }),
   });
 }

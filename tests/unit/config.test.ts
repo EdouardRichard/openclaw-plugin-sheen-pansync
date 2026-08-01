@@ -2,10 +2,9 @@ import { describe, expect, it } from "vitest";
 import { resolvePluginConfig } from "../../src/config.js";
 
 describe("resolvePluginConfig", () => {
-  it("uses the v1 defaults", () => {
+  it("uses the only ordinary plugin default", () => {
     expect(resolvePluginConfig(undefined)).toEqual({
       defaultDirectory: "/openClawShare",
-      tokenGuideUrl: undefined,
     });
   });
 

@@ -1,14 +1,13 @@
-import { PanSyncError } from "../errors.js";
-import type { AliyunHttpClient } from "../providers/aliyun/http.js";
 import type { ProviderOperationOptions } from "../contracts.js";
+import { PanSyncError } from "../errors.js";
+import type { AliyunTokenService } from "../providers/aliyun/types.js";
 import type { CredentialRecord } from "./types.js";
-
-const REFRESH_WINDOW_MS = 5 * 60 * 1_000;
 
 export type TokenManagerStatus =
   | "unconfigured"
   | "ready"
   | "degraded"
+  | "rate_limited"
   | "reauth_required";
 
 export interface TokenCredentialVault {
@@ -20,9 +19,10 @@ export interface TokenCredentialVault {
   ): Promise<boolean>;
 }
 
-type FailureState = {
-  credentialVersion: number;
-  status: "degraded" | "reauth_required";
+export type TokenManagerOptions = {
+  store: TokenCredentialVault;
+  tokenService: AliyunTokenService;
+  clock?: () => number;
 };
 
 type RefreshSubscriber = {
@@ -46,26 +46,30 @@ function cancellationError(): PanSyncError {
 }
 
 export class TokenManager {
+  readonly #store: TokenCredentialVault;
+  readonly #tokenService: AliyunTokenService;
+  readonly #clock: () => number;
   #refreshInFlight: RefreshOperation | undefined;
-  #failureState: FailureState | undefined;
 
-  constructor(
-    private readonly store: TokenCredentialVault,
-    private readonly aliyun: Pick<AliyunHttpClient, "refreshToken">,
-    private readonly clock: () => number = Date.now,
-  ) {}
+  constructor(options: TokenManagerOptions) {
+    this.#store = options.store;
+    this.#tokenService = options.tokenService;
+    this.#clock = options.clock ?? Date.now;
+  }
 
-  async getValidAccessToken(options: ProviderOperationOptions = {}): Promise<string> {
+  async getValidAccessToken(
+    _options: ProviderOperationOptions = {},
+  ): Promise<string> {
     const record = await this.#readConfiguredRecord();
-    if (
-      record.accessToken.length > 0
-      && Date.parse(record.accessTokenExpiresAt) - this.clock()
-        >= REFRESH_WINDOW_MS
-    ) {
-      return record.accessToken;
+    if (record.refreshState.status !== "ready") {
+      throw new PanSyncError(
+        record.refreshState.failureCode ?? "CREDENTIALS_INVALID",
+      );
     }
-
-    return this.#singleFlightRefresh(record, options);
+    if (record.accessToken.length === 0) {
+      throw new PanSyncError("CREDENTIALS_INVALID");
+    }
+    return record.accessToken;
   }
 
   async forceRefresh(
@@ -87,30 +91,16 @@ export class TokenManager {
   }
 
   async status(): Promise<TokenManagerStatus> {
-    const record = await this.store.read();
-    return this.statusForSnapshot(record);
+    return this.statusForSnapshot(await this.#store.read());
   }
 
   statusForSnapshot(
     record: CredentialRecord | undefined,
   ): TokenManagerStatus {
-    if (record === undefined) {
-      this.#failureState = undefined;
-      return "unconfigured";
-    }
-    if (
-      this.#failureState !== undefined
-      && this.#failureState.credentialVersion === record.credentialVersion
-    ) {
-      return this.#failureState.status;
-    }
-
-    this.#failureState = undefined;
-    return "ready";
+    return record?.refreshState.status ?? "unconfigured";
   }
 
   clearSnapshots(): void {
-    this.#failureState = undefined;
     const operation = this.#refreshInFlight;
     if (operation === undefined) {
       return;
@@ -124,16 +114,9 @@ export class TokenManager {
   }
 
   async #readConfiguredRecord(): Promise<CredentialRecord> {
-    const record = await this.store.read();
+    const record = await this.#store.read();
     if (record === undefined) {
-      this.#failureState = undefined;
       throw new PanSyncError("CREDENTIALS_REQUIRED");
-    }
-    if (
-      this.#failureState !== undefined
-      && this.#failureState.credentialVersion !== record.credentialVersion
-    ) {
-      this.#failureState = undefined;
     }
     return record;
   }
@@ -231,85 +214,50 @@ export class TokenManager {
     options: ProviderOperationOptions,
   ): Promise<string> {
     if (
-      record.clientId.length === 0
-      || record.clientSecret.length === 0
+      record.refreshApiUrl.length === 0
       || record.refreshToken.length === 0
     ) {
       throw new PanSyncError("CREDENTIALS_INVALID");
     }
 
-    let result: Awaited<ReturnType<AliyunHttpClient["refreshToken"]>>;
+    let result: Awaited<ReturnType<AliyunTokenService["refresh"]>>;
     try {
-      result = await this.aliyun.refreshToken({
-        clientId: record.clientId,
-        clientSecret: record.clientSecret,
+      result = await this.#tokenService.refresh({
+        refreshApiUrl: record.refreshApiUrl,
         refreshToken: record.refreshToken,
         ...(options.signal === undefined ? {} : { signal: options.signal }),
       });
     } catch (error) {
-      if (options.signal?.aborted === true) {
-        throw error instanceof PanSyncError ? error : cancellationError();
-      }
-      if (
-        error instanceof PanSyncError
-        && error.code === "REFRESH_TOKEN_REJECTED"
-      ) {
-        this.#failureState = {
-          credentialVersion: record.credentialVersion,
-          status: "reauth_required",
-        };
+      if (error instanceof PanSyncError) {
         throw error;
       }
-      if (
-        error instanceof PanSyncError
-        && (error.code === "TOKEN_ENDPOINT_UNAVAILABLE"
-          || error.code === "RATE_LIMITED")
-      ) {
-        this.#failureState = {
-          credentialVersion: record.credentialVersion,
-          status: "degraded",
-        };
-        throw error;
-      }
-
-      this.#failureState = {
-        credentialVersion: record.credentialVersion,
-        status: "degraded",
-      };
-      throw new PanSyncError("TOKEN_ENDPOINT_UNAVAILABLE");
+      throw cancellationError();
     }
 
-    const now = this.clock();
     const candidate: CredentialRecord = {
       ...record,
       credentialVersion: record.credentialVersion + 1,
       accessToken: result.accessToken,
       refreshToken: result.refreshToken,
-      accessTokenExpiresAt: new Date(
-        now + result.expiresInSeconds * 1_000,
-      ).toISOString(),
-      lastVerifiedAt: new Date(now).toISOString(),
+      lastVerifiedAt: new Date(this.#clock()).toISOString(),
+      refreshState: { status: "ready" },
     };
-    const replaced = await this.store.replaceIfVersion(
+    const replaced = await this.#store.replaceIfVersion(
       record.credentialVersion,
       candidate,
       options,
     );
     if (replaced) {
-      this.#failureState = undefined;
       return result.accessToken;
     }
 
-    const winner = await this.store.read();
+    const winner = await this.#store.read();
     if (winner === undefined) {
-      this.#failureState = undefined;
       throw new PanSyncError("CREDENTIALS_REQUIRED");
     }
     if (winner.accessToken.length === 0) {
       throw new PanSyncError("CREDENTIALS_INVALID");
     }
-
-    this.#failureState = undefined;
     return winner.accessToken;
   }
 }

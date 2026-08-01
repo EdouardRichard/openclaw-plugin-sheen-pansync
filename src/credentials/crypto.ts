@@ -6,7 +6,7 @@ import {
 import type { EncryptedEnvelopeV1 } from "./types.js";
 
 const ALGORITHM = "aes-256-gcm";
-const AAD = Buffer.from("openclaw-pan-sync-helper:credentials:v1", "utf8");
+const AAD = Buffer.from("openclaw-pan-sync-helper:credentials:v2", "utf8");
 const KEY_BYTES = 32;
 const NONCE_BYTES = 12;
 const AUTH_TAG_BYTES = 16;

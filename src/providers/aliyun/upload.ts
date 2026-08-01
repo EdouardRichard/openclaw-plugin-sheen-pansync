@@ -8,7 +8,7 @@ import type {
 import type { PanSyncErrorCode } from "../../errors.js";
 import { PanSyncError } from "../../errors.js";
 import type { ResolvedWorkspaceFile } from "../../workspace/path-guard.js";
-import { ALIYUN_OPENAPI_BASE_URL } from "./http.js";
+import { ALIYUN_OPENAPI_BASE_URL } from "./constants.js";
 import type { AliyunFetch } from "./types.js";
 
 const MIN_PART_SIZE = 20 * 1024 * 1024;

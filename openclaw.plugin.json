@@ -14,10 +14,6 @@
       "defaultDirectory": {
         "type": "string",
         "default": "/openClawShare"
-      },
-      "tokenGuideUrl": {
-        "type": "string",
-        "format": "uri"
       }
     }
   }

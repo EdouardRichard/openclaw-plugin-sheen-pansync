@@ -8,7 +8,6 @@ import type { CloudDriveProvider, RemoteDirectory } from "../../src/contracts.js
 import type { ResolvedWorkspaceFile } from "../../src/workspace/path-guard.js";
 import { PanSyncError } from "../../src/errors.js";
 import { ProviderRegistry } from "../../src/provider-registry.js";
-import { AliyunHttpClient } from "../../src/providers/aliyun/http.js";
 import { AliyunProvider } from "../../src/providers/aliyun/provider.js";
 import type { AliyunFetch } from "../../src/providers/aliyun/types.js";
 
@@ -282,7 +281,7 @@ function provider(
   } = {},
 ): AliyunProvider {
   return new AliyunProvider({
-    httpClient: new AliyunHttpClient({ baseUrl: server.baseUrl }),
+    tokenService: { refresh: vi.fn() },
     baseUrl: server.baseUrl,
     tokenManager: {
       forceRefresh: options.forceRefresh ?? (async () => "access-new"),

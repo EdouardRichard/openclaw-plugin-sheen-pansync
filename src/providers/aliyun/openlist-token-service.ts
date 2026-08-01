@@ -6,9 +6,6 @@ import type {
   OpenListRefreshResult,
 } from "./types.js";
 
-export const DEFAULT_OPENLIST_AUTHORIZATION_PAGE_URL = "https://api.oplist.org.cn";
-export const DEFAULT_OPENLIST_REFRESH_API_URL = "https://api.oplist.org.cn/alicloud/renewapi";
-
 const TOKEN_REQUEST_TIMEOUT_MS = 15_000;
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
 const MONTHS = [

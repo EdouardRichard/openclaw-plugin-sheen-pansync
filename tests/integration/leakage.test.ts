@@ -17,7 +17,7 @@ import { TokenManager, type TokenCredentialVault } from "../../src/credentials/t
 import type { CredentialRecord } from "../../src/credentials/types.js";
 import { createPanSyncPluginEntry } from "../../src/index.js";
 import { ProviderRegistry } from "../../src/provider-registry.js";
-import { AliyunHttpClient } from "../../src/providers/aliyun/http.js";
+import { OpenListTokenService } from "../../src/providers/aliyun/openlist-token-service.js";
 import { AliyunProvider } from "../../src/providers/aliyun/provider.js";
 import { registerPanSyncUploadTool, type PanSyncUploadToolApi } from "../../src/tool.js";
 import { UploadOrchestrator } from "../../src/upload/orchestrator.js";
@@ -42,17 +42,19 @@ const cleanups: Array<() => Promise<void>> = [];
 const runningServers: SetupServer[] = [];
 const aliyunServers: FakeAliyunServer[] = [];
 
-function record(expiresAt = "2099-01-01T00:00:00.000Z"): CredentialRecord {
+function record(
+  refreshState: CredentialRecord["refreshState"] = { status: "ready" },
+): CredentialRecord {
   return {
-    formatVersion: 1,
+    formatVersion: 2,
     credentialVersion: 1,
-    clientId: "client-id-123456",
-    clientSecret: CLIENT_SECRET,
+    authorizationPageUrl: "http://auth.example.test/custom",
+    refreshApiUrl: "http://refresh.example.test/custom/renew",
     refreshToken: REFRESH_TOKEN,
     accessToken: ACCESS_TOKEN,
-    accessTokenExpiresAt: expiresAt,
     account: { userIdMasked: "use***42", displayNameMasked: "R***" },
     lastVerifiedAt: "2026-08-01T00:00:00.000Z",
+    refreshState,
   };
 }
 
@@ -87,19 +89,22 @@ function orchestratorFor(
   vault: TokenCredentialVault,
   defaultDirectory = "/",
 ) {
-  const httpClient = new AliyunHttpClient({
-    baseUrl: server.baseUrl,
+  const tokenService = new OpenListTokenService({
     clock: () => NOW,
   });
-  const tokenManager = new TokenManager(vault, httpClient, () => NOW);
+  const tokenManager = new TokenManager({
+    store: vault,
+    tokenService,
+    clock: () => NOW,
+  });
   const provider = new AliyunProvider({
-    httpClient,
+    tokenService,
     tokenManager,
     baseUrl: server.baseUrl,
     clock: () => NOW,
   });
   return {
-    httpClient,
+    tokenService,
     provider,
     tokenManager,
     orchestrator: new UploadOrchestrator({
@@ -680,8 +685,8 @@ describe("release leakage canaries", () => {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        clientId: saved.clientId,
-        clientSecret: saved.clientSecret,
+        authorizationPageUrl: "http://auth.example.test/custom",
+        refreshApiUrl: `${invalidServer.baseUrl}/custom/renew`,
         refreshToken: saved.refreshToken,
       }),
     });
@@ -695,12 +700,12 @@ describe("release leakage canaries", () => {
     }
     assertNoProtectedArguments([invalidPayload]);
     expect(invalidResponse.status).toBe(400);
-    expect(invalidPayload).toEqual({ code: "CREDENTIALS_INVALID" });
+    expect(invalidPayload).toEqual({ code: "REFRESH_TOKEN_REJECTED" });
 
     const configResponse = await setupRequest(setup, "/api/config");
     const configOutput = await configResponse.text();
     expect(configResponse.status).toBe(200);
-    expect(configOutput.includes(CLIENT_SECRET)).toBe(true);
+    expect(configOutput.includes(CLIENT_SECRET)).toBe(false);
     expect(configOutput.includes(REFRESH_TOKEN)).toBe(true);
     if (configOutput.includes(ACCESS_TOKEN) || configOutput.includes(ABSOLUTE_PATH)) {
       throw new Error("authenticated config exposed a forbidden protected value");
@@ -714,7 +719,10 @@ describe("release leakage canaries", () => {
       },
     });
     aliyunServers.push(refreshServer);
-    const expiredVault = memoryVault(record("2000-01-01T00:00:00.000Z"));
+    const expiredVault = memoryVault(record({
+      status: "reauth_required",
+      failureCode: "REFRESH_TOKEN_REJECTED",
+    }));
     const refreshRuntime = orchestratorFor(refreshServer, expiredVault);
     const refreshResult = await toolFor(
       refreshRuntime.orchestrator,

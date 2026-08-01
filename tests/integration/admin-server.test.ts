@@ -10,7 +10,7 @@ import { JSDOM } from "jsdom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CredentialRecord } from "../../src/credentials/types.js";
 import { PanSyncError } from "../../src/errors.js";
-import { AliyunHttpClient } from "../../src/providers/aliyun/http.js";
+import { OpenListTokenService } from "../../src/providers/aliyun/openlist-token-service.js";
 import { AliyunProvider } from "../../src/providers/aliyun/provider.js";
 import { UploadOrchestrator } from "../../src/upload/orchestrator.js";
 import {
@@ -28,18 +28,18 @@ const SECURITY_HEADERS = {
 } as const;
 
 const savedRecord: CredentialRecord = {
-  formatVersion: 1,
+  formatVersion: 2,
   credentialVersion: 7,
-  clientId: "client-id-saved",
-  clientSecret: "client-secret-saved",
+  authorizationPageUrl: "http://auth.example.test/custom",
+  refreshApiUrl: "http://refresh.example.test/custom/renew",
   refreshToken: "refresh-token-saved",
   accessToken: "access-token-saved",
-  accessTokenExpiresAt: "2030-01-01T00:00:00.000Z",
   account: {
     userIdMasked: "use***42",
     displayNameMasked: "A***",
   },
   lastVerifiedAt: "2026-07-31T00:00:00.000Z",
+  refreshState: { status: "ready" },
 };
 
 type HarnessOptions = {
@@ -132,8 +132,8 @@ async function createHarness(options: HarnessOptions = {}) {
       ?? (async (candidate) => ({
         ...savedRecord,
         credentialVersion: candidate.credentialVersion ?? 1,
-        clientId: candidate.clientId,
-        clientSecret: candidate.clientSecret,
+        authorizationPageUrl: candidate.authorizationPageUrl,
+        refreshApiUrl: candidate.refreshApiUrl,
         refreshToken: `${candidate.refreshToken}-rotated`,
         accessToken: "new-access-token",
       })),
@@ -319,14 +319,14 @@ describe("one-time setup server", () => {
         expect(response.headers.get(name)).toBe(value);
       }
     }
-    expect(await responses[0]?.text()).not.toContain(savedRecord.clientSecret);
+    expect(await responses[0]?.text()).not.toContain(savedRecord.refreshToken);
 
     const rejectedHost = await requestWithHost(baseUrl, "/api/config", "attacker.example");
     expect(rejectedHost.status).toBe(400);
     for (const [name, value] of Object.entries(SECURITY_HEADERS)) {
       expect(rejectedHost.headers[name]).toBe(value);
     }
-    expect(rejectedHost.body).not.toContain(savedRecord.clientSecret);
+    expect(rejectedHost.body).not.toContain(savedRecord.refreshToken);
   });
 
   it("authorizes only the exact header and returns full values only on authorized GET", async () => {
@@ -348,7 +348,7 @@ describe("one-time setup server", () => {
         headers: { authorization },
       });
       expect(response.status).toBe(401);
-      expect(await response.text()).not.toContain(savedRecord.clientSecret);
+      expect(await response.text()).not.toContain(savedRecord.refreshToken);
     }
 
     const response = await apiRequest(baseUrl, "/api/config", key);
@@ -356,11 +356,14 @@ describe("one-time setup server", () => {
     expect(await response.json()).toMatchObject({
       configured: true,
       credentials: {
-        clientId: savedRecord.clientId,
-        clientSecret: savedRecord.clientSecret,
+        authorizationPageUrl: savedRecord.authorizationPageUrl,
+        refreshApiUrl: savedRecord.refreshApiUrl,
         refreshToken: savedRecord.refreshToken,
       },
     });
+    const serialized = JSON.stringify(await (await apiRequest(baseUrl, "/api/config", key)).json());
+    expect(serialized).not.toContain(savedRecord.accessToken);
+    expect(serialized).not.toContain("failureCode");
   });
 
   it("rejects a noncanonical base64url spelling that decodes to the same key bytes", async () => {
@@ -378,7 +381,7 @@ describe("one-time setup server", () => {
     const response = await apiRequest(baseUrl, "/api/config", alternate);
 
     expect(response.status).toBe(401);
-    expect(await response.text()).not.toContain(savedRecord.clientSecret);
+    expect(await response.text()).not.toContain(savedRecord.refreshToken);
   });
 
   it("accepts only the exact selected IPv4 loopback Host with its port", async () => {
@@ -399,23 +402,105 @@ describe("one-time setup server", () => {
     }
   });
 
-  it("projects configured page guidance only after authorization", async () => {
-    const harness = await createHarness({ record: savedRecord });
+  it("projects default OpenList URLs on the first authenticated setup", async () => {
+    const harness = await createHarness({ record: undefined });
     harness.deps.defaultDirectory = "/teamShare";
-    harness.deps.tokenGuideUrl = "https://docs.example.test/aliyun-token";
     cleanups.push(harness.cleanup);
     const result = await startSetupServer(harness.deps);
     runningServers.push(result);
     const baseUrl = result.url.split("/#")[0] ?? "";
     const key = accessKey(result.url);
 
-    const publicPage = await apiRequest(baseUrl, "/");
-    expect(await publicPage.text()).not.toContain("docs.example.test");
     const config = await apiRequest(baseUrl, "/api/config", key);
-    expect(await config.json()).toMatchObject({
+    expect(await config.json()).toEqual({
+      configured: false,
+      credentials: {
+        authorizationPageUrl: "https://api.oplist.org.cn",
+        refreshApiUrl: "https://api.oplist.org.cn/alicloud/renewapi",
+        refreshToken: "",
+      },
       defaultDirectory: "/teamShare",
-      tokenGuideUrl: "https://docs.example.test/aliyun-token",
     });
+  });
+
+  it("accepts any syntactically valid configured URLs without network policy", async () => {
+    const harness = await createHarness({ record: savedRecord });
+    cleanups.push(harness.cleanup);
+    const result = await startSetupServer(harness.deps);
+    runningServers.push(result);
+    const candidate = {
+      authorizationPageUrl: "custom+auth://user:pass@127.0.0.1:1/authorize",
+      refreshApiUrl: "http://user:pass@127.0.0.1:9/renew",
+      refreshToken: "policy-owned-by-user",
+    };
+
+    const response = await apiRequest(
+      result.url.split("/#")[0] ?? "",
+      "/api/config",
+      accessKey(result.url),
+      {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(candidate),
+      },
+    );
+
+    expect(response.status).toBe(200);
+    expect(harness.validateCredentials).toHaveBeenCalledWith({
+      ...candidate,
+      credentialVersion: 8,
+    }, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    expect(await response.json()).toMatchObject({
+      credentials: {
+        authorizationPageUrl: candidate.authorizationPageUrl,
+        refreshApiUrl: candidate.refreshApiUrl,
+        refreshToken: "policy-owned-by-user-rotated",
+      },
+    });
+  });
+
+  it.each([
+    ["invalid authorization URL", {
+      authorizationPageUrl: "not a URL",
+      refreshApiUrl: "http://refresh.example.test/renew",
+      refreshToken: "refresh",
+    }],
+    ["invalid refresh URL", {
+      authorizationPageUrl: "http://auth.example.test/authorize",
+      refreshApiUrl: "not a URL",
+      refreshToken: "refresh",
+    }],
+    ["legacy or extra fields", {
+      authorizationPageUrl: "http://auth.example.test/authorize",
+      refreshApiUrl: "http://refresh.example.test/renew",
+      refreshToken: "refresh",
+      accessToken: "must-not-be-accepted",
+    }],
+    ["field over 4096 characters", {
+      authorizationPageUrl: "http://auth.example.test/authorize",
+      refreshApiUrl: "http://refresh.example.test/renew",
+      refreshToken: "x".repeat(4097),
+    }],
+  ] as const)("rejects %s before validation", async (_name, candidate) => {
+    const harness = await createHarness({ record: savedRecord });
+    cleanups.push(harness.cleanup);
+    const result = await startSetupServer(harness.deps);
+    runningServers.push(result);
+
+    const response = await apiRequest(
+      result.url.split("/#")[0] ?? "",
+      "/api/config",
+      accessKey(result.url),
+      {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(candidate),
+      },
+    );
+
+    expect(response.status).toBe(400);
+    expect(harness.validateCredentials).not.toHaveBeenCalled();
+    expect(harness.record).toEqual(savedRecord);
   });
 
   it("validates a candidate before atomically replacing the saved record", async () => {
@@ -426,8 +511,8 @@ describe("one-time setup server", () => {
     const baseUrl = result.url.split("/#")[0] ?? "";
     const key = accessKey(result.url);
     const candidate = {
-      clientId: "candidate-client",
-      clientSecret: "candidate-secret",
+      authorizationPageUrl: "http://auth.example.test/custom",
+      refreshApiUrl: "http://refresh.example.test/custom/renew",
       refreshToken: "candidate-refresh",
     };
 
@@ -450,20 +535,25 @@ describe("one-time setup server", () => {
     );
     expect(harness.record).toMatchObject({
       credentialVersion: 8,
-      clientId: candidate.clientId,
-      clientSecret: candidate.clientSecret,
+      authorizationPageUrl: candidate.authorizationPageUrl,
+      refreshApiUrl: candidate.refreshApiUrl,
       refreshToken: "candidate-refresh-rotated",
     });
     expect(await response.json()).toMatchObject({
       credentials: {
-        clientSecret: candidate.clientSecret,
+        authorizationPageUrl: candidate.authorizationPageUrl,
+        refreshApiUrl: candidate.refreshApiUrl,
         refreshToken: "candidate-refresh-rotated",
       },
     });
   });
 
   it("does not overwrite a newer record when the shared lease version check loses a race", async () => {
-    const winner = { ...savedRecord, credentialVersion: 8, clientId: "concurrent-winner" };
+    const winner = {
+      ...savedRecord,
+      credentialVersion: 8,
+      authorizationPageUrl: "http://winner-auth.example.test/custom",
+    };
     let harness!: Awaited<ReturnType<typeof createHarness>>;
     harness = await createHarness({
       record: savedRecord,
@@ -482,8 +572,8 @@ describe("one-time setup server", () => {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        clientId: "stale-client",
-        clientSecret: "stale-secret",
+        authorizationPageUrl: "http://stale-auth.example.test/custom",
+        refreshApiUrl: "http://stale-refresh.example.test/custom/renew",
         refreshToken: "stale-refresh",
       }),
     });
@@ -504,8 +594,8 @@ describe("one-time setup server", () => {
         return {
           ...savedRecord,
           credentialVersion: candidate.credentialVersion ?? 1,
-          clientId: candidate.clientId,
-          clientSecret: candidate.clientSecret,
+          authorizationPageUrl: candidate.authorizationPageUrl,
+          refreshApiUrl: candidate.refreshApiUrl,
           refreshToken: candidate.refreshToken,
         };
       },
@@ -519,8 +609,8 @@ describe("one-time setup server", () => {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        clientId: `client-${suffix}`,
-        clientSecret: `secret-${suffix}`,
+        authorizationPageUrl: `http://auth-${suffix}.example.test/custom`,
+        refreshApiUrl: `http://refresh-${suffix}.example.test/custom/renew`,
         refreshToken: `refresh-${suffix}`,
       }),
     });
@@ -534,7 +624,10 @@ describe("one-time setup server", () => {
     expect(responses.map(({ status }) => status).sort()).toEqual([200, 409]);
     expect(harness.replace).not.toHaveBeenCalled();
     expect(harness.replaceIfVersion).toHaveBeenCalledTimes(2);
-    expect(["client-first", "client-second"]).toContain(harness.record?.clientId);
+    expect([
+      "http://auth-first.example.test/custom",
+      "http://auth-second.example.test/custom",
+    ]).toContain(harness.record?.authorizationPageUrl);
   });
 
   it("does not resurrect credentials when clear wins a race with an in-flight save", async () => {
@@ -548,8 +641,8 @@ describe("one-time setup server", () => {
         return {
           ...savedRecord,
           credentialVersion: candidate.credentialVersion ?? 8,
-          clientId: candidate.clientId,
-          clientSecret: candidate.clientSecret,
+          authorizationPageUrl: candidate.authorizationPageUrl,
+          refreshApiUrl: candidate.refreshApiUrl,
           refreshToken: candidate.refreshToken,
         };
       },
@@ -563,8 +656,8 @@ describe("one-time setup server", () => {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        clientId: "stale-client",
-        clientSecret: "stale-secret",
+        authorizationPageUrl: "http://stale-auth.example.test/custom",
+        refreshApiUrl: "http://stale-refresh.example.test/custom/renew",
         refreshToken: "stale-refresh",
       }),
     });
@@ -603,8 +696,8 @@ describe("one-time setup server", () => {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        clientId: "candidate-client",
-        clientSecret: "wrong-secret",
+        authorizationPageUrl: "http://candidate-auth.example.test/custom",
+        refreshApiUrl: "http://candidate-refresh.example.test/custom/renew",
         refreshToken: "mismatched-refresh",
       }),
     });
@@ -655,7 +748,7 @@ describe("one-time setup server", () => {
     ])).resolves.toBe("closed");
     readGate.resolve(savedRecord);
 
-    expect(await responseText).not.toContain(savedRecord.clientSecret);
+    expect(await responseText).not.toContain(savedRecord.refreshToken);
   });
 
   it("expires during provider validation without mutating or echoing the candidate", async () => {
@@ -684,35 +777,35 @@ describe("one-time setup server", () => {
     runningServers.push(result);
     const baseUrl = result.url.split("/#")[0] ?? "";
     const key = accessKey(result.url);
-    const candidateSecret = "expiry-candidate-secret";
+    const candidateRefreshToken = "expiry-candidate-refresh-CANARY";
     const responseText = apiRequest(baseUrl, "/api/config", key, {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        clientId: "expiry-client",
-        clientSecret: candidateSecret,
-        refreshToken: "expiry-refresh",
+        authorizationPageUrl: "http://expiry-auth.example.test/custom",
+        refreshApiUrl: "http://expiry-refresh.example.test/custom/renew",
+        refreshToken: candidateRefreshToken,
       }),
     }).then((response) => response.text()).catch(() => "REQUEST_ABORTED");
     await validationStarted.promise;
 
     now += 10 * 60 * 1_000 + 1;
     expire?.();
-    validationGate.resolve({ ...savedRecord, clientSecret: candidateSecret });
+    validationGate.resolve({ ...savedRecord, refreshToken: candidateRefreshToken });
     await result.closed;
 
     expect(harness.replaceIfVersion).not.toHaveBeenCalled();
     expect(harness.record).toEqual(savedRecord);
-    expect(await responseText).not.toContain(candidateSecret);
+    expect(await responseText).not.toContain(candidateRefreshToken);
   });
 
-  it("aborts the real OAuth validation request on setup expiry before drive discovery", async () => {
-    const api = await startDelayedApi("/oauth/access_token");
+  it("aborts the real OpenList validation request on setup expiry before drive discovery", async () => {
+    const api = await startDelayedApi("/custom/renew");
     cleanups.push(api.close);
     const harness = await createHarness({ record: savedRecord });
     cleanups.push(harness.cleanup);
     harness.deps.provider = new AliyunProvider({
-      httpClient: new AliyunHttpClient({ baseUrl: api.baseUrl }),
+      tokenService: new OpenListTokenService(),
       baseUrl: api.baseUrl,
       tokenManager: { async forceRefresh() { return "unused"; } },
     });
@@ -733,9 +826,9 @@ describe("one-time setup server", () => {
         method: "PUT",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          clientId: "oauth-client",
-          clientSecret: "oauth-secret",
-          refreshToken: "oauth-refresh",
+          authorizationPageUrl: "http://auth.example.test/custom",
+          refreshApiUrl: `${api.baseUrl}/custom/renew`,
+          refreshToken: "openlist-refresh",
         }),
       },
     ).catch(() => undefined);
@@ -749,7 +842,7 @@ describe("one-time setup server", () => {
     ])).resolves.toBe("aborted");
     await result.closed;
     await saving;
-    expect(api.requests).toEqual(["/oauth/access_token"]);
+    expect(api.requests).toEqual(["/custom/renew"]);
     expect(harness.replaceIfVersion).not.toHaveBeenCalled();
   });
 
@@ -759,7 +852,7 @@ describe("one-time setup server", () => {
     const harness = await createHarness({ record: savedRecord });
     cleanups.push(harness.cleanup);
     const provider = new AliyunProvider({
-      httpClient: new AliyunHttpClient({ baseUrl: api.baseUrl }),
+      tokenService: { async refresh() { throw new Error("unused"); } },
       baseUrl: api.baseUrl,
       tokenManager: { async forceRefresh() { return savedRecord.accessToken; } },
     });
@@ -832,8 +925,8 @@ describe("one-time setup server", () => {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        clientId: "cas-client",
-        clientSecret: "cas-secret",
+        authorizationPageUrl: "http://cas-auth.example.test/custom",
+        refreshApiUrl: "http://cas-refresh.example.test/custom/renew",
         refreshToken: "cas-refresh",
       }),
     }).catch(() => undefined);
@@ -965,8 +1058,8 @@ describe("one-time setup server", () => {
     const baseUrl = result.url.split("/#")[0] ?? "";
     const key = accessKey(result.url);
     const body = JSON.stringify({
-      clientId: "media-client",
-      clientSecret: "media-secret",
+      authorizationPageUrl: "http://media-auth.example.test/custom",
+      refreshApiUrl: "http://media-refresh.example.test/custom/renew",
       refreshToken: "media-refresh",
     });
 
@@ -1020,7 +1113,7 @@ describe("one-time setup server", () => {
         response.once("end", () => resolve(response.statusCode ?? 0));
       });
       request.once("error", () => resolve(0));
-      request.write("{\"clientId\":");
+      request.write("{\"authorizationPageUrl\":");
     });
     await vi.waitFor(() => expect(deadline).toBeTypeOf("function"));
 
@@ -1069,8 +1162,8 @@ describe("one-time setup server", () => {
     });
     expect(revalidated.status).toBe(200);
     expect(harness.validateCredentials).toHaveBeenCalledWith({
-      clientId: savedRecord.clientId,
-      clientSecret: savedRecord.clientSecret,
+      authorizationPageUrl: savedRecord.authorizationPageUrl,
+      refreshApiUrl: savedRecord.refreshApiUrl,
       refreshToken: savedRecord.refreshToken,
       credentialVersion: 8,
     }, expect.objectContaining({ signal: expect.any(AbortSignal) }));
@@ -1199,8 +1292,8 @@ async function executePage(
       : {
         configured: true,
         credentials: {
-          clientId: "browser-client",
-          clientSecret: "browser-secret",
+          authorizationPageUrl: "http://browser-auth.example.test/custom",
+          refreshApiUrl: "http://browser-refresh.example.test/custom/renew",
           refreshToken: "browser-refresh",
         },
         defaultDirectory: "/openClawShare",
@@ -1230,7 +1323,7 @@ describe("setup page browser behavior", () => {
     const storedKeyAfterPagehide = first.dom.window.sessionStorage.getItem("panSyncSetupAccessKey");
     expect(storedKeyAfterPagehide).toBe(key);
     expect(first.dom.window.localStorage.length).toBe(0);
-    for (const id of ["clientId", "clientSecret", "refreshToken"]) {
+    for (const id of ["authorizationPageUrl", "refreshApiUrl", "refreshToken"]) {
       expect((first.dom.window.document.getElementById(id) as HTMLInputElement).value).toBe("");
     }
     const requestCountAfterPagehide = first.requests.length;
@@ -1252,11 +1345,36 @@ describe("setup page browser behavior", () => {
     await vi.waitFor(() => {
       expect(page.dom.window.document.getElementById("result")?.textContent).toBe("READY");
     });
-    for (const id of ["clientId", "clientSecret", "refreshToken"]) {
+    for (const id of ["authorizationPageUrl", "refreshApiUrl", "refreshToken"]) {
       const input = page.dom.window.document.getElementById(id) as HTMLInputElement;
       expect(input.type).toBe("text");
-      expect(input.autocomplete).toBe("off");
     }
+    expect((page.dom.window.document.getElementById("refreshToken") as HTMLInputElement).autocomplete).toBe("off");
+    expect(page.dom.window.document.getElementById("clientId")).toBeNull();
+    expect(page.dom.window.document.getElementById("clientSecret")).toBeNull();
+    expect(page.dom.window.document.getElementById("accessToken")).toBeNull();
+    const authorizationInput = page.dom.window.document.getElementById("authorizationPageUrl") as HTMLInputElement;
+    const authorizationLink = page.dom.window.document.getElementById("openAuthorizationPage") as HTMLAnchorElement;
+    expect(authorizationLink.href).toBe("http://browser-auth.example.test/custom");
+    authorizationInput.value = "http://changed-auth.example.test/custom";
+    authorizationInput.dispatchEvent(new page.dom.window.Event("input"));
+    expect(authorizationLink.href).toBe("http://changed-auth.example.test/custom");
+
+    expect(page.dom.window.document.body.textContent).toContain(
+      "The refresh token is sent to the configured refresh API URL",
+    );
+    expect(page.dom.window.document.body.textContent).toMatch(
+      /HTTP.*self-hosted.*third-party.*risk.*user/isu,
+    );
+    const form = page.dom.window.document.getElementById("credentials") as HTMLFormElement;
+    form.dispatchEvent(new page.dom.window.Event("submit", { cancelable: true }));
+    await vi.waitFor(() => expect(page.requests.some(({ init }) => init?.method === "PUT")).toBe(true));
+    const save = page.requests.find(({ init }) => init?.method === "PUT");
+    expect(JSON.parse(String(save?.init?.body))).toEqual({
+      authorizationPageUrl: "http://changed-auth.example.test/custom",
+      refreshApiUrl: "http://browser-refresh.example.test/custom/renew",
+      refreshToken: "browser-refresh",
+    });
     const canary = "raw-native-error-client-secret-CANARY";
     page.dom.window.fetch = (async () => {
       throw new Error(canary);
@@ -1269,7 +1387,7 @@ describe("setup page browser behavior", () => {
     expect(JSON.stringify(page.errors)).not.toContain(canary);
 
     page.dom.window.dispatchEvent(new page.dom.window.Event("pagehide"));
-    for (const id of ["clientId", "clientSecret", "refreshToken"]) {
+    for (const id of ["authorizationPageUrl", "refreshApiUrl", "refreshToken"]) {
       expect((page.dom.window.document.getElementById(id) as HTMLInputElement).value).toBe("");
     }
   });
@@ -1316,16 +1434,24 @@ describe("setup page browser behavior", () => {
     await vi.waitFor(() => expect(call).toBe(2));
     responses[1]?.resolve(new Response(JSON.stringify({
       configured: true,
-      credentials: { clientId: "new-client", clientSecret: "new-secret", refreshToken: "new-refresh" },
+      credentials: {
+        authorizationPageUrl: "http://new-auth.example.test/custom",
+        refreshApiUrl: "http://new-refresh.example.test/custom/renew",
+        refreshToken: "new-refresh",
+      },
     }), { status: 200 }));
-    await vi.waitFor(() => expect((dom.window.document.getElementById("clientId") as HTMLInputElement).value).toBe("new-client"));
+    await vi.waitFor(() => expect((dom.window.document.getElementById("authorizationPageUrl") as HTMLInputElement).value).toBe("http://new-auth.example.test/custom"));
     responses[0]?.resolve(new Response(JSON.stringify({
       configured: true,
-      credentials: { clientId: "stale-client", clientSecret: "stale-secret", refreshToken: "stale-refresh" },
+      credentials: {
+        authorizationPageUrl: "http://stale-auth.example.test/custom",
+        refreshApiUrl: "http://stale-refresh.example.test/custom/renew",
+        refreshToken: "stale-refresh",
+      },
     }), { status: 200 }));
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect((dom.window.document.getElementById("clientId") as HTMLInputElement).value).toBe("new-client");
+    expect((dom.window.document.getElementById("authorizationPageUrl") as HTMLInputElement).value).toBe("http://new-auth.example.test/custom");
   });
 
   it("aborts and ignores pending work on pagehide while clearing form values", async () => {
@@ -1349,10 +1475,14 @@ describe("setup page browser behavior", () => {
     expect(signal?.aborted).toBe(true);
     pending.resolve(new Response(JSON.stringify({
       configured: true,
-      credentials: { clientId: "late-client", clientSecret: "late-secret", refreshToken: "late-refresh" },
+      credentials: {
+        authorizationPageUrl: "http://late-auth.example.test/custom",
+        refreshApiUrl: "http://late-refresh.example.test/custom/renew",
+        refreshToken: "late-refresh",
+      },
     }), { status: 200 }));
     await new Promise((resolve) => setTimeout(resolve, 0));
-    for (const id of ["clientId", "clientSecret", "refreshToken"]) {
+    for (const id of ["authorizationPageUrl", "refreshApiUrl", "refreshToken"]) {
       expect((dom.window.document.getElementById(id) as HTMLInputElement).value).toBe("");
     }
   });

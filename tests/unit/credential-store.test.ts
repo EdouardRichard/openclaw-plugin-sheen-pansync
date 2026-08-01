@@ -31,18 +31,18 @@ function record(
   refreshToken = `refresh-${credentialVersion}`,
 ): CredentialRecord {
   return {
-    formatVersion: 1,
+    formatVersion: 2,
     credentialVersion,
-    clientId: "client-id-CANARY",
-    clientSecret: "client-secret-CANARY",
+    authorizationPageUrl: "http://auth.example.test/custom",
+    refreshApiUrl: "http://refresh.example.test/custom/renew",
     refreshToken,
     accessToken: `access-${credentialVersion}-CANARY`,
-    accessTokenExpiresAt: "2026-08-01T00:00:00.000Z",
     account: {
       userIdMasked: "user-***-masked",
       displayNameMasked: "name-***",
     },
     lastVerifiedAt: "2026-07-31T00:00:00.000Z",
+    refreshState: { status: "ready" },
   };
 }
 
@@ -133,7 +133,8 @@ describe("CredentialStore", () => {
 
     expect(await readFile(masterKeyPath)).toHaveLength(32);
     const encrypted = await readFile(credentialsPath, "utf8");
-    expect(encrypted).not.toContain(saved.clientSecret);
+    expect(encrypted).not.toContain(saved.authorizationPageUrl);
+    expect(encrypted).not.toContain(saved.refreshApiUrl);
     expect(encrypted).not.toContain(saved.refreshToken);
     expect(encrypted).not.toContain(saved.accessToken);
     await expect(store.read()).resolves.toEqual(saved);

@@ -510,16 +510,16 @@ describe("UploadOrchestrator", () => {
   });
 
   it("propagates CREDENTIALS_REQUIRED from an actual empty TokenManager vault", async () => {
-    const refreshToken = vi.fn(async () => {
+    const refresh = vi.fn(async () => {
       throw new Error("refresh must not run without stored credentials");
     });
-    const tokenManager = new TokenManager(
-      {
+    const tokenManager = new TokenManager({
+      store: {
         read: async () => undefined,
         replaceIfVersion: async () => false,
       },
-      { refreshToken },
-    );
+      tokenService: { refresh },
+    });
     const { orchestrator, events, opened } = harness({ tokenManager });
 
     await expect(
@@ -528,7 +528,7 @@ describe("UploadOrchestrator", () => {
         paths: ["a.txt"],
       }),
     ).rejects.toMatchObject({ code: "CREDENTIALS_REQUIRED" });
-    expect(refreshToken).not.toHaveBeenCalled();
+    expect(refresh).not.toHaveBeenCalled();
     expect(events).toEqual(["provider:default"]);
     expect(opened).toEqual([]);
   });

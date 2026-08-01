@@ -25,6 +25,7 @@ const BOUNDED_STATUSES: ReadonlySet<string> = new Set([
   "unconfigured",
   "ready",
   "degraded",
+  "rate_limited",
   "reauth_required",
 ]);
 
@@ -35,12 +36,6 @@ function escapeHtml(value: string): string {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
-}
-
-function maskClientId(value: string): string {
-  const characters = Array.from(value);
-  if (characters.length <= 4) return "***";
-  return `${characters.slice(0, 2).join("")}****${characters.slice(-2).join("")}`;
 }
 
 function trustedMaskedSummary(value: string | undefined): string {
@@ -59,7 +54,6 @@ function renderStatusPage(
   defaultDirectory: string,
 ): string {
   const configured = record !== undefined;
-  const clientId = configured ? maskClientId(record.clientId) : "unavailable";
   const account = configured
     ? trustedMaskedSummary(
       record.account.displayNameMasked ?? record.account.userIdMasked,
@@ -90,7 +84,7 @@ function renderStatusPage(
       <dt>Provider</dt><dd>aliyun</dd>
       <dt>Status</dt><dd>${escapeHtml(status)}</dd>
       <dt>Configured</dt><dd>${configured ? "yes" : "no"}</dd>
-      <dt>Client ID</dt><dd>${escapeHtml(clientId)}</dd>
+      <dt>Token service</dt><dd>OpenList</dd>
       <dt>Account</dt><dd>${escapeHtml(account)}</dd>
       <dt>Default directory</dt><dd>${escapeHtml(defaultDirectory)}</dd>
       <dt>Last verified</dt><dd>${escapeHtml(lastVerifiedAt)}</dd>

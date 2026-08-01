@@ -20,8 +20,9 @@
   }
 
   const form = document.getElementById("credentials");
-  const clientId = document.getElementById("clientId");
-  const clientSecret = document.getElementById("clientSecret");
+  const authorizationPageUrl = document.getElementById("authorizationPageUrl");
+  const openAuthorizationPage = document.getElementById("openAuthorizationPage");
+  const refreshApiUrl = document.getElementById("refreshApiUrl");
   const refreshToken = document.getElementById("refreshToken");
   const result = document.getElementById("result");
   const revalidate = document.getElementById("revalidate");
@@ -29,7 +30,6 @@
   const clearCredentials = document.getElementById("clearCredentials");
   const confirmClear = document.getElementById("confirmClear");
   const defaultDirectory = document.getElementById("defaultDirectory");
-  const tokenGuide = document.getElementById("tokenGuide");
 
   const safeCodes = new Set([
     "CREDENTIALS_REQUIRED",
@@ -45,9 +45,18 @@
   const requestControllers = new Set();
 
   function clearFormValues() {
-    clientId.value = "";
-    clientSecret.value = "";
+    authorizationPageUrl.value = "";
+    refreshApiUrl.value = "";
     refreshToken.value = "";
+    syncAuthorizationLink();
+  }
+
+  function syncAuthorizationLink() {
+    if (authorizationPageUrl.value.length === 0) {
+      openAuthorizationPage.removeAttribute("href");
+    } else {
+      openAuthorizationPage.href = authorizationPageUrl.value;
+    }
   }
 
   function showSafeResult(value) {
@@ -68,22 +77,15 @@
 
   function applyConfig(value) {
     if (value && value.credentials) {
-      clientId.value = typeof value.credentials.clientId === "string" ? value.credentials.clientId : "";
-      clientSecret.value = typeof value.credentials.clientSecret === "string" ? value.credentials.clientSecret : "";
+      authorizationPageUrl.value = typeof value.credentials.authorizationPageUrl === "string" ? value.credentials.authorizationPageUrl : "";
+      refreshApiUrl.value = typeof value.credentials.refreshApiUrl === "string" ? value.credentials.refreshApiUrl : "";
       refreshToken.value = typeof value.credentials.refreshToken === "string" ? value.credentials.refreshToken : "";
+      syncAuthorizationLink();
     } else if (value && value.configured === false) {
       clearFormValues();
     }
     if (value && typeof value.defaultDirectory === "string") {
       defaultDirectory.textContent = value.defaultDirectory;
-    }
-    if (value && typeof value.tokenGuideUrl === "string") {
-      const link = document.createElement("a");
-      link.href = value.tokenGuideUrl;
-      link.rel = "noreferrer noopener";
-      link.textContent = "Open the initial Token guide";
-      tokenGuide.replaceChildren(link);
-      tokenGuide.hidden = false;
     }
   }
 
@@ -140,14 +142,16 @@
       (generation) => api("/api/config", {
         method: "PUT",
         body: JSON.stringify({
-          clientId: clientId.value,
-          clientSecret: clientSecret.value,
+          authorizationPageUrl: authorizationPageUrl.value,
+          refreshApiUrl: refreshApiUrl.value,
           refreshToken: refreshToken.value,
         }),
       }, generation),
       "SAVED_AND_VERIFIED",
     );
   });
+
+  authorizationPageUrl.addEventListener("input", syncAuthorizationLink);
 
   revalidate.addEventListener("click", () => {
     void run((generation) => api("/api/revalidate", { method: "POST" }, generation), "REVALIDATED");

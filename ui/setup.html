@@ -12,15 +12,16 @@
       <header>
         <p class="eyebrow">OpenClaw · Pan Sync Helper</p>
         <h1>Connect Aliyun Drive</h1>
-        <p class="warning" role="alert">This page shows full credential values. Host administrators, screen sharing, browser extensions, and screenshots can see them.</p>
+        <p class="warning" role="alert">The refresh token is sent to the configured refresh API URL. HTTP, self-hosted, and third-party service risk belongs to the user. This page shows the full refresh token, so host administrators, screen sharing, browser extensions, and screenshots can see it.</p>
       </header>
 
       <form id="credentials" autocomplete="off">
-        <label for="clientId">Client ID</label>
-        <input id="clientId" name="clientId" type="text" autocomplete="off" spellcheck="false" required>
+        <label for="authorizationPageUrl">OpenList authorization page URL</label>
+        <input id="authorizationPageUrl" name="authorizationPageUrl" type="text" required>
+        <a id="openAuthorizationPage" target="_blank" rel="noreferrer noopener">Open OpenList authorization</a>
 
-        <label for="clientSecret">Client Secret</label>
-        <input id="clientSecret" name="clientSecret" type="text" autocomplete="off" spellcheck="false" required>
+        <label for="refreshApiUrl">OpenList refresh API URL</label>
+        <input id="refreshApiUrl" name="refreshApiUrl" type="text" required>
 
         <label for="refreshToken">Refresh Token</label>
         <input id="refreshToken" name="refreshToken" type="text" autocomplete="off" spellcheck="false" required>
@@ -36,8 +37,7 @@
 
       <section class="notes" aria-label="Configuration notes">
         <p>Default upload directory: <code id="defaultDirectory">/openClawShare</code></p>
-        <p id="tokenGuide" hidden></p>
-        <p>AList is only one possible tool for obtaining the initial Refresh Token. You must choose custom Client ID and Client Secret credentials, and all three values must belong to the same OAuth application.</p>
+        <p>Authorize with the configured OpenList page, then paste its refresh token above.</p>
       </section>
 
       <output id="result" role="status" aria-live="polite"></output>

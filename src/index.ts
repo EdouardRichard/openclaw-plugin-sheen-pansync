@@ -47,10 +47,6 @@ const configSchema: OpenClawPluginConfigSchema = {
         type: "string",
         default: "/openClawShare",
       },
-      tokenGuideUrl: {
-        type: "string",
-        format: "uri",
-      },
     },
   },
 };
@@ -87,9 +83,6 @@ export function createPanSyncPluginEntry(
         clock: Date.now,
         randomBytes,
         defaultDirectory: runtime.config.defaultDirectory,
-        ...(runtime.config.tokenGuideUrl === undefined
-          ? {}
-          : { tokenGuideUrl: runtime.config.tokenGuideUrl }),
       }, options.configureCliOptions);
       api.registerHttpRoute({
         path: STATUS_PATH,

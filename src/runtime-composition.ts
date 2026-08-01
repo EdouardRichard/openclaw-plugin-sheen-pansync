@@ -7,7 +7,7 @@ import {
 } from "./credentials/store.js";
 import { TokenManager } from "./credentials/token-manager.js";
 import { ProviderRegistry } from "./provider-registry.js";
-import { AliyunHttpClient } from "./providers/aliyun/http.js";
+import { OpenListTokenService } from "./providers/aliyun/openlist-token-service.js";
 import { AliyunProvider } from "./providers/aliyun/provider.js";
 import { UploadOrchestrator } from "./upload/orchestrator.js";
 
@@ -17,7 +17,7 @@ export type PanSyncRuntime = {
   config: PluginConfig;
   dataDir: string;
   store: CredentialStore;
-  httpClient: AliyunHttpClient;
+  tokenService: OpenListTokenService;
   tokenManager: TokenManager;
   provider: AliyunProvider;
   providerRegistry: ProviderRegistry;
@@ -41,9 +41,9 @@ export function createPanSyncRuntime(
     ?? createSqliteWorkerCredentialLeaseRunner
   )(leaseDatabasePath);
   const store = new CredentialStore(dataDir, lease);
-  const httpClient = new AliyunHttpClient();
-  const tokenManager = new TokenManager(store, httpClient);
-  const provider = new AliyunProvider({ httpClient, tokenManager });
+  const tokenService = new OpenListTokenService();
+  const tokenManager = new TokenManager({ store, tokenService });
+  const provider = new AliyunProvider({ tokenService, tokenManager });
   const providerRegistry = new ProviderRegistry([provider], "aliyun");
   const orchestrator = new UploadOrchestrator({
     providerRegistry,
@@ -55,7 +55,7 @@ export function createPanSyncRuntime(
     config,
     dataDir,
     store,
-    httpClient,
+    tokenService,
     tokenManager,
     provider,
     providerRegistry,

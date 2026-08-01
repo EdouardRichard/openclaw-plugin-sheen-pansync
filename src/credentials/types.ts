@@ -7,16 +7,25 @@ export type EncryptedEnvelopeV1 = {
 };
 
 export type CredentialRecord = {
-  formatVersion: 1;
+  formatVersion: 2;
   credentialVersion: number;
-  clientId: string;
-  clientSecret: string;
+  authorizationPageUrl: string;
+  refreshApiUrl: string;
   refreshToken: string;
   accessToken: string;
-  accessTokenExpiresAt: string;
   account: {
     userIdMasked: string;
     displayNameMasked?: string;
   };
   lastVerifiedAt: string;
+  refreshState: RefreshState;
+};
+
+export type RefreshState = {
+  status: "ready" | "degraded" | "rate_limited" | "reauth_required";
+  notBefore?: string;
+  failureCode?:
+    | "TOKEN_ENDPOINT_UNAVAILABLE"
+    | "RATE_LIMITED"
+    | "REFRESH_TOKEN_REJECTED";
 };

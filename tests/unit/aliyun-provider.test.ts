@@ -3,7 +3,7 @@ import type { CloudDriveProvider } from "../../src/contracts.js";
 import type { CredentialRecord } from "../../src/credentials/types.js";
 import { PanSyncError } from "../../src/errors.js";
 import { ProviderRegistry } from "../../src/provider-registry.js";
-import { AliyunHttpClient } from "../../src/providers/aliyun/http.js";
+import { OpenListTokenService } from "../../src/providers/aliyun/openlist-token-service.js";
 import { AliyunProvider } from "../../src/providers/aliyun/provider.js";
 import {
   startFakeAliyunServer,
@@ -31,8 +31,7 @@ function provider(
   forceRefresh = vi.fn<(token?: string) => Promise<string>>(),
 ): AliyunProvider {
   return new AliyunProvider({
-    httpClient: new AliyunHttpClient({
-      baseUrl: server.baseUrl,
+    tokenService: new OpenListTokenService({
       clock: () => NOW,
     }),
     baseUrl: server.baseUrl,
@@ -69,6 +68,23 @@ async function rejectedPanSyncError(
 }
 
 describe("AliyunProvider credential validation", () => {
+  it.each([
+    ["authorization page URL", { authorizationPageUrl: "" }],
+    ["refresh API URL", { refreshApiUrl: "x".repeat(4097) }],
+    ["refresh token", { refreshToken: "" }],
+  ] as const)("rejects an invalid %s before contacting OpenList", async (_name, override) => {
+    const server = await fakeServer([]);
+    const error = await rejectedPanSyncError(() => provider(server).validateCredentials({
+      authorizationPageUrl: "http://auth.example.test/custom",
+      refreshApiUrl: `${server.baseUrl}/custom/renew`,
+      refreshToken: "refresh-candidate",
+      ...override,
+    }));
+
+    expect(error.code).toBe("CREDENTIALS_INVALID");
+    expect(server.requests).toEqual([]);
+  });
+
   it("refreshes the candidate before drive discovery and returns only masked account identifiers", async () => {
     const server = await fakeServer([
       {
@@ -87,62 +103,64 @@ describe("AliyunProvider credential validation", () => {
       "aliyun",
     ).resolve("aliyun");
     const result = await resolved.validateCredentials({
-      clientId: "client-id",
-      clientSecret: "client-secret",
+      authorizationPageUrl: "http://auth.example.test/custom",
+      refreshApiUrl: `${server.baseUrl}/custom/renew`,
       refreshToken: "refresh-candidate",
       credentialVersion: 7,
     });
 
     expect(server.requests.map(({ method, path }) => ({ method, path }))).toEqual([
-      { method: "POST", path: "/oauth/access_token" },
+      { method: "GET", path: "/custom/renew?refresh_ui=refresh-candidate&server_use=true&driver_txt=alicloud_qr" },
       { method: "POST", path: "/adrive/v1.0/user/getDriveInfo" },
     ]);
     expect(result).toMatchObject({
-      formatVersion: 1,
+      formatVersion: 2,
       credentialVersion: 7,
-      clientId: "client-id",
-      clientSecret: "client-secret",
+      authorizationPageUrl: "http://auth.example.test/custom",
+      refreshApiUrl: `${server.baseUrl}/custom/renew`,
       refreshToken: "refresh-rotated",
       accessToken: "access-rotated",
-      accessTokenExpiresAt: "2026-07-31T14:00:00.000Z",
       lastVerifiedAt: "2026-07-31T12:00:00.000Z",
+      refreshState: { status: "ready" },
     });
     expect(result.account.userIdMasked).not.toBe("unmasked-user-123456789");
     expect(result.account.displayNameMasked).not.toBe("Unmasked Account Name");
     expect(JSON.stringify(result.account)).not.toContain("unmasked-user-123456789");
     expect(JSON.stringify(result.account)).not.toContain("Unmasked Account Name");
-    expect(Number.isNaN(Date.parse(result.accessTokenExpiresAt))).toBe(false);
   });
 
-  it("preserves a transient token-endpoint failure as TOKEN_ENDPOINT_UNAVAILABLE", async () => {
+  it.each([
+    [503, "TOKEN_ENDPOINT_UNAVAILABLE"],
+    [429, "RATE_LIMITED"],
+  ] as const)("preserves OpenList HTTP %i as %s", async (status, code) => {
     const server = await fakeServer([{
-      status: 503,
+      status,
       body: { detail: "transient-secret-CANARY" },
     }]);
 
     const error = await rejectedPanSyncError(() =>
       provider(server).validateCredentials({
-        clientId: "client-id",
-        clientSecret: "client-secret",
+        authorizationPageUrl: "http://auth.example.test/custom",
+        refreshApiUrl: `${server.baseUrl}/custom/renew`,
         refreshToken: "refresh-candidate",
       })
     );
 
-    expect(error.code).toBe("TOKEN_ENDPOINT_UNAVAILABLE");
+    expect(error.code).toBe(code);
     expect(error.message).not.toContain("transient-secret-CANARY");
   });
 
   it("rejects an invalid candidate before a caller can replace old credentials", async () => {
     const oldRecord: CredentialRecord = {
-      formatVersion: 1,
+      formatVersion: 2,
       credentialVersion: 3,
-      clientId: "old-client",
-      clientSecret: "old-secret",
+      authorizationPageUrl: "http://old-auth.example.test/custom",
+      refreshApiUrl: "http://old-refresh.example.test/custom/renew",
       refreshToken: "old-refresh",
       accessToken: "old-access",
-      accessTokenExpiresAt: "2026-07-31T13:00:00.000Z",
       account: { userIdMasked: "old***id" },
       lastVerifiedAt: "2026-07-31T11:00:00.000Z",
+      refreshState: { status: "ready" },
     };
     const store = {
       record: oldRecord,
@@ -163,16 +181,15 @@ describe("AliyunProvider credential validation", () => {
 
     const saveValidatedCandidate = async () => {
       const validated = await provider(server).validateCredentials({
-        clientId: "candidate-client",
-        clientSecret: "candidate-secret-CANARY",
+        authorizationPageUrl: "http://candidate-auth.example.test/custom",
+        refreshApiUrl: `${server.baseUrl}/custom/renew`,
         refreshToken: "candidate-refresh-CANARY",
       });
       await store.replace(validated);
     };
     const error = await rejectedPanSyncError(saveValidatedCandidate);
 
-    expect(error.code).toBe("CREDENTIALS_INVALID");
-    expect(error.message).not.toContain("candidate-secret-CANARY");
+    expect(error.code).toBe("REFRESH_TOKEN_REJECTED");
     expect(error.message).not.toContain("candidate-refresh-CANARY");
     expect(store.replace).not.toHaveBeenCalled();
     await expect(store.read()).resolves.toBe(oldRecord);

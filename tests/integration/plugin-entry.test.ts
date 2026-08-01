@@ -114,18 +114,18 @@ afterEach(async () => {
 
 function credentialRecord(overrides: Partial<CredentialRecord> = {}): CredentialRecord {
   return {
-    formatVersion: 1,
+    formatVersion: 2,
     credentialVersion: 1,
-    clientId: "client-raw-1234",
-    clientSecret: "client-secret-CANARY",
+    authorizationPageUrl: "http://auth.example.test/custom",
+    refreshApiUrl: "http://refresh.example.test/custom/renew",
     refreshToken: "refresh-token-CANARY",
     accessToken: "access-token-CANARY",
-    accessTokenExpiresAt: "2026-07-31T00:00:00.000Z",
     account: {
       userIdMasked: "use***89",
       displayNameMasked: "<&***",
     },
     lastVerifiedAt: "2026-07-31T00:00:00.000Z",
+    refreshState: { status: "ready" },
     ...overrides,
   };
 }
@@ -302,12 +302,14 @@ describe("read-only status route", () => {
     expect(response.headers.get("x-content-type-options")).toBe("nosniff");
     expect(response.body).toContain("aliyun");
     expect(response.body).toContain("ready");
-    expect(response.body).toContain("cl****34");
+    expect(response.body).toContain("OpenList");
     expect(response.body).toContain("&lt;&amp;***");
     expect(response.body).toContain("/openClawShare");
     expect(response.body).toContain("openclaw pan-sync configure");
     expect(response.body).not.toMatch(/client_secret|refresh_token|access_token/u);
-    expect(response.body).not.toContain(record.clientSecret);
+    expect(response.body).not.toContain("client_id");
+    expect(response.body).not.toContain(record.authorizationPageUrl);
+    expect(response.body).not.toContain(record.refreshApiUrl);
     expect(response.body).not.toContain(record.refreshToken);
     expect(response.body).not.toContain(record.accessToken);
     expect(response.body).not.toContain("raw-user-id-CANARY");
@@ -321,6 +323,7 @@ describe("read-only status route", () => {
     "unconfigured",
     "ready",
     "degraded",
+    "rate_limited",
     "reauth_required",
   ] satisfies TokenManagerStatus[])("renders the bounded %s state", async (status) => {
     const handler = createPanSyncStatusRoute({
@@ -397,9 +400,10 @@ describe("read-only status route", () => {
         return false;
       },
     };
-    const tokenManager = new TokenManager(vault, {
-      refreshToken: vi.fn(),
-    } as never);
+    const tokenManager = new TokenManager({
+      store: vault,
+      tokenService: { refresh: vi.fn() },
+    });
     const handler = createPanSyncStatusRoute({
       store: vault as never,
       tokenManager,
@@ -411,7 +415,7 @@ describe("read-only status route", () => {
     expect(reads).toBe(1);
     expect(response.body).toContain("ready");
     expect(response.body).toContain("Configured</dt><dd>yes");
-    expect(response.body).toContain("cl****34");
+    expect(response.body).toContain("OpenList");
   });
 });
 
@@ -446,16 +450,15 @@ describe("OpenClaw plugin entry", () => {
 
   it("parses only plugin-owned non-secret config", () => {
     const configSchema = pluginConfigSchema(panSyncPlugin);
-    expect(configSchema.safeParse?.({
-      defaultDirectory: "/reports",
-      tokenGuideUrl: "https://example.test/guide",
-    })).toMatchObject({
+    expect(configSchema.safeParse?.({ defaultDirectory: "/reports" })).toMatchObject({
       success: true,
       data: {
         defaultDirectory: "/reports",
-        tokenGuideUrl: "https://example.test/guide",
       },
     });
+    expect(configSchema.safeParse?.({
+      tokenGuideUrl: "https://example.test/guide",
+    })).toMatchObject({ success: false });
     expect(configSchema.safeParse?.({
       clientSecret: "config-secret-CANARY",
     })).toMatchObject({ success: false });
@@ -546,9 +549,7 @@ describe("OpenClaw plugin entry", () => {
       "Pan Sync Helper configuration page is ready for 10 minutes.",
     );
 
-    await setup.store.replaceIfVersion(undefined, credentialRecord({
-      accessTokenExpiresAt: "2000-01-01T00:00:00.000Z",
-    }));
+    await setup.store.replaceIfVersion(undefined, credentialRecord());
     const ready = await invokeRoute(
       registeredStatusRoute(registrations),
       "GET",
@@ -572,12 +573,12 @@ describe("OpenClaw plugin entry", () => {
     const failed = await tool.execute("call-1", { paths: ["report.pdf"] });
     expect(failed.details).toEqual({ code: "TOKEN_ENDPOINT_UNAVAILABLE" });
     vi.unstubAllGlobals();
-    const degraded = await invokeRoute(
+    const afterProviderFailure = await invokeRoute(
       registeredStatusRoute(registrations),
       "GET",
     );
-    expect(degraded.body).toContain("degraded");
-    expect(degraded.body).not.toContain("upstream-body-CANARY");
+    expect(afterProviderFailure.body).toContain("ready");
+    expect(afterProviderFailure.body).not.toContain("upstream-body-CANARY");
 
     await service.stop?.({
       config: {},
@@ -590,7 +591,7 @@ describe("OpenClaw plugin entry", () => {
     );
     expect(reset.body).toContain("ready");
     await expect(setup.store.read()).resolves.toEqual(
-      expect.objectContaining({ clientId: "client-raw-1234" }),
+      expect.objectContaining({ authorizationPageUrl: "http://auth.example.test/custom" }),
     );
   });
 

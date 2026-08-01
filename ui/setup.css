@@ -78,6 +78,7 @@ input {
 }
 
 input:focus,
+a:focus-visible,
 button:focus-visible {
   outline: 3px solid #88a5ff;
   outline-offset: 2px;
