@@ -403,6 +403,7 @@ describe("read-only status route", () => {
     const tokenManager = new TokenManager({
       store: vault,
       tokenService: { refresh: vi.fn() },
+      runWithRefreshLease: immediateLease,
     });
     const handler = createPanSyncStatusRoute({
       store: vault as never,
@@ -477,11 +478,15 @@ describe("OpenClaw plugin entry", () => {
     const dataDir = path.join(state.dataDir, "pan-sync-helper");
     let capturedSetupDependencies: import("../../src/admin/setup-server.js").SetupServerDependencies | undefined;
     let capturedLeaseDatabasePath: string | undefined;
+    let leaseFactoryCalls = 0;
+    const leaseKeys: string[] = [];
     const writes: string[] = [];
     const entry = createPanSyncPluginEntry({
       credentialLeaseFactory(databasePath) {
+        leaseFactoryCalls += 1;
         capturedLeaseDatabasePath = databasePath;
-        return async (_key, run) => {
+        return async (key, run) => {
+          leaseKeys.push(key);
           await mkdir(path.dirname(databasePath), {
             recursive: true,
             mode: 0o700,
@@ -528,6 +533,7 @@ describe("OpenClaw plugin entry", () => {
     expect(capturedLeaseDatabasePath).toBe(
       path.join(dataDir, "locks", "lease.sqlite"),
     );
+    expect(leaseFactoryCalls).toBe(1);
     if (process.platform !== "win32") {
       expect(await octalMode(dataDir)).toBe("700");
       expect(await octalMode(path.join(dataDir, "locks"))).toBe("700");
@@ -556,13 +562,19 @@ describe("OpenClaw plugin entry", () => {
     );
     expect(ready.body).toContain("ready");
 
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(
-      JSON.stringify({ error: "upstream-body-CANARY" }),
-      {
-        status: 503,
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.startsWith("http://refresh.example.test/custom/renew")) {
+        return new Response(JSON.stringify({ error: "upstream-body-CANARY" }), {
+          status: 503,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ code: "AccessTokenExpired" }), {
+        status: 401,
         headers: { "content-type": "application/json" },
-      },
-    )));
+      });
+    }));
     const tool = registeredToolFactory(registrations)({
       workspaceDir: path.join(state.dataDir, "workspace"),
     } as never) as {
@@ -577,8 +589,43 @@ describe("OpenClaw plugin entry", () => {
       registeredStatusRoute(registrations),
       "GET",
     );
-    expect(afterProviderFailure.body).toContain("ready");
+    expect(afterProviderFailure.body).toContain("degraded");
     expect(afterProviderFailure.body).not.toContain("upstream-body-CANARY");
+    expect(leaseKeys).toContain("aliyun-token-refresh");
+
+    const persistedFailure = await setup.store.read();
+    if (persistedFailure === undefined) {
+      throw new Error("persisted failure missing");
+    }
+    const explicitRefreshRequests: string[] = [];
+    const explicitRefreshServer = createServer((request, response) => {
+      explicitRefreshRequests.push(request.url ?? "");
+      response.writeHead(400, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: "invalid explicit token" }));
+    });
+    await new Promise<void>((resolve, reject) => {
+      explicitRefreshServer.once("listening", resolve);
+      explicitRefreshServer.once("error", reject);
+      explicitRefreshServer.listen(0, "127.0.0.1");
+    });
+    const explicitAddress = explicitRefreshServer.address() as AddressInfo;
+    try {
+      await expect(setup.provider.validateCredentials({
+        authorizationPageUrl: persistedFailure.authorizationPageUrl,
+        refreshApiUrl: `http://127.0.0.1:${explicitAddress.port}/refresh`,
+        refreshToken: "refresh-explicit-submission",
+        credentialVersion: persistedFailure.credentialVersion + 1,
+      })).rejects.toMatchObject({ code: "REFRESH_TOKEN_REJECTED" });
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        explicitRefreshServer.close((error) => {
+          if (error === undefined) resolve();
+          else reject(error);
+        });
+      });
+    }
+    expect(explicitRefreshRequests).toHaveLength(1);
+    await expect(setup.store.read()).resolves.toEqual(persistedFailure);
 
     await service.stop?.({
       config: {},
@@ -589,7 +636,7 @@ describe("OpenClaw plugin entry", () => {
       registeredStatusRoute(registrations),
       "GET",
     );
-    expect(reset.body).toContain("ready");
+    expect(reset.body).toContain("degraded");
     await expect(setup.store.read()).resolves.toEqual(
       expect.objectContaining({ authorizationPageUrl: "http://auth.example.test/custom" }),
     );

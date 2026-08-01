@@ -1,30 +1,19 @@
-import { readFile } from "node:fs/promises";
-import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   TokenManager,
   type TokenCredentialVault,
 } from "../../src/credentials/token-manager.js";
-import {
-  CredentialStore,
-  type CredentialLeaseRunner,
-} from "../../src/credentials/store.js";
+import type { CredentialLeaseRunner } from "../../src/credentials/store.js";
 import type { CredentialRecord } from "../../src/credentials/types.js";
 import { PanSyncError } from "../../src/errors.js";
 import type {
   AliyunTokenService,
   OpenListRefreshResult,
 } from "../../src/providers/aliyun/types.js";
-import { createTempState } from "../helpers/temp-state.js";
 
 const NOW = Date.parse("2026-08-01T12:00:00.000Z");
 const immediateLease: CredentialLeaseRunner = (_key, run) => run({
   assertOwned: async () => undefined,
-});
-const cleanups: Array<() => Promise<void>> = [];
-
-afterEach(async () => {
-  await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
 });
 
 function record(
@@ -45,18 +34,6 @@ function record(
     lastVerifiedAt: "2026-08-01T11:59:00.000Z",
     refreshState: { status: "ready" },
     ...overrides,
-  };
-}
-
-async function tempStore(): Promise<{
-  dataDir: string;
-  store: CredentialStore;
-}> {
-  const state = await createTempState();
-  cleanups.push(state.cleanup);
-  return {
-    dataDir: state.dataDir,
-    store: new CredentialStore(state.dataDir, immediateLease),
   };
 }
 
@@ -82,6 +59,19 @@ function memoryVault(initial: CredentialRecord): {
       },
     },
     current: () => current,
+  };
+}
+
+function managerOptions(
+  store: TokenCredentialVault,
+  tokenService: AliyunTokenService,
+  clock: () => number = () => NOW,
+) {
+  return {
+    store,
+    tokenService,
+    runWithRefreshLease: immediateLease,
+    clock,
   };
 }
 
@@ -186,7 +176,7 @@ describe("TokenManager", () => {
   it("returns a ready non-empty access token without refreshing", async () => {
     const store = memoryVault(record());
     const tokenService = immediateTokenService();
-    const manager = new TokenManager({ store: store.vault, tokenService });
+    const manager = new TokenManager(managerOptions(store.vault, tokenService));
 
     await expect(manager.getValidAccessToken()).resolves.toBe("access-1");
     expect(tokenService.refresh).not.toHaveBeenCalled();
@@ -203,7 +193,7 @@ describe("TokenManager", () => {
         refreshState: { status, failureCode },
       }));
       const tokenService = immediateTokenService();
-      const manager = new TokenManager({ store: store.vault, tokenService });
+      const manager = new TokenManager(managerOptions(store.vault, tokenService));
 
       await expect(manager.getValidAccessToken()).rejects.toMatchObject({
         code: failureCode,
@@ -215,10 +205,10 @@ describe("TokenManager", () => {
 
   it("rejects an empty access token in a ready record", async () => {
     const store = memoryVault(record(1, { accessToken: "" }));
-    const manager = new TokenManager({
-      store: store.vault,
-      tokenService: immediateTokenService(),
-    });
+    const manager = new TokenManager(managerOptions(
+      store.vault,
+      immediateTokenService(),
+    ));
 
     await expect(manager.getValidAccessToken()).rejects.toMatchObject({
       code: "CREDENTIALS_INVALID",
@@ -233,6 +223,7 @@ describe("TokenManager", () => {
         replaceIfVersion: async () => false,
       },
       tokenService,
+      runWithRefreshLease: immediateLease,
     });
 
     await expect(manager.status()).resolves.toBe("unconfigured");
@@ -248,6 +239,7 @@ describe("TokenManager", () => {
     const manager = new TokenManager({
       store: store.vault,
       tokenService: refresh.tokenService,
+      runWithRefreshLease: immediateLease,
       clock: () => NOW,
     });
 
@@ -280,7 +272,7 @@ describe("TokenManager", () => {
       refreshToken: "winner-refresh",
     }));
     const tokenService = immediateTokenService();
-    const manager = new TokenManager({ store: store.vault, tokenService });
+    const manager = new TokenManager(managerOptions(store.vault, tokenService));
 
     await expect(manager.forceRefresh("access-1")).resolves.toBe("winner-access");
     expect(tokenService.refresh).not.toHaveBeenCalled();
@@ -304,6 +296,7 @@ describe("TokenManager", () => {
     const manager = new TokenManager({
       store: vault,
       tokenService: immediateTokenService(),
+      runWithRefreshLease: immediateLease,
       clock: () => NOW,
     });
 
@@ -311,25 +304,110 @@ describe("TokenManager", () => {
     expect(current).toBe(winner);
   });
 
-  it("leaves the encrypted record unchanged when refresh fails", async () => {
-    const { dataDir, store } = await tempStore();
+  it.each([
+    [
+      "RATE_LIMITED with Retry-After",
+      new PanSyncError("RATE_LIMITED", { retryAfterMs: 5 * 60_000 }),
+      {
+        status: "rate_limited",
+        notBefore: "2026-08-01T12:05:00.000Z",
+        failureCode: "RATE_LIMITED",
+      },
+    ],
+    [
+      "RATE_LIMITED without Retry-After",
+      new PanSyncError("RATE_LIMITED"),
+      {
+        status: "rate_limited",
+        notBefore: "2026-08-01T13:00:00.000Z",
+        failureCode: "RATE_LIMITED",
+      },
+    ],
+    [
+      "network, timeout, or 5xx failure",
+      new PanSyncError("TOKEN_ENDPOINT_UNAVAILABLE"),
+      {
+        status: "degraded",
+        notBefore: "2026-08-01T12:01:00.000Z",
+        failureCode: "TOKEN_ENDPOINT_UNAVAILABLE",
+      },
+    ],
+    [
+      "rejected refresh token",
+      new PanSyncError("REFRESH_TOKEN_REJECTED"),
+      {
+        status: "reauth_required",
+        failureCode: "REFRESH_TOKEN_REJECTED",
+      },
+    ],
+  ] as const)("persists %s before rejecting", async (_label, failure, refreshState) => {
     const initial = record();
-    await store.replace(initial);
-    const encryptedPath = path.join(dataDir, "credentials.enc");
-    const ciphertextBefore = await readFile(encryptedPath);
+    const store = memoryVault(initial);
     const tokenService: AliyunTokenService = {
       async refresh() {
-        throw new PanSyncError("RATE_LIMITED");
+        throw failure;
       },
     };
-    const manager = new TokenManager({ store, tokenService });
+    const manager = new TokenManager(managerOptions(store.vault, tokenService));
 
     const error = await rejectedPanSyncError(() => manager.forceRefresh());
 
-    expect(error.code).toBe("RATE_LIMITED");
-    expect(await readFile(encryptedPath)).toEqual(ciphertextBefore);
-    await expect(store.read()).resolves.toEqual(initial);
-    await expect(manager.status()).resolves.toBe("ready");
+    expect(error.code).toBe(failure.code);
+    expect(store.current()).toEqual({
+      ...initial,
+      credentialVersion: 2,
+      refreshState,
+    });
+    await expect(manager.status()).resolves.toBe(refreshState.status);
+  });
+
+  it.each([
+    [
+      "degraded",
+      "TOKEN_ENDPOINT_UNAVAILABLE",
+      "2026-08-01T12:01:00.000Z",
+    ],
+    ["rate_limited", "RATE_LIMITED", "2026-08-01T13:00:00.000Z"],
+  ] as const)(
+    "blocks persisted %s cooldown after restart and allows refresh exactly at notBefore",
+    async (status, failureCode, notBefore) => {
+      let now = NOW;
+      const store = memoryVault(record(2, {
+        refreshState: { status, failureCode, notBefore },
+      }));
+      const tokenService = immediateTokenService();
+      const manager = new TokenManager(managerOptions(
+        store.vault,
+        tokenService,
+        () => now,
+      ));
+
+      await expect(manager.forceRefresh()).rejects.toMatchObject({
+        code: failureCode,
+      });
+      expect(tokenService.refresh).not.toHaveBeenCalled();
+
+      now = Date.parse(notBefore);
+      await expect(manager.forceRefresh()).resolves.toBe("access-2");
+      expect(tokenService.refresh).toHaveBeenCalledTimes(1);
+      expect(store.current().refreshState).toEqual({ status: "ready" });
+    },
+  );
+
+  it("blocks a persisted reauth requirement after restart without an upstream request", async () => {
+    const store = memoryVault(record(2, {
+      refreshState: {
+        status: "reauth_required",
+        failureCode: "REFRESH_TOKEN_REJECTED",
+      },
+    }));
+    const tokenService = immediateTokenService();
+    const manager = new TokenManager(managerOptions(store.vault, tokenService));
+
+    await expect(manager.forceRefresh()).rejects.toMatchObject({
+      code: "REFRESH_TOKEN_REJECTED",
+    });
+    expect(tokenService.refresh).not.toHaveBeenCalled();
   });
 
   it("lets a cancelled joiner leave a shared refresh without cancelling its leader", async () => {
@@ -338,6 +416,8 @@ describe("TokenManager", () => {
     const manager = new TokenManager({
       store: store.vault,
       tokenService: refresh.tokenService,
+      runWithRefreshLease: immediateLease,
+      clock: () => NOW,
     });
     const leader = manager.forceRefresh();
     await refresh.started;
@@ -363,6 +443,7 @@ describe("TokenManager", () => {
     const manager = new TokenManager({
       store: store.vault,
       tokenService: refresh.tokenService,
+      runWithRefreshLease: immediateLease,
     });
     const leaderController = new AbortController();
     const leader = manager.forceRefresh(undefined, {
@@ -402,6 +483,8 @@ describe("TokenManager", () => {
     const manager = new TokenManager({
       store: store.vault,
       tokenService: refresh.tokenService,
+      runWithRefreshLease: immediateLease,
+      clock: () => NOW,
     });
     const first = manager.forceRefresh();
     await refresh.started;
@@ -417,8 +500,16 @@ describe("TokenManager", () => {
       { status: "rejected", reason: failure },
     ]);
     expect(refresh.calls()).toBe(1);
-    expect(store.current()).toBe(initial);
-    await expect(manager.status()).resolves.toBe("ready");
+    expect(store.current()).toEqual({
+      ...initial,
+      credentialVersion: 2,
+      refreshState: {
+        status: "degraded",
+        notBefore: new Date(NOW + 60_000).toISOString(),
+        failureCode: "TOKEN_ENDPOINT_UNAVAILABLE",
+      },
+    });
+    await expect(manager.status()).resolves.toBe("degraded");
   });
 
   it("removes every caller abort listener after a shared refresh settles", async () => {
@@ -427,6 +518,7 @@ describe("TokenManager", () => {
     const manager = new TokenManager({
       store: store.vault,
       tokenService: refresh.tokenService,
+      runWithRefreshLease: immediateLease,
     });
     const firstController = new AbortController();
     const secondController = new AbortController();
@@ -461,6 +553,7 @@ describe("TokenManager", () => {
     const manager = new TokenManager({
       store: store.vault,
       tokenService: refresh.tokenService,
+      runWithRefreshLease: immediateLease,
     });
     const controller = new AbortController();
     const pending = manager.forceRefresh(undefined, { signal: controller.signal });
@@ -481,6 +574,7 @@ describe("TokenManager", () => {
     const manager = new TokenManager({
       store: store.vault,
       tokenService: refresh.tokenService,
+      runWithRefreshLease: immediateLease,
     });
     const pending = manager.forceRefresh();
     await refresh.started;

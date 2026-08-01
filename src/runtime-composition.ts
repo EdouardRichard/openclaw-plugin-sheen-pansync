@@ -5,7 +5,10 @@ import {
   type CredentialLeaseRunner,
   CredentialStore,
 } from "./credentials/store.js";
-import { TokenManager } from "./credentials/token-manager.js";
+import {
+  makeReentrantCredentialLeaseRunner,
+  TokenManager,
+} from "./credentials/token-manager.js";
 import { ProviderRegistry } from "./provider-registry.js";
 import { OpenListTokenService } from "./providers/aliyun/openlist-token-service.js";
 import { AliyunProvider } from "./providers/aliyun/provider.js";
@@ -36,13 +39,17 @@ export function createPanSyncRuntime(
   const config = resolvePluginConfig(options.pluginConfig);
   const dataDir = path.join(options.stateDir, PLUGIN_DATA_DIRECTORY);
   const leaseDatabasePath = path.join(dataDir, "locks", "lease.sqlite");
-  const lease = (
+  const lease = makeReentrantCredentialLeaseRunner((
     options.credentialLeaseFactory
     ?? createSqliteWorkerCredentialLeaseRunner
-  )(leaseDatabasePath);
+  )(leaseDatabasePath));
   const store = new CredentialStore(dataDir, lease);
   const tokenService = new OpenListTokenService();
-  const tokenManager = new TokenManager({ store, tokenService });
+  const tokenManager = new TokenManager({
+    store,
+    tokenService,
+    runWithRefreshLease: lease,
+  });
   const provider = new AliyunProvider({ tokenService, tokenManager });
   const providerRegistry = new ProviderRegistry([provider], "aliyun");
   const orchestrator = new UploadOrchestrator({
