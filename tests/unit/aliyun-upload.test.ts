@@ -1,4 +1,4 @@
-import { createServer, type IncomingMessage, type Server } from "node:http";
+import { createServer, type IncomingMessage, type RequestListener } from "node:http";
 import { mkdtemp, open, rm, truncate } from "node:fs/promises";
 import type { Socket } from "node:net";
 import os from "node:os";
@@ -8,6 +8,7 @@ import type { CloudDriveProvider, RemoteDirectory } from "../../src/contracts.js
 import type { ResolvedWorkspaceFile } from "../../src/workspace/path-guard.js";
 import { PanSyncError } from "../../src/errors.js";
 import { ProviderRegistry } from "../../src/provider-registry.js";
+import { bindFetchSafeLoopbackServer } from "../../src/net/fetch-safe-loopback.js";
 import { AliyunProvider } from "../../src/providers/aliyun/provider.js";
 import type { AliyunFetch } from "../../src/providers/aliyun/types.js";
 
@@ -80,7 +81,7 @@ async function startUploadServer(
   let maximumPuts = 0;
   let baseUrl = "";
 
-  const server: Server = createServer(async (request, response) => {
+  const requestListener: RequestListener = async (request, response) => {
     const requestUrl = new URL(request.url ?? "/", baseUrl);
     const partMatch = /^\/signed\/(?:refreshed-)?(\d+)$/.exec(requestUrl.pathname);
     if (request.method === "PUT" && partMatch !== null) {
@@ -215,22 +216,17 @@ async function startUploadServer(
 
     response.writeHead(404, { "content-type": "application/json" });
     response.end("{}");
+  };
+  const { server, address } = await bindFetchSafeLoopbackServer({
+    createServer() {
+      const candidate = createServer(requestListener);
+      candidate.on("connection", (socket) => {
+        sockets.add(socket);
+        socket.on("close", () => sockets.delete(socket));
+      });
+      return candidate;
+    },
   });
-  server.on("connection", (socket) => {
-    sockets.add(socket);
-    socket.on("close", () => sockets.delete(socket));
-  });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      server.off("error", reject);
-      resolve();
-    });
-  });
-  const address = server.address();
-  if (address === null || typeof address === "string") {
-    throw new Error("upload server did not bind");
-  }
   baseUrl = `http://127.0.0.1:${address.port}`;
 
   const fixture: UploadServer = {

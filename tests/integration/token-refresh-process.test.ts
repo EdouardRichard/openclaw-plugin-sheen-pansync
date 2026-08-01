@@ -1,7 +1,6 @@
 import { execFile, fork } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { createServer } from "node:http";
-import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
@@ -9,6 +8,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { CredentialStore } from "../../src/credentials/store.js";
 import type { CredentialLeaseRunner } from "../../src/credentials/store.js";
 import type { CredentialRecord } from "../../src/credentials/types.js";
+import { bindFetchSafeLoopbackServer } from "../../src/net/fetch-safe-loopback.js";
 import { createTempState } from "../helpers/temp-state.js";
 
 type ChildMessage = {
@@ -176,22 +176,22 @@ async function withOpenList(
     releaseResponse = resolve;
   });
   const requests: string[] = [];
-  const server = createServer(async (request, response) => {
-    requests.push(request.url ?? "");
-    await responseReleased;
-    if (responseStatus === 429) {
-      response.writeHead(429, { "content-type": "application/json" });
-      response.end(JSON.stringify({ error: "rate limited" }));
-      return;
-    }
-    response.writeHead(200, { "content-type": "application/json" });
-    response.end(JSON.stringify({
-      access_token: "access-rotated",
-      refresh_token: "refresh-rotated",
-    }));
+  const { server, address } = await bindFetchSafeLoopbackServer({
+    createServer: () => createServer(async (request, response) => {
+      requests.push(request.url ?? "");
+      await responseReleased;
+      if (responseStatus === 429) {
+        response.writeHead(429, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: "rate limited" }));
+        return;
+      }
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        access_token: "access-rotated",
+        refresh_token: "refresh-rotated",
+      }));
+    }),
   });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address() as AddressInfo;
   try {
     await run({
       refreshApiUrl: `http://127.0.0.1:${address.port}/refresh`,

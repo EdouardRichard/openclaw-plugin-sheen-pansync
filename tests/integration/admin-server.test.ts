@@ -10,6 +10,7 @@ import { JSDOM } from "jsdom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CredentialRecord } from "../../src/credentials/types.js";
 import { PanSyncError } from "../../src/errors.js";
+import { bindFetchSafeLoopbackServer } from "../../src/net/fetch-safe-loopback.js";
 import { OpenListTokenService } from "../../src/providers/aliyun/openlist-token-service.js";
 import { AliyunProvider } from "../../src/providers/aliyun/provider.js";
 import { UploadOrchestrator } from "../../src/upload/orchestrator.js";
@@ -65,28 +66,23 @@ async function startDelayedApi(delayedPath: string) {
   const started = deferred();
   const aborted = deferred();
   const requests: string[] = [];
-  const server = nodeCreateServer((request, response) => {
-    const requestPath = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
-    requests.push(requestPath);
-    if (requestPath === delayedPath) {
-      started.resolve();
-      request.once("aborted", () => aborted.resolve());
-      response.once("close", () => {
-        if (!response.writableEnded) aborted.resolve();
-      });
-      request.resume();
-      return;
-    }
-    response.writeHead(500, { "content-type": "application/json" });
-    response.end('{"code":"UNEXPECTED_REQUEST"}');
+  const { server, address } = await bindFetchSafeLoopbackServer({
+    createServer: () => nodeCreateServer((request, response) => {
+      const requestPath = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
+      requests.push(requestPath);
+      if (requestPath === delayedPath) {
+        started.resolve();
+        request.once("aborted", () => aborted.resolve());
+        response.once("close", () => {
+          if (!response.writableEnded) aborted.resolve();
+        });
+        request.resume();
+        return;
+      }
+      response.writeHead(500, { "content-type": "application/json" });
+      response.end('{"code":"UNEXPECTED_REQUEST"}');
+    }),
   });
-  server.listen(0, "127.0.0.1");
-  await new Promise<void>((resolve, reject) => {
-    server.once("listening", resolve);
-    server.once("error", reject);
-  });
-  const address = server.address();
-  if (address === null || typeof address === "string") throw new Error("delayed API unavailable");
   return {
     baseUrl: `http://127.0.0.1:${address.port}`,
     requests,

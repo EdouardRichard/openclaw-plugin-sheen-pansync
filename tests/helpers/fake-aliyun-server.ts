@@ -1,5 +1,6 @@
-import { createServer, type Server } from "node:http";
+import { createServer, type RequestListener } from "node:http";
 import type { Socket } from "node:net";
+import { bindFetchSafeLoopbackServer } from "../../src/net/fetch-safe-loopback.js";
 
 export type FakeAliyunRequest = {
   method: string;
@@ -25,9 +26,7 @@ export async function startFakeAliyunServer(
   const queue = Array.isArray(responses) ? [...responses] : [responses];
   const requests: FakeAliyunRequest[] = [];
   const sockets = new Set<Socket>();
-  let server: Server;
-
-  server = createServer((request, response) => {
+  const requestListener: RequestListener = (request, response) => {
     const chunks: Buffer[] = [];
     request.on("data", (chunk: Buffer) => {
       chunks.push(chunk);
@@ -50,24 +49,17 @@ export async function startFakeAliyunServer(
       });
       response.end(JSON.stringify(next.body ?? {}));
     });
+  };
+  const { server, address } = await bindFetchSafeLoopbackServer({
+    createServer() {
+      const candidate = createServer(requestListener);
+      candidate.on("connection", (socket) => {
+        sockets.add(socket);
+        socket.on("close", () => sockets.delete(socket));
+      });
+      return candidate;
+    },
   });
-  server.on("connection", (socket) => {
-    sockets.add(socket);
-    socket.on("close", () => sockets.delete(socket));
-  });
-
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      server.off("error", reject);
-      resolve();
-    });
-  });
-
-  const address = server.address();
-  if (address === null || typeof address === "string") {
-    throw new Error("fake Aliyun server did not bind a TCP port");
-  }
 
   return {
     baseUrl: `http://127.0.0.1:${address.port}`,

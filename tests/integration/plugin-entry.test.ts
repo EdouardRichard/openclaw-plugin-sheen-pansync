@@ -10,7 +10,6 @@ import {
   rm,
   stat,
 } from "node:fs/promises";
-import type { AddressInfo } from "node:net";
 import type {
   OpenClawPluginApi,
   OpenClawPluginConfigSchema,
@@ -25,6 +24,7 @@ import {
   createPanSyncPluginEntry,
   default as panSyncPlugin,
 } from "../../src/index.js";
+import { bindFetchSafeLoopbackServer } from "../../src/net/fetch-safe-loopback.js";
 import { createPanSyncStatusRoute } from "../../src/admin/status-route.js";
 import {
   type CredentialLeaseRunner,
@@ -213,18 +213,14 @@ async function invokeRoute(
   handler: OpenClawPluginHttpRouteHandler,
   method: string,
 ): Promise<{ status: number; headers: Headers; body: string }> {
-  const server = createServer((request, response) => {
-    void Promise.resolve(handler(request, response)).catch(() => {
-      response.statusCode = 500;
-      response.end();
-    });
+  const { server, address } = await bindFetchSafeLoopbackServer({
+    createServer: () => createServer((request, response) => {
+      void Promise.resolve(handler(request, response)).catch(() => {
+        response.statusCode = 500;
+        response.end();
+      });
+    }),
   });
-  server.listen(0, "127.0.0.1");
-  await new Promise<void>((resolve, reject) => {
-    server.once("listening", resolve);
-    server.once("error", reject);
-  });
-  const address = server.address() as AddressInfo;
   try {
     const response = await fetch(`http://127.0.0.1:${address.port}/status`, {
       method,
@@ -599,17 +595,16 @@ describe("OpenClaw plugin entry", () => {
       throw new Error("persisted failure missing");
     }
     const explicitRefreshRequests: string[] = [];
-    const explicitRefreshServer = createServer((request, response) => {
-      explicitRefreshRequests.push(request.url ?? "");
-      response.writeHead(400, { "content-type": "application/json" });
-      response.end(JSON.stringify({ error: "invalid explicit token" }));
+    const {
+      server: explicitRefreshServer,
+      address: explicitAddress,
+    } = await bindFetchSafeLoopbackServer({
+      createServer: () => createServer((request, response) => {
+        explicitRefreshRequests.push(request.url ?? "");
+        response.writeHead(400, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: "invalid explicit token" }));
+      }),
     });
-    await new Promise<void>((resolve, reject) => {
-      explicitRefreshServer.once("listening", resolve);
-      explicitRefreshServer.once("error", reject);
-      explicitRefreshServer.listen(0, "127.0.0.1");
-    });
-    const explicitAddress = explicitRefreshServer.address() as AddressInfo;
     try {
       await expect(setup.provider.validateCredentials({
         authorizationPageUrl: persistedFailure.authorizationPageUrl,

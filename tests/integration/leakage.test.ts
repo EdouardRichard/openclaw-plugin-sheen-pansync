@@ -2,7 +2,6 @@ import { createServer } from "node:http";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import type { AddressInfo } from "node:net";
 import { types as nodeTypes } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import type {
@@ -17,6 +16,7 @@ import { CredentialStore } from "../../src/credentials/store.js";
 import { TokenManager, type TokenCredentialVault } from "../../src/credentials/token-manager.js";
 import type { CredentialRecord } from "../../src/credentials/types.js";
 import { createPanSyncPluginEntry } from "../../src/index.js";
+import { bindFetchSafeLoopbackServer } from "../../src/net/fetch-safe-loopback.js";
 import { ProviderRegistry } from "../../src/provider-registry.js";
 import { OpenListTokenService } from "../../src/providers/aliyun/openlist-token-service.js";
 import { AliyunProvider } from "../../src/providers/aliyun/provider.js";
@@ -120,18 +120,14 @@ function orchestratorFor(
 }
 
 async function invokeRoute(handler: OpenClawPluginHttpRouteHandler) {
-  const server = createServer((request, response) => {
-    void Promise.resolve(handler(request, response)).catch(() => {
-      response.statusCode = 500;
-      response.end();
-    });
+  const { server, address } = await bindFetchSafeLoopbackServer({
+    createServer: () => createServer((request, response) => {
+      void Promise.resolve(handler(request, response)).catch(() => {
+        response.statusCode = 500;
+        response.end();
+      });
+    }),
   });
-  server.listen(0, "127.0.0.1");
-  await new Promise<void>((resolve, reject) => {
-    server.once("listening", resolve);
-    server.once("error", reject);
-  });
-  const address = server.address() as AddressInfo;
   try {
     return await (await fetch(`http://127.0.0.1:${address.port}/status`)).text();
   } finally {

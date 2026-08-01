@@ -14,6 +14,10 @@ import type { CredentialStore } from "../credentials/store.js";
 import type { CredentialRecord } from "../credentials/types.js";
 import { PanSyncError, safeErrorDetails } from "../errors.js";
 import {
+  bindFetchSafeLoopbackServer,
+  isFetchSafePort,
+} from "../net/fetch-safe-loopback.js";
+import {
   DEFAULT_OPENLIST_AUTHORIZATION_PAGE_URL,
   DEFAULT_OPENLIST_REFRESH_API_URL,
 } from "../providers/aliyun/constants.js";
@@ -30,14 +34,6 @@ const REQUEST_LIFETIME_MS = 15 * 1_000;
 const RESULT_DISPLAY_MS = 60 * 1_000;
 const DEFAULT_REMOTE_DIRECTORY = "/openClawShare";
 const LOOPBACK_HOST = "127.0.0.1";
-const FETCH_FORBIDDEN_PORTS = new Set([
-  1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69,
-  77, 79, 87, 95, 101, 102, 103, 104, 109, 110, 111, 113, 115, 117, 119,
-  123, 135, 137, 139, 143, 161, 179, 389, 427, 465, 512, 513, 514, 515,
-  526, 530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636, 989, 990,
-  993, 995, 1719, 1720, 1723, 2049, 3659, 4045, 5060, 5061, 6000, 6566,
-  6665, 6666, 6667, 6668, 6669, 6697, 10080,
-]);
 
 export const SETUP_SECURITY_HEADERS = {
   "Cache-Control": "no-store",
@@ -313,29 +309,11 @@ function projectRecord(record: CredentialRecord | undefined, dependencies: Setup
   };
 }
 
-function isBrowserSafePort(port: number): boolean {
-  return port >= 1 && port <= 65_535 && !FETCH_FORBIDDEN_PORTS.has(port);
-}
-
-function closeListeningServer(server: Server): Promise<void> {
-  return new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
-}
-
 function safeFailure(error: unknown): { status: number; body: { code: string } } {
   if (error instanceof SetupConflictError) return { status: 409, body: { code: "CREDENTIALS_INVALID" } };
   const details = safeErrorDetails(error);
   const status = details.code === "TOKEN_ENDPOINT_UNAVAILABLE" || details.code === "RATE_LIMITED" ? 503 : 400;
   return { status, body: details };
-}
-
-function waitUntilListening(server: Server): Promise<void> {
-  if (server.listening) return Promise.resolve();
-  return new Promise((resolve, reject) => {
-    const onError = (error: Error): void => { server.off("listening", onListening); reject(error); };
-    const onListening = (): void => { server.off("error", onError); resolve(); };
-    server.once("error", onError);
-    server.once("listening", onListening);
-  });
 }
 
 export async function startSetupServer(
@@ -369,7 +347,7 @@ export async function startSetupServer(
   let closing: Promise<void> | undefined;
   let expiryTimeout: unknown;
   let resultTimeout: unknown;
-  let selectedPort: number | undefined;
+  let selectedPort!: number;
   const activeRequests = new Set<RequestContext>();
   let resolveClosed!: () => void;
   const closed = new Promise<void>((resolve) => { resolveClosed = resolve; });
@@ -627,30 +605,21 @@ export async function startSetupServer(
     })();
   };
 
-  const portIsSafe = runtime.isBrowserSafePort ?? isBrowserSafePort;
   try {
-    for (let attempt = 0; attempt < 16; attempt += 1) {
-      server = createServer(requestListener);
-      server.listen(runtime.port ?? 0, LOOPBACK_HOST);
-      await waitUntilListening(server);
-      const address = server.address();
-      if (address === null || typeof address === "string") {
-        await closeListeningServer(server);
-        throw new Error("setup server address unavailable");
-      }
-      if (portIsSafe(address.port)) { selectedPort = address.port; break; }
-      await closeListeningServer(server);
-      if (runtime.port !== undefined && runtime.port !== 0) throw new Error("setup server port rejected by browsers");
-    }
+    const binding = await bindFetchSafeLoopbackServer({
+      createServer: () => createServer(requestListener),
+      ...(runtime.port === undefined ? {} : { port: runtime.port }),
+      isPortSafe: runtime.isBrowserSafePort ?? isFetchSafePort,
+      addressUnavailableMessage: "setup server address unavailable",
+      fixedPortRejectedMessage: "setup server port rejected by browsers",
+      selectionExhaustedMessage: "setup server could not select a browser-safe port",
+    });
+    server = binding.server;
+    selectedPort = binding.address.port;
   } catch (error) {
     accessKeyBuffer.fill(0);
     accessKeyAscii.fill(0);
     throw error;
-  }
-  if (selectedPort === undefined) {
-    accessKeyBuffer.fill(0);
-    accessKeyAscii.fill(0);
-    throw new Error("setup server could not select a browser-safe port");
   }
   server.once("close", () => {
     active = false;
