@@ -11,7 +11,7 @@ import {
   createBuiltPackageFixture,
   type BuiltPackageFixture,
 } from "../helpers/package-fixture.js";
-import { withOpenClawInstallLease } from "../helpers/openclaw-install-lease.js";
+import { withOpenClawInstallLease } from "../helpers/openclaw-install-lease.mjs";
 
 type PackResult = Array<{
   filename?: string;

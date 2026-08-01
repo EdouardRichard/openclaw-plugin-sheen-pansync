@@ -12,7 +12,7 @@ import {
   type PanSyncUploadToolApi,
 } from "../../src/tool.js";
 import type { UploadOrchestrator } from "../../src/upload/orchestrator.js";
-import { withOpenClawInstallLease } from "../helpers/openclaw-install-lease.js";
+import { withOpenClawInstallLease } from "../helpers/openclaw-install-lease.mjs";
 
 type ToolRegistration = Parameters<PanSyncUploadToolApi["registerTool"]>[0];
 type CapturedTool = ReturnType<ToolRegistration>;

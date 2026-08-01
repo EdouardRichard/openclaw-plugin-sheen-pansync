@@ -37,7 +37,7 @@ import {
 import type { CredentialRecord } from "../../src/credentials/types.js";
 import { createTempState, octalMode } from "../helpers/temp-state.js";
 import { createBuiltPackageFixture } from "../helpers/package-fixture.js";
-import { withOpenClawInstallLease } from "../helpers/openclaw-install-lease.js";
+import { withOpenClawInstallLease } from "../helpers/openclaw-install-lease.mjs";
 
 type ToolFactory = OpenClawPluginToolFactory;
 
