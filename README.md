@@ -156,24 +156,40 @@ OpenClaw 会先用 `pan_sync_list` 消除歧义，再用 `pan_sync_download` 下
 
 插件注册/加载和当前 Agent 的有效 Tool 权限是两个独立环节。`openclaw plugins list` 显示 `enabled` 并列出三个 Tool，只能确认插件已经注册；如果当前会话仍提示 `pan_sync_list` 或 `pan_sync_download` 不可用，还需要把它们加入有效的全局或 Agent 级 Tool 策略。
 
-若当前 Agent 没有显式的 Agent 级 `allow` 列表，可在 PowerShell 中运行以下命令。它会读取并保留现有的全局 `tools.alsoAllow`，再合并两个读取 Tool；不要用仅包含插件 Tool 的固定数组直接执行 `config set` 或 `config patch`，因为数组会被整体替换。
+若要修复全局策略，可在 PowerShell 中运行以下命令。它优先读取全局 `tools.allow`：该路径存在时只合并到原 `allow`，不会设置 `alsoAllow`；否则合并到现有 `tools.alsoAllow`，或从空列表开始。若全局 `tools.deny` 存在，它只移除这两个 Tool 的精确名称并保留其他拒绝项；该路径不存在时不会创建它。最终只提交一个递归对象补丁，因此 `tools` 下的其他键也会保留。不要用仅包含插件 Tool 的固定数组直接执行 `config set` 或 `config patch`，因为数组会被整体替换。
 
 ```powershell
-$currentJson = openclaw config get tools.alsoAllow --json 2>$null
-$current = if ($LASTEXITCODE -eq 0) {
-  @($currentJson | ConvertFrom-Json)
+$targets = @("pan_sync_list", "pan_sync_download")
+$allowJson = openclaw config get tools.allow --json 2>$null
+$toolsPatch = @{}
+if ($LASTEXITCODE -eq 0) {
+  $allow = @((($allowJson -join [Environment]::NewLine) | ConvertFrom-Json))
+  $toolsPatch["allow"] = @((
+    $allow + $targets
+  ) | Sort-Object -Unique)
 } else {
-  @()
+  $alsoAllowJson = openclaw config get tools.alsoAllow --json 2>$null
+  $alsoAllow = @()
+  if ($LASTEXITCODE -eq 0) {
+    $alsoAllow = @((($alsoAllowJson -join [Environment]::NewLine) | ConvertFrom-Json))
+  }
+  $toolsPatch["alsoAllow"] = @((
+    $alsoAllow + $targets
+  ) | Sort-Object -Unique)
 }
-$merged = @((
-  $current + @("pan_sync_list", "pan_sync_download")
-) | Sort-Object -Unique)
-@{ tools = @{ alsoAllow = $merged } } |
+$denyJson = openclaw config get tools.deny --json 2>$null
+if ($LASTEXITCODE -eq 0) {
+  $deny = @((($denyJson -join [Environment]::NewLine) | ConvertFrom-Json))
+  $toolsPatch["deny"] = @($deny | Where-Object {
+    $_ -ne "pan_sync_list" -and $_ -ne "pan_sync_download"
+  })
+}
+@{ tools = $toolsPatch } |
   ConvertTo-Json -Compress -Depth 3 |
   openclaw config patch --stdin
 ```
 
-如果当前 Agent 已配置显式 `allow`，全局 `alsoAllow` 可能不会成为它的有效权限。此时在 OpenClaw Control UI 中打开 **Settings → Agents → 当前 Agent → Tools**，把 `pan_sync_list` 和 `pan_sync_download` 加入 `allow`；没有显式 `allow` 时也可加入 Agent 级 `alsoAllow`。同时确认这两个名称不在 `deny` 中，然后保存。不要删除或替换原有授权。
+如果当前 Agent 已配置 Agent 级策略，全局授权可能不会成为它的有效权限。此时在 OpenClaw Control UI 中打开 **Settings → Agents → 当前 Agent → Tools**：已有显式 `allow` 时把 `pan_sync_list` 和 `pan_sync_download` 合并到 `allow`，不要再设置 `alsoAllow`；没有显式 `allow` 时可合并到 Agent 级 `alsoAllow`。同时只从 `deny` 中移除这两个精确名称，然后保存。不要删除或替换任何无关授权或拒绝项。
 
 修改任一作用域后，安全重启 Gateway：
 
@@ -181,10 +197,12 @@ $merged = @((
 openclaw gateway restart --safe
 ```
 
-若使用了上面的全局方式，可确认合并结果：
+若使用了上面的全局方式，先查询 `tools.allow`；它存在时确认两个 Tool 已加入，脚本不会改动或设置 `alsoAllow`。若 `tools.allow` 不存在，则查询 `tools.alsoAllow`。如果修改前存在 `tools.deny`，还要确认其中只移除了这两个名称：
 
-```bash
+```powershell
+openclaw config get tools.allow --json
 openclaw config get tools.alsoAllow --json
+openclaw config get tools.deny --json
 ```
 
 最后新建一个 OpenClaw 会话，分别明确请求列出资源盘根目录和下载读取一个测试文件；旧会话不能代替这次有效权限复验。若使用 Agent 级方式，还应重新打开该 Agent 的 Tools 设置，确认保存的条目仍在。
@@ -360,24 +378,40 @@ Only after your explicit confirmation for that exact file may OpenClaw retry onc
 
 Plugin registration/loading and the active Agent's effective Tool policy are separate gates. Seeing `enabled` and all three Tools in `openclaw plugins list` confirms registration only. If the current session still reports that `pan_sync_list` or `pan_sync_download` is unavailable, add them at the effective global or Agent scope.
 
-If the active Agent has no explicit Agent-level `allow` list, run the following in PowerShell. It reads and preserves the current global `tools.alsoAllow`, then merges in the two read Tools. Do not run `config set` or `config patch` with a fixed array containing only the plugin Tools: arrays are replaced as a whole.
+To repair the global policy, run the following in PowerShell. It reads global `tools.allow` first. If that path exists, it merges into the existing `allow` only and does not set `alsoAllow`; otherwise, it merges into the existing `tools.alsoAllow` or starts with an empty list. When global `tools.deny` exists, it removes only the two exact Tool names and preserves every other denial; it does not create that path when absent. One recursive object patch preserves all sibling keys under `tools`. Do not run `config set` or `config patch` with a fixed array containing only the plugin Tools: arrays are replaced as a whole.
 
 ```powershell
-$currentJson = openclaw config get tools.alsoAllow --json 2>$null
-$current = if ($LASTEXITCODE -eq 0) {
-  @($currentJson | ConvertFrom-Json)
+$targets = @("pan_sync_list", "pan_sync_download")
+$allowJson = openclaw config get tools.allow --json 2>$null
+$toolsPatch = @{}
+if ($LASTEXITCODE -eq 0) {
+  $allow = @((($allowJson -join [Environment]::NewLine) | ConvertFrom-Json))
+  $toolsPatch["allow"] = @((
+    $allow + $targets
+  ) | Sort-Object -Unique)
 } else {
-  @()
+  $alsoAllowJson = openclaw config get tools.alsoAllow --json 2>$null
+  $alsoAllow = @()
+  if ($LASTEXITCODE -eq 0) {
+    $alsoAllow = @((($alsoAllowJson -join [Environment]::NewLine) | ConvertFrom-Json))
+  }
+  $toolsPatch["alsoAllow"] = @((
+    $alsoAllow + $targets
+  ) | Sort-Object -Unique)
 }
-$merged = @((
-  $current + @("pan_sync_list", "pan_sync_download")
-) | Sort-Object -Unique)
-@{ tools = @{ alsoAllow = $merged } } |
+$denyJson = openclaw config get tools.deny --json 2>$null
+if ($LASTEXITCODE -eq 0) {
+  $deny = @((($denyJson -join [Environment]::NewLine) | ConvertFrom-Json))
+  $toolsPatch["deny"] = @($deny | Where-Object {
+    $_ -ne "pan_sync_list" -and $_ -ne "pan_sync_download"
+  })
+}
+@{ tools = $toolsPatch } |
   ConvertTo-Json -Compress -Depth 3 |
   openclaw config patch --stdin
 ```
 
-If the active Agent already has an explicit `allow`, the global `alsoAllow` might not become effective for that Agent. In the OpenClaw Control UI, open **Settings → Agents → active Agent → Tools** and add `pan_sync_list` and `pan_sync_download` to `allow`. With no explicit `allow`, you may instead add them to the Agent-level `alsoAllow`. Ensure neither name is in `deny`, save, and preserve every existing grant.
+If the active Agent has an Agent-level policy, the global grant might not become effective for that Agent. In the OpenClaw Control UI, open **Settings → Agents → active Agent → Tools**. With an explicit `allow`, merge `pan_sync_list` and `pan_sync_download` into `allow` and do not also set `alsoAllow`; without an explicit `allow`, merge them into the Agent-level `alsoAllow`. Remove only these two exact names from `deny`, then save. Preserve every unrelated grant and denial.
 
 After changing either scope, restart the Gateway safely:
 
@@ -385,10 +419,12 @@ After changing either scope, restart the Gateway safely:
 openclaw gateway restart --safe
 ```
 
-For the global method above, inspect the merged result:
+For the global method, query `tools.allow` first. If it exists, confirm the two Tools are present; the script does not change or set `alsoAllow`. If `tools.allow` is absent, query `tools.alsoAllow`. If `tools.deny` existed before the change, also confirm that only the two Tool names were removed:
 
-```bash
+```powershell
+openclaw config get tools.allow --json
 openclaw config get tools.alsoAllow --json
+openclaw config get tools.deny --json
 ```
 
 Finally, start a fresh OpenClaw session and explicitly request a resource-drive root listing and a test-file download/read. An old session does not replace this effective-policy check. For the Agent-level method, also reopen that Agent's Tools settings and confirm that the saved entries remain present.
