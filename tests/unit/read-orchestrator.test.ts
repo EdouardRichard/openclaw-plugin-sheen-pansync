@@ -1,11 +1,13 @@
 import {
   mkdir,
   mkdtemp,
+  open,
   readFile,
   readdir,
   rm,
   stat,
   writeFile,
+  type FileHandle,
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -126,6 +128,29 @@ function makeDownloadHarness(
     providerRegistry,
     tokenManager,
   };
+}
+
+type BufferWritePrototype = {
+  write(
+    this: FileHandle,
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+    position: number | null,
+  ): Promise<{ bytesWritten: number; buffer: Uint8Array }>;
+};
+
+async function getFileHandleWritePrototype(
+  workspace: string,
+): Promise<BufferWritePrototype> {
+  const probePath = path.join(workspace, "file-handle-probe.tmp");
+  const probe = await open(probePath, "wx");
+  try {
+    return Object.getPrototypeOf(probe) as BufferWritePrototype;
+  } finally {
+    await probe.close();
+    await rm(probePath);
+  }
 }
 
 describe("ReadOrchestrator direct directory listing", () => {
@@ -599,6 +624,80 @@ describe("ReadOrchestrator download", () => {
     expect(harness.provider.openDownload).not.toHaveBeenCalled();
   });
 
+  it("maps an unexpected provider-registry failure without leaking details", async () => {
+    const canary = "registry-secret-CANARY";
+    const entry = { ...file("file-id", "id.txt"), size: 1 };
+    const harness = makeDownloadHarness(entry);
+    harness.providerRegistry.resolve.mockImplementation(() => {
+      throw new Error(`registry failed with ${canary} at ${workspace}`);
+    });
+
+    let rejected: unknown;
+    try {
+      await harness.orchestrator.download({
+        workspaceDir: workspace,
+        fileId: entry.id,
+      });
+    } catch (error) {
+      rejected = error;
+    }
+
+    expect(rejected).toMatchObject({ code: "DOWNLOAD_FAILED" });
+    expect(String((rejected as Error).message)).toBe("DOWNLOAD_FAILED");
+    expect(JSON.stringify(rejected)).not.toContain(canary);
+    expect(JSON.stringify(rejected)).not.toContain(workspace);
+    expect(harness.tokenManager.getValidAccessToken).not.toHaveBeenCalled();
+  });
+
+  it("maps an unexpected token-manager failure without leaking details", async () => {
+    const canary = "credential-store-secret-CANARY";
+    const entry = { ...file("file-id", "id.txt"), size: 1 };
+    const harness = makeDownloadHarness(entry);
+    harness.tokenManager.getValidAccessToken.mockRejectedValue(
+      new Error(`credential store failed with ${canary} at ${workspace}`),
+    );
+
+    let rejected: unknown;
+    try {
+      await harness.orchestrator.download({
+        workspaceDir: workspace,
+        fileId: entry.id,
+      });
+    } catch (error) {
+      rejected = error;
+    }
+
+    expect(rejected).toMatchObject({ code: "DOWNLOAD_FAILED" });
+    expect(String((rejected as Error).message)).toBe("DOWNLOAD_FAILED");
+    expect(JSON.stringify(rejected)).not.toContain(canary);
+    expect(JSON.stringify(rejected)).not.toContain(workspace);
+    expect(harness.provider.getEntryById).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["provider registry", "RESOURCE_DRIVE_UNAVAILABLE"],
+    ["token manager", "AUTHORIZATION_REVOKED"],
+  ] as const)("preserves an explicit %s error", async (source, code) => {
+    const entry = { ...file("file-id", "id.txt"), size: 1 };
+    const harness = makeDownloadHarness(entry);
+    if (source === "provider registry") {
+      harness.providerRegistry.resolve.mockImplementation(() => {
+        throw new PanSyncError(code);
+      });
+    } else {
+      harness.tokenManager.getValidAccessToken.mockRejectedValue(
+        new PanSyncError(code),
+      );
+    }
+
+    await expect(
+      harness.orchestrator.download({
+        workspaceDir: workspace,
+        fileId: entry.id,
+      }),
+    ).rejects.toMatchObject({ code });
+  });
+
   it("rejects a directory before opening a stream or local file", async () => {
     const harness = makeDownloadHarness(folder("folder-reports", "reports"));
 
@@ -678,6 +777,54 @@ describe("ReadOrchestrator download", () => {
     expect(await readdir(workspace)).toEqual(["nested"]);
   });
 
+  it("checks cancellation before every partial FileHandle write", async () => {
+    const controller = new AbortController();
+    const writePrototype = await getFileHandleWritePrototype(workspace);
+    const originalWrite = writePrototype.write;
+    let writeCalls = 0;
+    const writeSpy = vi.spyOn(writePrototype, "write").mockImplementation(
+      async function (
+        this: FileHandle,
+        buffer: Uint8Array,
+        offset: number,
+        length: number,
+        position: number | null,
+      ) {
+        writeCalls += 1;
+        const result = await originalWrite.call(
+          this,
+          buffer,
+          offset,
+          writeCalls === 1 ? 1 : length,
+          position,
+        );
+        if (writeCalls === 1) {
+          controller.abort();
+        }
+        return result;
+      },
+    );
+    const entry = { ...file("file-partial-abort", "partial-abort.txt"), size: 2 };
+    const harness = makeDownloadHarness(entry, async () => ({
+      stream: byteStream(2),
+      size: 2,
+    }));
+
+    try {
+      await expect(
+        harness.orchestrator.download(
+          { workspaceDir: workspace, fileId: entry.id },
+          { signal: controller.signal },
+        ),
+      ).rejects.toMatchObject({ code: "DOWNLOAD_FAILED" });
+    } finally {
+      writeSpy.mockRestore();
+    }
+
+    expect(writeCalls).toBe(1);
+    expect(await readdir(workspace)).toEqual(["nested"]);
+  });
+
   it("rejects a short stream and removes the partial local file", async () => {
     const entry = { ...file("file-short", "short.txt"), size: 4 };
     const harness = makeDownloadHarness(entry, async () => ({
@@ -754,21 +901,57 @@ describe("ReadOrchestrator download", () => {
     expect(await readdir(workspace)).toEqual(["nested"]);
   });
 
-  it("maps a local write rejection and removes the created file", async () => {
+  it("maps a genuine FileHandle write rejection without leaking details", async () => {
+    const canary = "local-write-secret-CANARY";
+    const writePrototype = await getFileHandleWritePrototype(workspace);
+    const originalWrite = writePrototype.write;
+    let writeCalls = 0;
+    const writeSpy = vi.spyOn(writePrototype, "write").mockImplementation(
+      async function (
+        this: FileHandle,
+        buffer: Uint8Array,
+        offset: number,
+        length: number,
+        position: number | null,
+      ) {
+        writeCalls += 1;
+        await this.close();
+        try {
+          return await originalWrite.call(
+            this,
+            buffer,
+            offset,
+            length,
+            position,
+          );
+        } catch {
+          throw new Error(`write failed with ${canary} at ${workspace}`);
+        }
+      },
+    );
     const entry = { ...file("file-write", "write.txt"), size: 1 };
     const harness = makeDownloadHarness(entry, async () => ({
-      stream: new ReadableStream<Uint8Array>({
-        start(controller) {
-          controller.enqueue({ byteLength: 1 } as Uint8Array);
-          controller.close();
-        },
-      }),
+      stream: byteStream(1),
       size: 1,
     }));
 
-    await expect(
-      harness.orchestrator.download({ workspaceDir: workspace, fileId: entry.id }),
-    ).rejects.toMatchObject({ code: "DOWNLOAD_FAILED" });
+    let rejected: unknown;
+    try {
+      await harness.orchestrator.download({
+        workspaceDir: workspace,
+        fileId: entry.id,
+      });
+    } catch (error) {
+      rejected = error;
+    } finally {
+      writeSpy.mockRestore();
+    }
+
+    expect(writeCalls).toBe(1);
+    expect(rejected).toMatchObject({ code: "DOWNLOAD_FAILED" });
+    expect(String((rejected as Error).message)).toBe("DOWNLOAD_FAILED");
+    expect(JSON.stringify(rejected)).not.toContain(canary);
+    expect(JSON.stringify(rejected)).not.toContain(workspace);
     expect(await readdir(workspace)).toEqual(["nested"]);
   });
 });

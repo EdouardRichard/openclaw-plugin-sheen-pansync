@@ -60,9 +60,11 @@ function assertDownloadActive(signal: AbortSignal | undefined): void {
 async function writeChunk(
   target: WorkspaceDownloadTarget,
   chunk: Uint8Array,
+  signal: AbortSignal | undefined,
 ): Promise<void> {
   let offset = 0;
   while (offset < chunk.byteLength) {
+    assertDownloadActive(signal);
     const { bytesWritten } = await target.handle.write(
       chunk,
       offset,
@@ -153,10 +155,12 @@ export class ReadOrchestrator {
       throw new PanSyncError("REMOTE_FILE_AMBIGUOUS");
     }
 
-    const provider = this.dependencies.providerRegistry.resolve(input.provider);
-    const accessToken = await this.dependencies.tokenManager.getValidAccessToken(options);
+    let provider: CloudDriveProvider;
+    let accessToken: string;
     let entry: RemoteEntry;
     try {
+      provider = this.dependencies.providerRegistry.resolve(input.provider);
+      accessToken = await this.dependencies.tokenManager.getValidAccessToken(options);
       entry = input.fileId === undefined
         ? await provider.resolveEntry(input.remotePath!, accessToken, options)
         : await provider.getEntryById(input.fileId, accessToken, options);
@@ -213,7 +217,7 @@ export class ReadOrchestrator {
         if (written + chunk.byteLength > entry.size) {
           throw new PanSyncError("DOWNLOAD_FAILED");
         }
-        await writeChunk(target, chunk);
+        await writeChunk(target, chunk, options.signal);
         written += chunk.byteLength;
       }
       assertDownloadActive(options.signal);
