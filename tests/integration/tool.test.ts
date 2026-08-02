@@ -706,24 +706,43 @@ describe("OpenClaw manifest ownership", () => {
 });
 
 describe("pan-sync-upload Skill discovery contract", () => {
-  it("declares the approved explicit-trigger and safe-upload guidance", async () => {
+  it("discovers bilingual upload, list, search, download, and read intent", async () => {
     const contents = await readFile(
       new URL("../../skills/pan-sync-upload/SKILL.md", import.meta.url),
       "utf8",
     );
 
     expect(contents).toMatch(
-      /^---\nname: pan-sync-upload\ndescription: Upload concrete OpenClaw workspace files when the user explicitly asks to push, upload, or sync results to a cloud drive\.\n---\n/u,
+      /^---\nname: pan-sync-upload\ndescription: .*Chinese or English\.\n---\n/u,
     );
-    expect(contents).toContain("阿里网盘");
-    expect(contents).toContain("阿里云盘");
-    expect(contents).toContain("aliyun");
-    expect(contents).toContain("alipan");
-    expect(contents).toMatch(/明确.*上传|上传.*明确/u);
-    expect(contents).toMatch(/讨论.*不.*调用/u);
-    expect(contents).toMatch(/先.*生成.*确认.*路径.*存在.*再.*调用/u);
-    expect(contents).toMatch(/不得.*虚构.*路径/u);
-    expect(contents).toMatch(/同一.*规范.*文件.*不得.*重复/u);
+    expect(contents).toMatch(/阿里网盘|阿里云盘/u);
+    expect(contents).toMatch(/aliyun|alipan/iu);
+    expect(contents).toMatch(/上传[\s\S]*pan_sync_upload|pan_sync_upload[\s\S]*upload/iu);
+    expect(contents).toMatch(/列出[\s\S]*pan_sync_list|pan_sync_list[\s\S]*list/iu);
+    expect(contents).toMatch(/搜索[\s\S]*pan_sync_list|pan_sync_list[\s\S]*search/iu);
+    expect(contents).toMatch(/读取[\s\S]*pan_sync_download|pan_sync_download[\s\S]*read/iu);
+    expect(contents).toMatch(/下载[\s\S]*pan_sync_download|pan_sync_download[\s\S]*download/iu);
+    expect(contents).toMatch(/同步到[\s\S]*sync to/iu);
+    expect(contents).toMatch(/从网盘同步下来[\s\S]*sync from/iu);
+  });
+
+  it("requires safe clarification, confirmation, and no-tool behavior", async () => {
+    const contents = await readFile(
+      new URL("../../skills/pan-sync-upload/SKILL.md", import.meta.url),
+      "utf8",
+    );
+
+    expect(contents).toMatch(/同步网盘[\s\S]*澄清|澄清[\s\S]*同步网盘/u);
+    expect(contents).toMatch(/sync cloud drive[\s\S]*clarif|clarif[\s\S]*sync cloud drive/iu);
+    expect(contents).toMatch(/多个|multiple/iu);
+    expect(contents).toMatch(/选择|select/iu);
+    expect(contents).toContain("DOWNLOAD_CONFIRMATION_REQUIRED");
+    expect(contents).toMatch(/100 MiB/iu);
+    expect(contents).toMatch(/确认|confirm/iu);
+    expect(contents).toMatch(/讨论[\s\S]*不调用|不调用[\s\S]*讨论/u);
+    expect(contents).toMatch(
+      /discuss[\s\S]*(?:do not|must not) call|(?:do not|must not) call[\s\S]*discuss/iu,
+    );
     expect(contents).toContain("CREDENTIALS_REQUIRED");
     expect(contents).toContain("Pan Sync Helper");
     expect(contents).toContain("openclaw pan-sync configure");
