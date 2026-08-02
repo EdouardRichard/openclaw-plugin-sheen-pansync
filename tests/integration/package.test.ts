@@ -33,6 +33,12 @@ const allowedUiFiles = new Set([
 const allowedSkillFiles = new Set([
   "skills/pan-sync-upload/SKILL.md",
 ]);
+const allowedReadmeImages = new Set([
+  "docs/images/readme/01-plugin-ready.png",
+  "docs/images/readme/02-upload-resource-drive.png",
+  "docs/images/readme/03-search-resource-drive.png",
+  "docs/images/readme/04-download-and-read.png",
+]);
 const rejectedPackageRoots = new Set([
   ".superpowers",
   "node_modules",
@@ -63,7 +69,9 @@ function packageViolations(paths: readonly string[]): string[] {
       || normalized.startsWith("dist/ui/")
       || normalized.startsWith("dist/skills/")
       || (segments[0] === "ui" && !allowedUiFiles.has(normalized))
-      || (segments[0] === "skills" && !allowedSkillFiles.has(normalized));
+      || (segments[0] === "skills" && !allowedSkillFiles.has(normalized))
+      || (normalized.startsWith("docs/images/readme/")
+        && !allowedReadmeImages.has(normalized));
     return rejected ? [normalized] : [];
   });
 }
@@ -90,6 +98,18 @@ function readPackedText(tarball: string, packagePath: string): string {
     "tar",
     ["-xOf", tarball, `package/${packagePath}`],
     { encoding: "utf8", timeout: 10_000 },
+  );
+  if (extracted.error !== undefined || extracted.status !== 0) {
+    throw new Error(`could not read packed asset: ${packagePath}`);
+  }
+  return extracted.stdout;
+}
+
+function readPackedBuffer(tarball: string, packagePath: string): Buffer {
+  const extracted = spawnSync(
+    "tar",
+    ["-xOf", tarball, `package/${packagePath}`],
+    { encoding: null, timeout: 10_000 },
   );
   if (extracted.error !== undefined || extracted.status !== 0) {
     throw new Error(`could not read packed asset: ${packagePath}`);
@@ -194,6 +214,7 @@ describe("published package", () => {
       "openclaw.plugin.json",
       "README.md",
       "docs/guides/aliyun-token.md",
+      ...allowedReadmeImages,
     ];
     for (const entry of required) {
       expect(paths, `missing package entry: ${entry}`).toContain(entry);
@@ -201,6 +222,51 @@ describe("published package", () => {
 
     expect(packageViolations(paths)).toEqual([]);
     expect(paths.filter((entry) => /(?:canary|fixture|vault)/iu.test(entry))).toEqual([]);
+  });
+
+  it("ships a bilingual quick start and four valid screenshots", async () => {
+    const packDirectory = await mkdtemp(path.join(tmpdir(), "pan-sync-readme-images-"));
+    temporaryDirectories.push(packDirectory);
+    const packed = runNpm([
+      "pack",
+      "--json",
+      "--pack-destination",
+      packDirectory,
+    ]);
+    expect(packed.error).toBeUndefined();
+    expect(packed.status, `${packed.stdout}\n${packed.stderr}`).toBe(0);
+    const report = JSON.parse(packed.stdout) as PackResult;
+    const filename = report[0]?.filename;
+    expect(filename).toBeTypeOf("string");
+    const paths = report[0]?.files?.flatMap(({ path: entry }) =>
+      entry === undefined ? [] : [normalizePackagePath(entry)]
+    ) ?? [];
+    const tarball = path.join(packDirectory, path.basename(filename ?? ""));
+    const readme = readPackedText(tarball, "README.md");
+
+    expect(readme).toContain("[中文](#中文快速上手)");
+    expect(readme).toContain("[English](#english-quick-start)");
+    expect(readme).toContain("## 中文快速上手");
+    expect(readme).toContain("## English quick start");
+    expect(readme).toContain("pan_sync_upload");
+    expect(readme).toContain("pan_sync_list");
+    expect(readme).toContain("pan_sync_download");
+    expect(readme).toContain("资源盘");
+    expect(readme).toContain("resource drive");
+    expect(readme).toContain("DOWNLOAD_CONFIRMATION_REQUIRED");
+
+    expect(paths.filter((entry) => entry.startsWith("docs/images/readme/")))
+      .toEqual([...allowedReadmeImages]);
+    for (const imagePath of allowedReadmeImages) {
+      const png = readPackedBuffer(tarball, imagePath);
+      expect(png.subarray(0, 8)).toEqual(
+        Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      );
+      expect(png.subarray(12, 16).toString("ascii")).toBe("IHDR");
+      expect(png.readUInt32BE(16), `${imagePath} width`).toBeGreaterThan(0);
+      expect(png.readUInt32BE(20), `${imagePath} height`).toBeGreaterThan(0);
+      expect(png.byteLength, `${imagePath} size`).toBeLessThan(2 * 1024 * 1024);
+    }
   });
 
   it("ships every local documentation target linked by the packed README", async () => {
@@ -295,6 +361,7 @@ describe("published package", () => {
       "skills/pan-sync-upload/private.txt",
       "dist/ui/setup.html",
       "dist/skills/pan-sync-upload/SKILL.md",
+      "docs/images/readme/unapproved.png",
     ];
 
     expect(packageViolations(unsafePaths)).toHaveLength(unsafePaths.length);
