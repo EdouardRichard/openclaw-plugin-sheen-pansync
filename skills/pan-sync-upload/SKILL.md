@@ -11,13 +11,13 @@ description: Upload, list, search, download, and read Aliyun Drive files from Op
 
 ## Upload / 上传
 
-For explicit upload intent such as “上传”, “推送到网盘”, “upload”, “push to cloud drive”, or a directional sync-to request, call `pan_sync_upload` with existing workspace-relative `paths`, optional `provider`, and optional `remoteDirectory`.
+For explicit upload intent such as “上传”, “推送到网盘”, “传到阿里云盘”, “保存到网盘”, “upload”, “push to cloud drive”, “send a file to Aliyun Drive”, “save a result to the cloud drive”, or a directional sync-to request, call `pan_sync_upload` with existing workspace-relative `paths`, optional `provider`, and optional `remoteDirectory`.
 
 If the request also creates an artifact, create it first, verify that its path exists, then upload it. Never invent a path or upload the same normalized file twice in one request.
 
 ## List and search / 列出与搜索
 
-For “列出/查看网盘目录”, “list/show files”, “搜索/查找”, or “search/find”, call `pan_sync_list`:
+For “列出/查看/浏览网盘目录”, “list/show/browse files”, “搜索/查找”, or “search/find”, call `pan_sync_list`:
 
 - List: pass `remoteDirectory`; omit it or use `/` for the resource-drive root.
 - Search: pass `query`; optionally pass `remoteDirectory` to narrow the subtree.
@@ -25,7 +25,7 @@ For “列出/查看网盘目录”, “list/show files”, “搜索/查找”,
 
 ## Download and read / 下载与读取
 
-For “下载/保存到工作区”, “读取/打开/总结网盘文件”, “download”, “read/open/summarize a cloud file”, or a directional sync-from request, use `pan_sync_download` for one ordinary file. After a successful download, use OpenClaw's normal workspace file tools to read or process the returned relative `localPath`.
+For “下载/获取网盘文件”, “从网盘取出并保存到工作区”, “读取/打开/总结网盘文件”, “download/fetch a cloud file”, “get a file from the cloud drive”, “read/open/summarize a cloud file”, or a directional sync-from request, use `pan_sync_download` for one ordinary file. After a successful download, use OpenClaw's normal workspace file tools to read or process the returned relative `localPath`.
 
 Do not treat a directory as a downloadable file. Omit `localDirectory` to download to the current workspace root. Existing local files are not overwritten; the Tool chooses a collision-safe name such as `name (1).ext`.
 

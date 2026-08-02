@@ -706,6 +706,14 @@ describe("OpenClaw manifest ownership", () => {
 });
 
 describe("pan-sync-upload Skill discovery contract", () => {
+  function section(contents: string, heading: string): string {
+    const start = contents.indexOf(`## ${heading}`);
+    expect(start, `missing Skill section: ${heading}`).toBeGreaterThanOrEqual(0);
+    const bodyStart = contents.indexOf("\n", start);
+    const next = contents.indexOf("\n## ", bodyStart + 1);
+    return contents.slice(bodyStart + 1, next === -1 ? undefined : next);
+  }
+
   it("discovers bilingual upload, list, search, download, and read intent", async () => {
     const contents = await readFile(
       new URL("../../skills/pan-sync-upload/SKILL.md", import.meta.url),
@@ -717,13 +725,42 @@ describe("pan-sync-upload Skill discovery contract", () => {
     );
     expect(contents).toMatch(/阿里网盘|阿里云盘/u);
     expect(contents).toMatch(/aliyun|alipan/iu);
-    expect(contents).toMatch(/上传[\s\S]*pan_sync_upload|pan_sync_upload[\s\S]*upload/iu);
-    expect(contents).toMatch(/列出[\s\S]*pan_sync_list|pan_sync_list[\s\S]*list/iu);
-    expect(contents).toMatch(/搜索[\s\S]*pan_sync_list|pan_sync_list[\s\S]*search/iu);
-    expect(contents).toMatch(/读取[\s\S]*pan_sync_download|pan_sync_download[\s\S]*read/iu);
-    expect(contents).toMatch(/下载[\s\S]*pan_sync_download|pan_sync_download[\s\S]*download/iu);
-    expect(contents).toMatch(/同步到[\s\S]*sync to/iu);
-    expect(contents).toMatch(/从网盘同步下来[\s\S]*sync from/iu);
+    const upload = section(contents, "Upload / 上传");
+    const list = section(contents, "List and search / 列出与搜索");
+    const download = section(contents, "Download and read / 下载与读取");
+
+    expect(upload).toContain("pan_sync_upload");
+    expect(upload).toMatch(/上传/u);
+    expect(upload).toMatch(/推送/u);
+    expect(upload).toMatch(/传到/u);
+    expect(upload).toMatch(/保存到/u);
+    expect(upload).toMatch(/upload/iu);
+    expect(upload).toMatch(/push/iu);
+    expect(upload).toMatch(/send[^\n]*to/iu);
+    expect(upload).toMatch(/save[^\n]*to/iu);
+
+    expect(list).toContain("pan_sync_list");
+    expect(list).toMatch(/列出/u);
+    expect(list).toMatch(/查看/u);
+    expect(list).toMatch(/浏览/u);
+    expect(list).toMatch(/查找/u);
+    expect(list).toMatch(/搜索/u);
+    expect(list).toMatch(/list/iu);
+    expect(list).toMatch(/browse/iu);
+    expect(list).toMatch(/find/iu);
+    expect(list).toMatch(/search/iu);
+
+    expect(download).toContain("pan_sync_download");
+    expect(download).toMatch(/读取/u);
+    expect(download).toMatch(/打开/u);
+    expect(download).toMatch(/下载/u);
+    expect(download).toMatch(/获取/u);
+    expect(download).toMatch(/从网盘取出/u);
+    expect(download).toMatch(/read/iu);
+    expect(download).toMatch(/open/iu);
+    expect(download).toMatch(/download/iu);
+    expect(download).toMatch(/fetch/iu);
+    expect(download).toMatch(/get[^\n]*from/iu);
   });
 
   it("requires safe clarification, confirmation, and no-tool behavior", async () => {
