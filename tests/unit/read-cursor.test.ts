@@ -59,6 +59,40 @@ describe("search cursor codec", () => {
       .toEqual(state);
   });
 
+  it("emits a near-limit cursor within the input byte ceiling that decodes", () => {
+    const nearLimitState: SearchCursorState = {
+      v: 1,
+      identity: {
+        ...identity,
+        query: "界".repeat(16_250),
+      },
+      pending: [],
+      buffered: [],
+    };
+
+    const cursor = encodeSearchCursor(nearLimitState);
+
+    expect(Buffer.byteLength(cursor, "utf8")).toBeGreaterThan(65_000);
+    expect(Buffer.byteLength(cursor, "utf8")).toBeLessThanOrEqual(65_536);
+    expect(decodeSearchCursor(cursor, nearLimitState.identity))
+      .toEqual(nearLimitState);
+  });
+
+  it("rejects a state whose base64url cursor would exceed the input byte ceiling", () => {
+    const encodedOversizeState: SearchCursorState = {
+      v: 1,
+      identity: {
+        ...identity,
+        query: "x".repeat(49_100),
+      },
+      pending: [],
+      buffered: [],
+    };
+
+    expect(() => encodeSearchCursor(encodedOversizeState))
+      .toThrowError(PanSyncError);
+  });
+
   it("maps malformed and oversized cursor input to a stable safe error", () => {
     expectInvalid("not-base64");
     expectInvalid("a".repeat(65_537));

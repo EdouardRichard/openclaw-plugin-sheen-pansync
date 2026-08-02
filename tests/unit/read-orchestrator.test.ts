@@ -29,7 +29,7 @@ function makeHarness(pages: RemoteEntryPage[]) {
       path: "/",
       providerState: { driveId: "drive-secret" },
     })),
-    resolveEntry: async () => unused(),
+    resolveEntry: vi.fn(async () => unused()),
     getEntryById: async () => unused(),
     listEntries,
     openDownload: async () => unused(),
@@ -308,6 +308,34 @@ describe("ReadOrchestrator bounded breadth-first search", () => {
     expect(cursorJson).not.toContain("drive-secret");
     expect(cursorJson).not.toContain("signed-secret");
     expect(cursorJson).not.toContain("access-secret");
+  });
+
+  it("returns a buffered resume without token or Provider calls", async () => {
+    const harness = makeHarness([{
+      entries: [
+        file("match-1", "hit-1.txt"),
+        file("match-2", "hit-2.txt"),
+        file("match-3", "hit-3.txt"),
+      ],
+    }]);
+    const first = await harness.orchestrator.list({ query: "hit", limit: 1 });
+    harness.tokenManager.getValidAccessToken.mockClear();
+    vi.mocked(harness.provider.getReadRoot).mockClear();
+    vi.mocked(harness.provider.resolveEntry).mockClear();
+    harness.listEntries.mockClear();
+
+    const resumed = await harness.orchestrator.list({
+      query: "hit",
+      limit: 1,
+      cursor: first.nextCursor!,
+    });
+
+    expect(resumed.entries.map(({ fileId }) => fileId)).toEqual(["match-2"]);
+    expect(resumed.nextCursor).toBeTypeOf("string");
+    expect(harness.tokenManager.getValidAccessToken).not.toHaveBeenCalled();
+    expect(harness.provider.getReadRoot).not.toHaveBeenCalled();
+    expect(harness.provider.resolveEntry).not.toHaveBeenCalled();
+    expect(harness.listEntries).not.toHaveBeenCalled();
   });
 
   it("stops at 20 provider pages and resumes the remaining breadth-first work", async () => {

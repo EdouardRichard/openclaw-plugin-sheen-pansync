@@ -168,7 +168,11 @@ export function encodeSearchCursor(state: SearchCursorState): string {
     if (encoded.byteLength > MAX_CURSOR_BYTES) {
       throw invalidCursor();
     }
-    return encoded.toString("base64url");
+    const cursor = encoded.toString("base64url");
+    if (Buffer.byteLength(cursor, "utf8") > MAX_CURSOR_BYTES) {
+      throw invalidCursor();
+    }
+    return cursor;
   } catch {
     throw invalidCursor();
   }

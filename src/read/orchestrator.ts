@@ -230,6 +230,23 @@ export class ReadOrchestrator {
     if (resumed !== undefined) {
       assertSearchState(resumed, remoteDirectory);
     }
+    let state = resumed;
+    const entries = state?.buffered.splice(0, limit) ?? [];
+    if (
+      state !== undefined
+      && (entries.length === limit || state.pending.length === 0)
+    ) {
+      const nextCursor = state.pending.length === 0 && state.buffered.length === 0
+        ? undefined
+        : encodeSearchCursor(state);
+      return {
+        provider: provider.id,
+        remoteDirectory,
+        query,
+        entries,
+        ...(nextCursor === undefined ? {} : { nextCursor }),
+      };
+    }
     const accessToken = await this.dependencies.tokenManager.getValidAccessToken(options);
     const root = await resolveDirectory(
       provider,
@@ -237,13 +254,12 @@ export class ReadOrchestrator {
       accessToken,
       options,
     );
-    const state: SearchCursorState = resumed ?? {
+    state ??= {
       v: 1,
       identity,
       pending: [{ id: root.id, path: remoteDirectory }],
       buffered: [],
     };
-    const entries = state.buffered.splice(0, limit);
     const queryKey = matchKey(query);
     let providerPages = 0;
 
