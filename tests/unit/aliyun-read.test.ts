@@ -81,6 +81,39 @@ describe("AliyunProvider read primitives", () => {
     expect(requests.at(-1)?.body).toMatchObject({ drive_id: "drive-resource" });
   });
 
+  it("accepts Aliyun folder entries whose size is null", async () => {
+    const fetch: AliyunFetch = async (input) => {
+      const url = new URL(input instanceof Request ? input.url : input.toString());
+      if (url.pathname.endsWith("/getDriveInfo")) return jsonResponse(resourceDrive());
+      return jsonResponse({
+        items: [{
+          file_id: "folder-demo",
+          parent_file_id: "root",
+          name: "demo",
+          type: "folder",
+          size: null,
+          updated_at: "2026-08-02T00:00:00.000Z",
+        }],
+        next_marker: "",
+      });
+    };
+    const provider = makeProvider(fetch);
+    const root = await provider.getReadRoot("access-old");
+
+    await expect(provider.listEntries({
+      accessToken: "access-old",
+      directory: root,
+      limit: 20,
+    })).resolves.toEqual({
+      entries: [expect.objectContaining({
+        id: "folder-demo",
+        name: "demo",
+        type: "folder",
+        remotePath: "/demo",
+      })],
+    });
+  });
+
   it("resolves an exact resource-drive path", async () => {
     const requests: RecordedRequest[] = [];
     const fetch: AliyunFetch = async (input, init) => {

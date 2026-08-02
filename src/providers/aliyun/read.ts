@@ -51,7 +51,7 @@ function optionalSize(
   failureCode: PanSyncErrorCode,
 ): number | undefined {
   const value = record.size;
-  if (value === undefined) return undefined;
+  if (value === undefined || value === null) return undefined;
   if (
     typeof value !== "number"
     || !Number.isSafeInteger(value)
