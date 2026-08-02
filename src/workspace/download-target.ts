@@ -15,6 +15,8 @@ export type WorkspaceDownloadTarget = {
 };
 
 const CONTROL_CHARACTER = /\p{Cc}/u;
+const WINDOWS_INVALID_FILENAME_CHARACTER = /[<>:"/\\|?*]/u;
+const WINDOWS_RESERVED_DEVICE_BASENAME = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/iu;
 
 function isContained(root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate);
@@ -49,14 +51,19 @@ function hasParentSegment(value: string): boolean {
 }
 
 function safeRemoteBasename(remoteName: string): string {
-  if (remoteName.length === 0 || CONTROL_CHARACTER.test(remoteName)) {
+  if (
+    remoteName.length === 0
+    || CONTROL_CHARACTER.test(remoteName)
+    || WINDOWS_INVALID_FILENAME_CHARACTER.test(remoteName)
+    || /[. ]$/u.test(remoteName)
+    || WINDOWS_RESERVED_DEVICE_BASENAME.test(remoteName)
+  ) {
     throw rejectWorkspacePath();
   }
-  const basename = path.posix.basename(remoteName.replaceAll("\\", "/"));
-  if (basename.length === 0 || basename === "." || basename === "..") {
+  if (remoteName === "." || remoteName === "..") {
     throw rejectWorkspacePath();
   }
-  return basename;
+  return remoteName;
 }
 
 async function resolveWorkspaceRoot(workspaceDir: string): Promise<{
@@ -142,28 +149,34 @@ export async function openWorkspaceDownloadTarget(
       throw rejectWorkspacePath();
     }
 
-    let cleaned = false;
+    let closed = false;
+    let removed = false;
     return {
       handle,
       relativePath: path.relative(workspace.canonical, candidate).split(path.sep).join("/"),
       async cleanup(): Promise<void> {
-        if (cleaned) {
+        if (removed) {
           return;
         }
-        cleaned = true;
-        try {
-          await handle.close();
-        } catch (error) {
-          if (errorCode(error) !== "EBADF") {
-            throw rejectWorkspacePath();
+        if (!closed) {
+          try {
+            await handle.close();
+            closed = true;
+          } catch (error) {
+            if (errorCode(error) !== "EBADF") {
+              throw rejectWorkspacePath();
+            }
+            closed = true;
           }
         }
         try {
           await unlink(candidate);
+          removed = true;
         } catch (error) {
           if (errorCode(error) !== "ENOENT") {
             throw rejectWorkspacePath();
           }
+          removed = true;
         }
       },
     };

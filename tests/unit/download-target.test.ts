@@ -10,8 +10,19 @@ import {
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openWorkspaceDownloadTarget } from "../../src/workspace/download-target.js";
+
+const fsMocks = vi.hoisted(() => ({
+  open: vi.fn(),
+  actualOpen: undefined as unknown as typeof import("node:fs/promises").open,
+}));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  fsMocks.actualOpen = actual.open;
+  return { ...actual, open: fsMocks.open };
+});
 
 let fixtureRoot: string;
 let workspace: string;
@@ -19,6 +30,9 @@ let outside: string;
 
 describe("openWorkspaceDownloadTarget", () => {
   beforeEach(async () => {
+    fsMocks.open.mockImplementation((...args) =>
+      Reflect.apply(fsMocks.actualOpen, undefined, args));
+    fsMocks.open.mockClear();
     fixtureRoot = await mkdtemp(path.join(os.tmpdir(), "pan-sync-download-target-"));
     workspace = path.join(fixtureRoot, "workspace");
     outside = path.join(fixtureRoot, "outside");
@@ -152,17 +166,53 @@ describe("openWorkspaceDownloadTarget", () => {
   );
 
   it.each([
-    ["folder/report.pdf", "report.pdf"],
-    ["folder\\report.pdf", "report.pdf"],
-  ])("reduces remote name %j to the safe basename %j", async (remoteName, expected) => {
+    "keep.txt:stream",
+    "bad<name.txt",
+    "bad>name.txt",
+    "bad:name.txt",
+    'bad"name.txt',
+    "bad/name.txt",
+    "bad\\name.txt",
+    "bad|name.txt",
+    "bad?name.txt",
+    "bad*name.txt",
+    "trailing-dot.",
+    "trailing-space ",
+  ])("rejects Windows-special remote filename %j on every platform", async (remoteName) => {
+    await expect(
+      openWorkspaceDownloadTarget(workspace, undefined, remoteName),
+    ).rejects.toMatchObject({ code: "WORKSPACE_PATH_REJECTED" });
+    expect(fsMocks.open).not.toHaveBeenCalled();
+    expect(await readdir(workspace)).toEqual(["nested"]);
+  });
+
+  it.each([
+    "CON",
+    "con.txt",
+    "PRN.pdf",
+    "aux",
+    "NUL.txt",
+    "COM1.log",
+    "com9",
+    "LPT1.csv",
+    "lpt9.backup.tar",
+  ])("rejects reserved DOS device basename %j before any extension", async (remoteName) => {
+    await expect(
+      openWorkspaceDownloadTarget(workspace, undefined, remoteName),
+    ).rejects.toMatchObject({ code: "WORKSPACE_PATH_REJECTED" });
+    expect(fsMocks.open).not.toHaveBeenCalled();
+    expect(await readdir(workspace)).toEqual(["nested"]);
+  });
+
+  it("preserves a valid Unicode remote filename", async () => {
     const target = await openWorkspaceDownloadTarget(
       workspace,
       undefined,
-      remoteName,
+      "会议纪要 ①.txt",
     );
 
     try {
-      expect(target.relativePath).toBe(expected);
+      expect(target.relativePath).toBe("会议纪要 ①.txt");
     } finally {
       await target.cleanup();
     }
@@ -192,6 +242,68 @@ describe("openWorkspaceDownloadTarget", () => {
     await expect(stat(path.join(workspace, "download.txt"))).rejects.toMatchObject({
       code: "ENOENT",
     });
+    await expect(readFile(path.join(workspace, "keep.txt"), "utf8")).resolves.toBe(
+      "keep",
+    );
+  });
+
+  it("retries cleanup after a non-EBADF close failure and becomes idempotent after success", async () => {
+    const target = await openWorkspaceDownloadTarget(
+      workspace,
+      undefined,
+      "close-retry.txt",
+    );
+    await target.handle.writeFile("partial");
+    const originalClose = target.handle.close.bind(target.handle);
+    let closeAttempts = 0;
+    target.handle.close = async () => {
+      closeAttempts += 1;
+      if (closeAttempts === 1) {
+        throw Object.assign(new Error("transient close failure"), { code: "EIO" });
+      }
+      await originalClose();
+    };
+
+    await expect(target.cleanup()).rejects.toMatchObject({
+      code: "WORKSPACE_PATH_REJECTED",
+    });
+    await expect(stat(path.join(workspace, "close-retry.txt"))).resolves.toBeDefined();
+
+    await target.cleanup();
+    await target.cleanup();
+
+    expect(closeAttempts).toBe(2);
+    await expect(stat(path.join(workspace, "close-retry.txt"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("retries cleanup after unlink failure and removes only the exact reserved path", async () => {
+    await writeFile(path.join(workspace, "keep.txt"), "keep");
+    const target = await openWorkspaceDownloadTarget(
+      workspace,
+      undefined,
+      "unlink-retry.txt",
+    );
+    const reservedPath = path.join(workspace, target.relativePath);
+    await target.handle.close();
+    await rm(reservedPath);
+    await mkdir(reservedPath);
+
+    await expect(target.cleanup()).rejects.toMatchObject({
+      code: "WORKSPACE_PATH_REJECTED",
+    });
+
+    await rm(reservedPath, { recursive: true });
+    await writeFile(reservedPath, "replacement at reserved path");
+    await target.cleanup();
+    await expect(stat(reservedPath)).rejects.toMatchObject({ code: "ENOENT" });
+    await writeFile(reservedPath, "created after successful cleanup");
+    await target.cleanup();
+
+    await expect(readFile(reservedPath, "utf8")).resolves.toBe(
+      "created after successful cleanup",
+    );
     await expect(readFile(path.join(workspace, "keep.txt"), "utf8")).resolves.toBe(
       "keep",
     );
