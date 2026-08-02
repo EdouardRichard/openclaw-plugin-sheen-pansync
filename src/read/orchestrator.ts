@@ -1,6 +1,8 @@
 import path from "node:path";
 import type {
   CloudDriveProvider,
+  PanSyncDownloadInput,
+  PanSyncDownloadResult,
   PanSyncListInput,
   PanSyncListResult,
   ProviderOperationOptions,
@@ -10,6 +12,10 @@ import type {
 import type { TokenManager } from "../credentials/token-manager.js";
 import { PanSyncError } from "../errors.js";
 import type { ProviderRegistry } from "../provider-registry.js";
+import {
+  openWorkspaceDownloadTarget,
+  type WorkspaceDownloadTarget,
+} from "../workspace/download-target.js";
 import { normalizeRemoteDirectory } from "../workspace/path-guard.js";
 import {
   decodeSearchCursor,
@@ -24,6 +30,9 @@ const MAX_SEARCH_PAGES = 20;
 const MAX_PENDING_DIRECTORIES = 512;
 const MAX_BUFFERED_MATCHES = 100;
 const CONTROL_CHARACTER = /\p{Cc}/u;
+const LARGE_DOWNLOAD_THRESHOLD = 100 * 1024 * 1024;
+
+export type DownloadRequest = PanSyncDownloadInput & { workspaceDir: string };
 
 export type ReadOrchestratorDependencies = {
   providerRegistry: Pick<ProviderRegistry, "resolve">;
@@ -34,6 +43,37 @@ function stableReadError(error: unknown): PanSyncError {
   return error instanceof PanSyncError
     ? error
     : new PanSyncError("REMOTE_DIRECTORY_FAILED");
+}
+
+function stableDownloadError(error: unknown): PanSyncError {
+  return error instanceof PanSyncError
+    ? error
+    : new PanSyncError("DOWNLOAD_FAILED");
+}
+
+function assertDownloadActive(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) {
+    throw new PanSyncError("DOWNLOAD_FAILED");
+  }
+}
+
+async function writeChunk(
+  target: WorkspaceDownloadTarget,
+  chunk: Uint8Array,
+): Promise<void> {
+  let offset = 0;
+  while (offset < chunk.byteLength) {
+    const { bytesWritten } = await target.handle.write(
+      chunk,
+      offset,
+      chunk.byteLength - offset,
+      null,
+    );
+    if (bytesWritten <= 0) {
+      throw new PanSyncError("DOWNLOAD_FAILED");
+    }
+    offset += bytesWritten;
+  }
 }
 
 function validLimit(value: number): boolean {
@@ -104,6 +144,99 @@ async function resolveDirectory(
 
 export class ReadOrchestrator {
   constructor(private readonly dependencies: ReadOrchestratorDependencies) {}
+
+  async download(
+    input: DownloadRequest,
+    options: ProviderOperationOptions = {},
+  ): Promise<PanSyncDownloadResult> {
+    if ((input.fileId === undefined) === (input.remotePath === undefined)) {
+      throw new PanSyncError("REMOTE_FILE_AMBIGUOUS");
+    }
+
+    const provider = this.dependencies.providerRegistry.resolve(input.provider);
+    const accessToken = await this.dependencies.tokenManager.getValidAccessToken(options);
+    let entry: RemoteEntry;
+    try {
+      entry = input.fileId === undefined
+        ? await provider.resolveEntry(input.remotePath!, accessToken, options)
+        : await provider.getEntryById(input.fileId, accessToken, options);
+    } catch (error) {
+      throw stableDownloadError(error);
+    }
+
+    if (entry.type !== "file") {
+      throw new PanSyncError("REMOTE_ENTRY_NOT_FILE");
+    }
+    if (
+      entry.size === undefined
+      || !Number.isSafeInteger(entry.size)
+      || entry.size < 0
+    ) {
+      throw new PanSyncError("DOWNLOAD_FAILED");
+    }
+    if (
+      entry.size > LARGE_DOWNLOAD_THRESHOLD
+      && !input.confirmedLargeDownload
+    ) {
+      return {
+        provider: provider.id,
+        remoteName: entry.name,
+        fileId: entry.id,
+        size: entry.size,
+        status: "confirmation_required",
+        code: "DOWNLOAD_CONFIRMATION_REQUIRED",
+      };
+    }
+
+    let target: WorkspaceDownloadTarget | undefined;
+    try {
+      target = await openWorkspaceDownloadTarget(
+        input.workspaceDir,
+        input.localDirectory,
+        entry.name,
+      );
+      assertDownloadActive(options.signal);
+      const download = await provider.openDownload({
+        accessToken,
+        entry,
+      }, options);
+      if (download.size !== entry.size) {
+        throw new PanSyncError("DOWNLOAD_FAILED");
+      }
+
+      let written = 0;
+      for await (const chunk of download.stream) {
+        assertDownloadActive(options.signal);
+        if (!(chunk instanceof Uint8Array)) {
+          throw new PanSyncError("DOWNLOAD_FAILED");
+        }
+        if (written + chunk.byteLength > entry.size) {
+          throw new PanSyncError("DOWNLOAD_FAILED");
+        }
+        await writeChunk(target, chunk);
+        written += chunk.byteLength;
+      }
+      assertDownloadActive(options.signal);
+      if (written !== entry.size) {
+        throw new PanSyncError("DOWNLOAD_FAILED");
+      }
+      await target.handle.close();
+      return {
+        provider: provider.id,
+        remoteName: entry.name,
+        localPath: target.relativePath,
+        size: written,
+        status: "downloaded",
+      };
+    } catch (error) {
+      try {
+        await target?.cleanup();
+      } catch {
+        // Cleanup errors are intentionally collapsed into the stable download error.
+      }
+      throw stableDownloadError(error);
+    }
+  }
 
   async list(
     input: PanSyncListInput,

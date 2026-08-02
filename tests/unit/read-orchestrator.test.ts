@@ -1,4 +1,15 @@
-import { describe, expect, it, vi } from "vitest";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   CloudDriveProvider,
   RemoteEntry,
@@ -68,6 +79,52 @@ function file(id: string, name: string, parentId = "root"): RemoteEntry {
     size: id.length,
     remotePath: parentId === "root" ? `/${name}` : `/${parentId}/${name}`,
     providerState: { driveId: "drive-secret", signedUrl: "signed-secret" },
+  };
+}
+
+function byteStream(size: number, chunkSize = 1024 * 1024): ReadableStream<Uint8Array> {
+  let remaining = size;
+  return new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (remaining === 0) {
+        controller.close();
+        return;
+      }
+      const length = Math.min(remaining, chunkSize);
+      remaining -= length;
+      controller.enqueue(new Uint8Array(length).fill(0x61));
+    },
+  });
+}
+
+function makeDownloadHarness(
+  entry: RemoteEntry,
+  openDownload: CloudDriveProvider["openDownload"] = async () => ({
+    stream: byteStream(entry.size ?? 0),
+    size: entry.size ?? 0,
+  }),
+) {
+  const provider: CloudDriveProvider = {
+    id: "aliyun",
+    aliases: ["aliyun"],
+    validateCredentials: async () => unused(),
+    ensureDirectory: async () => unused(),
+    getReadRoot: async () => unused(),
+    resolveEntry: vi.fn(async () => entry),
+    getEntryById: vi.fn(async () => entry),
+    listEntries: async () => unused(),
+    openDownload: vi.fn(openDownload),
+    uploadFile: async () => unused(),
+  };
+  const providerRegistry = { resolve: vi.fn(() => provider) };
+  const tokenManager = {
+    getValidAccessToken: vi.fn(async () => "access-secret"),
+  };
+  return {
+    orchestrator: new ReadOrchestrator({ providerRegistry, tokenManager }),
+    provider,
+    providerRegistry,
+    tokenManager,
   };
 }
 
@@ -388,5 +445,330 @@ describe("ReadOrchestrator bounded breadth-first search", () => {
     expect(rejected).toMatchObject({ code: "REMOTE_DIRECTORY_FAILED" });
     expect(String((rejected as Error).message)).not.toContain(canaryId);
     expect(harness.listEntries).toHaveBeenCalledOnce();
+  });
+});
+
+describe("ReadOrchestrator download", () => {
+  const threshold = 104_857_600;
+  let fixtureRoot: string;
+  let workspace: string;
+
+  beforeEach(async () => {
+    fixtureRoot = await mkdtemp(path.join(os.tmpdir(), "pan-sync-download-"));
+    workspace = path.join(fixtureRoot, "workspace");
+    await mkdir(path.join(workspace, "nested"), { recursive: true });
+  });
+
+  afterEach(async () => {
+    await rm(fixtureRoot, { recursive: true, force: true });
+  });
+
+  it("downloads exactly 100 MiB to the workspace root", async () => {
+    const entry = { ...file("file-limit", "limit.bin"), size: threshold };
+    const harness = makeDownloadHarness(entry);
+
+    const result = await harness.orchestrator.download({
+      workspaceDir: workspace,
+      fileId: entry.id,
+    });
+
+    expect(result).toEqual({
+      provider: "aliyun",
+      remoteName: "limit.bin",
+      localPath: "limit.bin",
+      size: threshold,
+      status: "downloaded",
+    });
+    await expect(stat(path.join(workspace, "limit.bin"))).resolves.toMatchObject({
+      size: threshold,
+    });
+    expect(JSON.stringify(result)).not.toContain(workspace);
+    expect(JSON.stringify(result)).not.toContain("access-secret");
+    expect(JSON.stringify(result)).not.toContain("providerState");
+  });
+
+  it("requires confirmation above 100 MiB before opening a stream or local file", async () => {
+    const entry = { ...file("file-large", "large.bin"), size: threshold + 1 };
+    const harness = makeDownloadHarness(entry);
+
+    const result = await harness.orchestrator.download({
+      workspaceDir: workspace,
+      remotePath: "/large.bin",
+    });
+
+    expect(result).toEqual({
+      provider: "aliyun",
+      remoteName: "large.bin",
+      fileId: "file-large",
+      size: threshold + 1,
+      status: "confirmation_required",
+      code: "DOWNLOAD_CONFIRMATION_REQUIRED",
+    });
+    expect(harness.provider.openDownload).not.toHaveBeenCalled();
+    expect(await readdir(workspace)).toEqual(["nested"]);
+  });
+
+  it("downloads a confirmed file above 100 MiB", async () => {
+    const size = threshold + 1;
+    const entry = { ...file("file-large", "large.bin"), size };
+    const harness = makeDownloadHarness(entry);
+
+    const result = await harness.orchestrator.download({
+      workspaceDir: workspace,
+      fileId: entry.id,
+      confirmedLargeDownload: true,
+    });
+
+    expect(result).toMatchObject({
+      localPath: "large.bin",
+      size,
+      status: "downloaded",
+    });
+    await expect(stat(path.join(workspace, "large.bin"))).resolves.toMatchObject({
+      size,
+    });
+  });
+
+  it("resolves an ordinary remote path and writes exact bytes to an existing nested directory", async () => {
+    const entry = { ...file("file-report", "report.txt"), size: 6 };
+    const harness = makeDownloadHarness(entry, async () => ({
+      stream: new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("abc"));
+          controller.enqueue(new TextEncoder().encode("123"));
+          controller.close();
+        },
+      }),
+      size: 6,
+    }));
+
+    const result = await harness.orchestrator.download({
+      workspaceDir: workspace,
+      remotePath: "/reports/report.txt",
+      localDirectory: "nested",
+    });
+
+    expect(result).toEqual({
+      provider: "aliyun",
+      remoteName: "report.txt",
+      localPath: "nested/report.txt",
+      size: 6,
+      status: "downloaded",
+    });
+    await expect(
+      readFile(path.join(workspace, "nested", "report.txt"), "utf8"),
+    ).resolves.toBe("abc123");
+    expect(harness.provider.resolveEntry).toHaveBeenCalledWith(
+      "/reports/report.txt",
+      "access-secret",
+      {},
+    );
+    expect(harness.provider.getEntryById).not.toHaveBeenCalled();
+  });
+
+  it("resolves a file ID without resolving a path", async () => {
+    const entry = { ...file("file-id", "id.txt"), size: 1 };
+    const harness = makeDownloadHarness(entry);
+
+    await harness.orchestrator.download({
+      workspaceDir: workspace,
+      fileId: entry.id,
+    });
+
+    expect(harness.provider.getEntryById).toHaveBeenCalledWith(
+      entry.id,
+      "access-secret",
+      {},
+    );
+    expect(harness.provider.resolveEntry).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {},
+    { fileId: "file-id", remotePath: "/id.txt" },
+  ])("rejects a non-unique target before token or provider I/O: %j", async (target) => {
+    const entry = { ...file("file-id", "id.txt"), size: 1 };
+    const harness = makeDownloadHarness(entry);
+
+    await expect(
+      harness.orchestrator.download({ workspaceDir: workspace, ...target }),
+    ).rejects.toMatchObject({ code: "REMOTE_FILE_AMBIGUOUS" });
+    expect(harness.tokenManager.getValidAccessToken).not.toHaveBeenCalled();
+    expect(harness.provider.resolveEntry).not.toHaveBeenCalled();
+    expect(harness.provider.getEntryById).not.toHaveBeenCalled();
+    expect(harness.provider.openDownload).not.toHaveBeenCalled();
+  });
+
+  it("rejects a directory before opening a stream or local file", async () => {
+    const harness = makeDownloadHarness(folder("folder-reports", "reports"));
+
+    await expect(
+      harness.orchestrator.download({
+        workspaceDir: workspace,
+        fileId: "folder-reports",
+      }),
+    ).rejects.toMatchObject({ code: "REMOTE_ENTRY_NOT_FILE" });
+    expect(harness.provider.openDownload).not.toHaveBeenCalled();
+    expect(await readdir(workspace)).toEqual(["nested"]);
+  });
+
+  it("rejects missing size metadata before opening a stream or local file", async () => {
+    const entry = file("file-no-size", "unknown.bin");
+    delete entry.size;
+    const harness = makeDownloadHarness(entry);
+
+    await expect(
+      harness.orchestrator.download({
+        workspaceDir: workspace,
+        fileId: entry.id,
+      }),
+    ).rejects.toMatchObject({ code: "DOWNLOAD_FAILED" });
+    expect(harness.provider.openDownload).not.toHaveBeenCalled();
+    expect(await readdir(workspace)).toEqual(["nested"]);
+  });
+
+  it("preserves the stable missing-file error without leaking provider details", async () => {
+    const entry = { ...file("missing", "missing.txt"), size: 1 };
+    const harness = makeDownloadHarness(entry);
+    vi.mocked(harness.provider.getEntryById).mockRejectedValue(
+      new PanSyncError("REMOTE_FILE_NOT_FOUND"),
+    );
+
+    let rejected: unknown;
+    try {
+      await harness.orchestrator.download({
+        workspaceDir: workspace,
+        fileId: entry.id,
+      });
+    } catch (error) {
+      rejected = error;
+    }
+
+    expect(rejected).toMatchObject({ code: "REMOTE_FILE_NOT_FOUND" });
+    expect(JSON.stringify(rejected)).not.toContain("access-secret");
+    expect(await readdir(workspace)).toEqual(["nested"]);
+  });
+
+  it("cancels and removes the partial local file", async () => {
+    const controller = new AbortController();
+    let pullCount = 0;
+    const entry = { ...file("file-abort", "abort.txt"), size: 2 };
+    const harness = makeDownloadHarness(entry, async () => ({
+      stream: new ReadableStream<Uint8Array>({
+        pull(streamController) {
+          pullCount += 1;
+          if (pullCount === 1) {
+            streamController.enqueue(Uint8Array.of(0x61));
+            return;
+          }
+          controller.abort();
+          streamController.enqueue(Uint8Array.of(0x62));
+          streamController.close();
+        },
+      }),
+      size: 2,
+    }));
+
+    await expect(
+      harness.orchestrator.download(
+        { workspaceDir: workspace, fileId: entry.id },
+        { signal: controller.signal },
+      ),
+    ).rejects.toMatchObject({ code: "DOWNLOAD_FAILED" });
+    expect(await readdir(workspace)).toEqual(["nested"]);
+  });
+
+  it("rejects a short stream and removes the partial local file", async () => {
+    const entry = { ...file("file-short", "short.txt"), size: 4 };
+    const harness = makeDownloadHarness(entry, async () => ({
+      stream: byteStream(3),
+      size: 4,
+    }));
+
+    await expect(
+      harness.orchestrator.download({ workspaceDir: workspace, fileId: entry.id }),
+    ).rejects.toMatchObject({ code: "DOWNLOAD_FAILED" });
+    expect(await readdir(workspace)).toEqual(["nested"]);
+  });
+
+  it("rejects a long stream as soon as it exceeds metadata and removes it", async () => {
+    const entry = { ...file("file-long", "long.txt"), size: 3 };
+    const harness = makeDownloadHarness(entry, async () => ({
+      stream: byteStream(4),
+      size: 3,
+    }));
+
+    await expect(
+      harness.orchestrator.download({ workspaceDir: workspace, fileId: entry.id }),
+    ).rejects.toMatchObject({ code: "DOWNLOAD_FAILED" });
+    expect(await readdir(workspace)).toEqual(["nested"]);
+  });
+
+  it("removes only this call's collision file after a provider failure", async () => {
+    const canary = "signed-url-secret-CANARY";
+    await writeFile(path.join(workspace, "report.txt"), "keep me");
+    const entry = { ...file("file-provider", "report.txt"), size: 4 };
+    const harness = makeDownloadHarness(entry, async () => {
+      throw new Error(`provider failed at ${canary} in ${workspace}`);
+    });
+
+    let rejected: unknown;
+    try {
+      await harness.orchestrator.download({
+        workspaceDir: workspace,
+        fileId: entry.id,
+      });
+    } catch (error) {
+      rejected = error;
+    }
+
+    expect(rejected).toMatchObject({ code: "DOWNLOAD_FAILED" });
+    expect(JSON.stringify(rejected)).not.toContain(canary);
+    expect(JSON.stringify(rejected)).not.toContain(workspace);
+    expect(await readdir(workspace)).toEqual(["nested", "report.txt"]);
+    await expect(readFile(path.join(workspace, "report.txt"), "utf8")).resolves.toBe(
+      "keep me",
+    );
+  });
+
+  it("removes the partial file when the response stream fails", async () => {
+    const entry = { ...file("file-network", "network.txt"), size: 2 };
+    let pullCount = 0;
+    const harness = makeDownloadHarness(entry, async () => ({
+      stream: new ReadableStream<Uint8Array>({
+        pull(controller) {
+          pullCount += 1;
+          if (pullCount === 1) {
+            controller.enqueue(Uint8Array.of(0x61));
+            return;
+          }
+          controller.error(new Error("network raw response secret"));
+        },
+      }),
+      size: 2,
+    }));
+
+    await expect(
+      harness.orchestrator.download({ workspaceDir: workspace, fileId: entry.id }),
+    ).rejects.toMatchObject({ code: "DOWNLOAD_FAILED" });
+    expect(await readdir(workspace)).toEqual(["nested"]);
+  });
+
+  it("maps a local write rejection and removes the created file", async () => {
+    const entry = { ...file("file-write", "write.txt"), size: 1 };
+    const harness = makeDownloadHarness(entry, async () => ({
+      stream: new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue({ byteLength: 1 } as Uint8Array);
+          controller.close();
+        },
+      }),
+      size: 1,
+    }));
+
+    await expect(
+      harness.orchestrator.download({ workspaceDir: workspace, fileId: entry.id }),
+    ).rejects.toMatchObject({ code: "DOWNLOAD_FAILED" });
+    expect(await readdir(workspace)).toEqual(["nested"]);
   });
 });

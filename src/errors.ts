@@ -11,6 +11,9 @@ export type PanSyncErrorCode =
   | "FILE_NOT_READABLE"
   | "REMOTE_DIRECTORY_FAILED"
   | "REMOTE_FILE_NOT_FOUND"
+  | "REMOTE_FILE_AMBIGUOUS"
+  | "REMOTE_ENTRY_NOT_FILE"
+  | "DOWNLOAD_CONFIRMATION_REQUIRED"
   | "QUOTA_EXCEEDED"
   | "DOWNLOAD_FAILED"
   | "UPLOAD_FAILED"
@@ -30,10 +33,13 @@ export class PanSyncError extends Error {
   }
 }
 
-export function safeErrorDetails(error: unknown): { code: PanSyncErrorCode } {
+export function safeErrorDetails(
+  error: unknown,
+  fallback: PanSyncErrorCode = "UPLOAD_FAILED",
+): { code: PanSyncErrorCode } {
   if (error instanceof PanSyncError) {
     return { code: error.code };
   }
 
-  return { code: "UPLOAD_FAILED" };
+  return { code: fallback };
 }

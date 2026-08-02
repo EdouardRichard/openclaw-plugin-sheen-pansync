@@ -48,6 +48,31 @@ export type PanSyncListResult = {
   nextCursor?: string;
 };
 
+export type PanSyncDownloadInput = {
+  provider?: ProviderId;
+  fileId?: string;
+  remotePath?: string;
+  localDirectory?: string;
+  confirmedLargeDownload?: boolean;
+};
+
+export type PanSyncDownloadResult =
+  | {
+      provider: ProviderId;
+      remoteName: string;
+      localPath: string;
+      size: number;
+      status: "downloaded";
+    }
+  | {
+      provider: ProviderId;
+      remoteName: string;
+      fileId: string;
+      size: number;
+      status: "confirmation_required";
+      code: "DOWNLOAD_CONFIRMATION_REQUIRED";
+    };
+
 export type CredentialInput = {
   authorizationPageUrl: string;
   refreshApiUrl: string;
