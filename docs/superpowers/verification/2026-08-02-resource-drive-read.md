@@ -14,7 +14,7 @@ Release decision: BLOCKED
 ## Versions and artifact
 
 - Node.js current gate: `24.18.1`
-- Node.js lower-bound gate: `22.23.1` via Volta
+- Node.js supported Node 22 gate: `22.23.1` via Volta
 - npm: `11.18.0`
 - TypeScript: `5.9.3`
 - Vitest: `3.2.7`
@@ -24,7 +24,7 @@ Release decision: BLOCKED
 
 ## Automated gate
 
-Two fresh full verification runs were used as the release gate: `npm run verify` on Node `24.18.1`, then `volta run --node 22.23.1 npm run verify` at the supported Node 22 lower bound. Each run completed TypeScript type checking, unit tests, integration tests, a production build, and `npm pack --dry-run`.
+Two fresh full verification runs were used as the release gate: `npm run verify` on Node `24.18.1`, then `volta run --node 22.23.1 npm run verify` on a supported Node 22 runtime. Each run completed TypeScript type checking, unit tests, integration tests, a production build, and `npm pack --dry-run`.
 
 Fresh counts per run:
 
