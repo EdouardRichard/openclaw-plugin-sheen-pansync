@@ -806,7 +806,12 @@ describe("release leakage canaries", () => {
     const uploadServer = await startFakeAliyunServer([
       {
         status: 200,
-        body: { default_drive_id: "drive-1", user_id: "user-1" },
+        body: {
+          default_drive_id: "drive-default",
+          resource_drive_id: "drive-resource",
+          backup_drive_id: "drive-backup",
+          user_id: "user-1",
+        },
       },
       {
         status: 500,

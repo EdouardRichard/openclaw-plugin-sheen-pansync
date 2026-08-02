@@ -9,6 +9,7 @@ import type {
 import type { CredentialRecord } from "../../credentials/types.js";
 import { PanSyncError } from "../../errors.js";
 import { normalizeRemoteDirectory } from "../../workspace/path-guard.js";
+import { parseResourceDriveSummary } from "./resource-drive.js";
 import type { AliyunFetch, AliyunTokenService } from "./types.js";
 import {
   AliyunAuthorizedClient,
@@ -28,12 +29,6 @@ export type AliyunProviderOptions = {
 };
 
 const MAX_CREDENTIAL_FIELD_LENGTH = 4096;
-
-type DriveSummary = {
-  driveId: string;
-  userId: string;
-  displayName?: string;
-};
 
 type ListedFolder = {
   fileId: string;
@@ -84,27 +79,6 @@ function maskDisplayName(value: string): string {
     return "***";
   }
   return `${characters[0]}***`;
-}
-
-function parseDriveSummary(body: unknown): DriveSummary {
-  if (!isRecord(body)) {
-    throw new PanSyncError("CREDENTIALS_INVALID");
-  }
-  const driveId =
-    nonEmptyString(body, "default_drive_id")
-    ?? nonEmptyString(body, "resource_drive_id")
-    ?? nonEmptyString(body, "backup_drive_id");
-  const userId = nonEmptyString(body, "user_id");
-  if (driveId === undefined || userId === undefined) {
-    throw new PanSyncError("CREDENTIALS_INVALID");
-  }
-  const displayName =
-    nonEmptyString(body, "name")
-    ?? nonEmptyString(body, "nick_name")
-    ?? nonEmptyString(body, "user_name");
-  return displayName === undefined
-    ? { driveId, userId }
-    : { driveId, userId, displayName };
 }
 
 function parseFolder(body: unknown): ListedFolder {
@@ -186,7 +160,7 @@ export class AliyunProvider implements CloudDriveProvider {
         ...(options.signal === undefined ? {} : { signal: options.signal }),
       },
     );
-    const drive = parseDriveSummary(driveResponse.body);
+    const drive = parseResourceDriveSummary(driveResponse.body);
     const now = this.#clock();
     const account: CredentialRecord["account"] = {
       userIdMasked: maskIdentifier(drive.userId),
@@ -223,7 +197,7 @@ export class AliyunProvider implements CloudDriveProvider {
       },
     );
     token = driveResponse.accessToken;
-    const drive = parseDriveSummary(driveResponse.body);
+    const drive = parseResourceDriveSummary(driveResponse.body);
     const normalizedPath = normalizeRemoteDirectory(remotePath);
     if (normalizedPath === "/") {
       return {

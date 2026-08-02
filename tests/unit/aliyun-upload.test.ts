@@ -17,7 +17,7 @@ const NOW = Date.parse("2026-07-31T12:00:00.000Z");
 const REMOTE_DIRECTORY: RemoteDirectory = {
   id: "folder-1",
   path: "/openClawShare",
-  providerState: { driveId: "drive-default" },
+  providerState: { driveId: "drive-resource" },
 };
 const cleanups: Array<() => Promise<void>> = [];
 
@@ -153,6 +153,8 @@ async function startUploadServer(
       response.end(JSON.stringify({
         user_id: "contract-user-id",
         default_drive_id: "drive-default",
+        resource_drive_id: "drive-resource",
+        backup_drive_id: "drive-backup",
       }));
       return;
     }
@@ -326,7 +328,7 @@ describe("Aliyun multipart upload", () => {
       requestPath.endsWith("/openFile/create")
     );
     expect(create?.body).toEqual({
-      drive_id: "drive-default",
+      drive_id: "drive-resource",
       parent_file_id: "folder-1",
       name: "report.bin",
       type: "file",
@@ -524,7 +526,14 @@ describe("Aliyun multipart upload", () => {
       size: 1,
     });
 
-    expect(directory.providerState).toEqual({ driveId: "drive-default" });
+    expect(directory.providerState).toEqual({ driveId: "drive-resource" });
+    expect(
+      server.requests
+        .filter(({ body }) =>
+          typeof body === "object" && body !== null && "drive_id" in body
+        )
+        .map(({ body }) => (body as { drive_id: unknown }).drive_id),
+    ).toEqual(["drive-resource", "drive-resource"]);
     await expect(file.handle.stat()).resolves.toMatchObject({ size: 1 });
   });
 

@@ -375,6 +375,35 @@ describe("AliyunProvider credential validation", () => {
 });
 
 describe("AliyunProvider directory traversal", () => {
+  it("uses resource_drive_id when default_drive_id points at backup storage", async () => {
+    const server = await fakeServer([
+      driveInfo({
+        default_drive_id: "drive-backup-default",
+        resource_drive_id: "drive-resource",
+        backup_drive_id: "drive-backup",
+      }),
+    ]);
+
+    await expect(provider(server).ensureDirectory("/", "access-old"))
+      .resolves.toMatchObject({
+        id: "root",
+        providerState: { driveId: "drive-resource" },
+      });
+  });
+
+  it("rejects an account without a resource drive instead of falling back", async () => {
+    const server = await fakeServer([
+      driveInfo({ resource_drive_id: undefined }),
+    ]);
+
+    const error = await rejectedPanSyncError(() =>
+      provider(server).ensureDirectory("/", "access-old")
+    );
+
+    expect(error.code).toBe("RESOURCE_DRIVE_UNAVAILABLE");
+    expect(server.requests).toHaveLength(1);
+  });
+
   it("paginates each segment, creates only missing folders, and recovers from a create race", async () => {
     const server = await fakeServer([
       driveInfo(),
@@ -427,7 +456,7 @@ describe("AliyunProvider directory traversal", () => {
     ).resolves.toMatchObject({
       id: "folder-2026",
       path: "/openClawShare/reports/2026",
-      providerState: { driveId: "drive-default" },
+      providerState: { driveId: "drive-resource" },
     });
 
     expect(server.requests.slice(1).map(({ path }) => path)).toEqual([
@@ -440,12 +469,12 @@ describe("AliyunProvider directory traversal", () => {
       "/adrive/v1.0/openFile/list",
     ]);
     expect(server.requests[1]?.body).toEqual({
-      drive_id: "drive-default",
+      drive_id: "drive-resource",
       parent_file_id: "root",
       limit: 200,
     });
     expect(server.requests[2]?.body).toEqual({
-      drive_id: "drive-default",
+      drive_id: "drive-resource",
       parent_file_id: "root",
       limit: 200,
       marker: "page-2",
@@ -456,14 +485,14 @@ describe("AliyunProvider directory traversal", () => {
         .map(({ body }) => body),
     ).toEqual([
       {
-        drive_id: "drive-default",
+        drive_id: "drive-resource",
         parent_file_id: "root",
         name: "openClawShare",
         type: "folder",
         check_name_mode: "refuse",
       },
       {
-        drive_id: "drive-default",
+        drive_id: "drive-resource",
         parent_file_id: "folder-reports",
         name: "2026",
         type: "folder",
@@ -483,7 +512,7 @@ describe("AliyunProvider directory traversal", () => {
       provider(server, forceRefresh).ensureDirectory("/", "access-old"),
     ).resolves.toMatchObject({
       id: "root",
-      providerState: { driveId: "drive-default" },
+      providerState: { driveId: "drive-resource" },
     });
 
     expect(forceRefresh).toHaveBeenCalledOnce();
