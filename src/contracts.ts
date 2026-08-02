@@ -40,6 +40,39 @@ export type RemoteDirectory = {
   providerState: Readonly<Record<string, unknown>>;
 };
 
+export type RemoteEntry = {
+  id: string;
+  parentId: string;
+  name: string;
+  type: "file" | "folder";
+  size?: number;
+  updatedAt?: string;
+  remotePath?: string;
+  providerState: Readonly<Record<string, unknown>>;
+};
+
+export type RemoteEntryPage = {
+  entries: RemoteEntry[];
+  nextMarker?: string;
+};
+
+export type ProviderListInput = {
+  accessToken: string;
+  directory: RemoteDirectory;
+  marker?: string;
+  limit: number;
+};
+
+export type ProviderDownloadInput = {
+  accessToken: string;
+  entry: RemoteEntry;
+};
+
+export type ProviderDownload = {
+  stream: ReadableStream<Uint8Array>;
+  size: number;
+};
+
 export type ProviderUploadInput = {
   accessToken: string;
   file: ResolvedWorkspaceFile;
@@ -61,5 +94,10 @@ export interface CloudDriveProvider {
   readonly aliases: readonly string[];
   validateCredentials(candidate: CredentialInput, options?: ProviderOperationOptions): Promise<ValidatedCredentialRecord>;
   ensureDirectory(remotePath: string, accessToken: string, options?: ProviderOperationOptions): Promise<RemoteDirectory>;
+  getReadRoot(accessToken: string, options?: ProviderOperationOptions): Promise<RemoteDirectory>;
+  resolveEntry(remotePath: string, accessToken: string, options?: ProviderOperationOptions): Promise<RemoteEntry>;
+  getEntryById(fileId: string, accessToken: string, options?: ProviderOperationOptions): Promise<RemoteEntry>;
+  listEntries(input: ProviderListInput, options?: ProviderOperationOptions): Promise<RemoteEntryPage>;
+  openDownload(input: ProviderDownloadInput, options?: ProviderOperationOptions): Promise<ProviderDownload>;
   uploadFile(input: ProviderUploadInput, options?: ProviderOperationOptions): Promise<ProviderUploadResult>;
 }

@@ -21,6 +21,27 @@ import {
 } from "../../src/upload/orchestrator.js";
 import type { ResolvedWorkspaceFile } from "../../src/workspace/path-guard.js";
 
+const unavailableReadOperations: Pick<
+  CloudDriveProvider,
+  "getReadRoot" | "resolveEntry" | "getEntryById" | "listEntries" | "openDownload"
+> = {
+  async getReadRoot() {
+    throw new Error("read operations are not used by upload orchestrator tests");
+  },
+  async resolveEntry() {
+    throw new Error("read operations are not used by upload orchestrator tests");
+  },
+  async getEntryById() {
+    throw new Error("read operations are not used by upload orchestrator tests");
+  },
+  async listEntries() {
+    throw new Error("read operations are not used by upload orchestrator tests");
+  },
+  async openDownload() {
+    throw new Error("read operations are not used by upload orchestrator tests");
+  },
+};
+
 type HarnessOptions = {
   defaultDirectory?: string;
   identities?: Readonly<Record<string, string>>;
@@ -55,6 +76,7 @@ function harness(options: HarnessOptions = {}) {
   const provider: CloudDriveProvider = {
     id: "aliyun",
     aliases: ["aliyun"],
+    ...unavailableReadOperations,
     async validateCredentials() {
       throw new Error("validateCredentials must not be called by uploads");
     },
@@ -448,6 +470,7 @@ describe("UploadOrchestrator", () => {
     const provider: CloudDriveProvider = {
       id: "aliyun",
       aliases: ["aliyun"],
+      ...unavailableReadOperations,
       async validateCredentials() {
         throw new Error("not used");
       },
@@ -645,6 +668,7 @@ describe("UploadOrchestrator", () => {
     const provider: CloudDriveProvider = {
       id: "aliyun",
       aliases: ["aliyun"],
+      ...unavailableReadOperations,
       async validateCredentials() {
         throw new Error("not used");
       },

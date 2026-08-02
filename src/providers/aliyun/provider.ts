@@ -1,6 +1,11 @@
 import type {
   CloudDriveProvider,
   CredentialInput,
+  ProviderDownload,
+  ProviderDownloadInput,
+  ProviderListInput,
+  RemoteEntry,
+  RemoteEntryPage,
   ProviderUploadInput,
   ProviderUploadResult,
   ProviderOperationOptions,
@@ -10,6 +15,11 @@ import type { CredentialRecord } from "../../credentials/types.js";
 import { PanSyncError } from "../../errors.js";
 import { normalizeRemoteDirectory } from "../../workspace/path-guard.js";
 import { parseResourceDriveSummary } from "./resource-drive.js";
+import {
+  parseAliyunDownloadUrl,
+  parseAliyunRemoteEntry,
+  parseAliyunRemoteEntryPage,
+} from "./read.js";
 import type { AliyunFetch, AliyunTokenService } from "./types.js";
 import {
   AliyunAuthorizedClient,
@@ -278,6 +288,145 @@ export class AliyunProvider implements CloudDriveProvider {
     };
   }
 
+  async getReadRoot(
+    accessToken: string,
+    options: ProviderOperationOptions = {},
+  ): Promise<AliyunRemoteDirectory> {
+    return (await this.#resourceDriveContext(accessToken, options)).root;
+  }
+
+  async resolveEntry(
+    remotePath: string,
+    accessToken: string,
+    options: ProviderOperationOptions = {},
+  ): Promise<RemoteEntry> {
+    const normalizedPath = normalizeRemoteDirectory(remotePath);
+    if (normalizedPath === "/") {
+      throw new PanSyncError("REMOTE_FILE_NOT_FOUND");
+    }
+    const context = await this.#resourceDriveContext(accessToken, options);
+    const resolved = await this.#api.post(
+      "/adrive/v1.0/openFile/get_by_path",
+      context.accessToken,
+      { drive_id: context.root.providerState.driveId, file_path: normalizedPath },
+      {
+        failureCode: "REMOTE_FILE_NOT_FOUND",
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+      },
+    );
+    const entry = parseAliyunRemoteEntry(resolved.body, {
+      driveId: context.root.providerState.driveId,
+      remotePath: normalizedPath,
+      failureCode: "REMOTE_DIRECTORY_FAILED",
+    });
+    if (entry.name !== normalizedPath.slice(normalizedPath.lastIndexOf("/") + 1)) {
+      throw new PanSyncError("REMOTE_FILE_NOT_FOUND");
+    }
+    return entry;
+  }
+
+  async getEntryById(
+    fileId: string,
+    accessToken: string,
+    options: ProviderOperationOptions = {},
+  ): Promise<RemoteEntry> {
+    if (typeof fileId !== "string" || fileId.length === 0) {
+      throw new PanSyncError("REMOTE_FILE_NOT_FOUND");
+    }
+    const context = await this.#resourceDriveContext(accessToken, options);
+    const found = await this.#api.post(
+      "/adrive/v1.0/openFile/get",
+      context.accessToken,
+      { drive_id: context.root.providerState.driveId, file_id: fileId },
+      {
+        failureCode: "REMOTE_FILE_NOT_FOUND",
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+      },
+    );
+    return parseAliyunRemoteEntry(found.body, {
+      driveId: context.root.providerState.driveId,
+      failureCode: "REMOTE_FILE_NOT_FOUND",
+    });
+  }
+
+  async listEntries(
+    input: ProviderListInput,
+    options: ProviderOperationOptions = {},
+  ): Promise<RemoteEntryPage> {
+    if (
+      !Number.isSafeInteger(input.limit)
+      || input.limit < 1
+      || (input.marker !== undefined && input.marker.length === 0)
+      || !isAliyunRemoteDirectory(input.directory)
+    ) {
+      throw new PanSyncError("REMOTE_DIRECTORY_FAILED");
+    }
+    const context = await this.#resourceDriveContext(input.accessToken, options);
+    if (input.directory.providerState.driveId !== context.root.providerState.driveId) {
+      throw new PanSyncError("REMOTE_DIRECTORY_FAILED");
+    }
+    const listed = await this.#api.post(
+      "/adrive/v1.0/openFile/list",
+      context.accessToken,
+      {
+        drive_id: context.root.providerState.driveId,
+        parent_file_id: input.directory.id,
+        limit: input.limit,
+        ...(input.marker === undefined ? {} : { marker: input.marker }),
+      },
+      {
+        failureCode: "REMOTE_DIRECTORY_FAILED",
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+      },
+    );
+    return parseAliyunRemoteEntryPage(
+      listed.body,
+      context.root.providerState.driveId,
+      input.directory.path,
+    );
+  }
+
+  async openDownload(
+    input: ProviderDownloadInput,
+    options: ProviderOperationOptions = {},
+  ): Promise<ProviderDownload> {
+    const size = input.entry.size;
+    if (
+      input.entry.type !== "file"
+      || typeof input.entry.id !== "string"
+      || input.entry.id.length === 0
+      || size === undefined
+      || !Number.isSafeInteger(size)
+      || size < 0
+    ) {
+      throw new PanSyncError("DOWNLOAD_FAILED");
+    }
+    const context = await this.#resourceDriveContext(input.accessToken, options);
+    const addressed = await this.#api.post(
+      "/adrive/v1.0/openFile/getDownloadUrl",
+      context.accessToken,
+      { drive_id: context.root.providerState.driveId, file_id: input.entry.id },
+      {
+        failureCode: "DOWNLOAD_FAILED",
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+      },
+    );
+    const downloadUrl = parseAliyunDownloadUrl(addressed.body);
+    let response: Response;
+    try {
+      response = await this.#api.fetch(downloadUrl, {
+        method: "GET",
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+      });
+    } catch {
+      throw new PanSyncError("DOWNLOAD_FAILED");
+    }
+    if (!response.ok || response.body === null) {
+      throw new PanSyncError("DOWNLOAD_FAILED");
+    }
+    return { stream: response.body, size };
+  }
+
   async uploadFile(
     input: ProviderUploadInput,
     options: ProviderOperationOptions = {},
@@ -286,6 +435,30 @@ export class AliyunProvider implements CloudDriveProvider {
       throw new PanSyncError("UPLOAD_FAILED");
     }
     return uploadAliyunFile(this.#api, input, this.#clock, options);
+  }
+
+  async #resourceDriveContext(
+    accessToken: string,
+    options: ProviderOperationOptions,
+  ): Promise<{ accessToken: string; root: AliyunRemoteDirectory }> {
+    const driveResponse = await this.#api.post(
+      "/adrive/v1.0/user/getDriveInfo",
+      accessToken,
+      {},
+      {
+        failureCode: "REMOTE_DIRECTORY_FAILED",
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+      },
+    );
+    const drive = parseResourceDriveSummary(driveResponse.body);
+    return {
+      accessToken: driveResponse.accessToken,
+      root: {
+        id: "root",
+        path: "/",
+        providerState: { driveId: drive.driveId },
+      },
+    };
   }
 
   async #findFolder(
