@@ -424,7 +424,12 @@ describe("OpenClaw plugin entry", () => {
 
     registerPlugin(panSyncPlugin, api);
 
-    expect(registrations.tools).toContain("pan_sync_upload");
+    expect(registrations.tools).toEqual(expect.arrayContaining([
+      "pan_sync_upload",
+      "pan_sync_list",
+      "pan_sync_download",
+    ]));
+    expect(registrations.tools).toHaveLength(3);
     expect(registrations.cliCommands).toContain("pan-sync");
     expect(registrations.httpRoutes).toContainEqual(
       expect.objectContaining({
@@ -728,7 +733,11 @@ describe("OpenClaw plugin entry", () => {
       expect(
         result.diagnostics?.filter(({ level }) => level === "error") ?? [],
       ).toEqual([]);
-      expect(result.plugin?.toolNames).toContain("pan_sync_upload");
+      expect(result.plugin?.toolNames).toEqual(expect.arrayContaining([
+        "pan_sync_upload",
+        "pan_sync_list",
+        "pan_sync_download",
+      ]));
       expect(inspect.stderr).not.toContain(
         "openKeyedStore is only available for trusted plugins",
       );

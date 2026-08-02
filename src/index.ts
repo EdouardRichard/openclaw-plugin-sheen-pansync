@@ -12,6 +12,7 @@ import {
 import { createPanSyncStatusRoute } from "./admin/status-route.js";
 import { resolvePluginConfig } from "./config.js";
 import type { CredentialLeaseRunner } from "./credentials/store.js";
+import { registerPanSyncReadTools } from "./read/tool.js";
 import { createPanSyncRuntime } from "./runtime-composition.js";
 import { registerPanSyncUploadTool } from "./tool.js";
 
@@ -62,7 +63,7 @@ export function createPanSyncPluginEntry(
   return definePluginEntry({
     id: PLUGIN_ID,
     name: PLUGIN_NAME,
-    description: "Upload OpenClaw workspace files to a configured cloud drive",
+    description: "Upload workspace files to and list or download files from an Aliyun Drive resource drive",
     configSchema,
     register(api) {
       const runtime = createPanSyncRuntime({
@@ -74,6 +75,7 @@ export function createPanSyncPluginEntry(
       });
 
       registerPanSyncUploadTool(api, runtime.orchestrator);
+      registerPanSyncReadTools(api, runtime.readOrchestrator);
       registerPanSyncConfigureCli(api, {
         store: runtime.store,
         provider: runtime.provider,

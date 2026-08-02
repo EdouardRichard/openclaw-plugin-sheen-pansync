@@ -20,6 +20,11 @@ import { bindFetchSafeLoopbackServer } from "../../src/net/fetch-safe-loopback.j
 import { ProviderRegistry } from "../../src/provider-registry.js";
 import { OpenListTokenService } from "../../src/providers/aliyun/openlist-token-service.js";
 import { AliyunProvider } from "../../src/providers/aliyun/provider.js";
+import type { ReadOrchestrator } from "../../src/read/orchestrator.js";
+import {
+  registerPanSyncReadTools,
+  type PanSyncReadToolApi,
+} from "../../src/read/tool.js";
 import { registerPanSyncUploadTool, type PanSyncUploadToolApi } from "../../src/tool.js";
 import { UploadOrchestrator } from "../../src/upload/orchestrator.js";
 import { startFakeAliyunServer, type FakeAliyunServer } from "../helpers/fake-aliyun-server.js";
@@ -31,6 +36,10 @@ const REFRESH_API_URL_PATH = "/openlist-renew-CANARY-0c73";
 const REFRESH_API_URL = `https://refresh.example.test${REFRESH_API_URL_PATH}`;
 const OPENLIST_ERROR_TEXT = "openlist-error-CANARY-a625";
 const ABSOLUTE_PATH = "/srv/private/openclaw/workspace/report.pdf";
+const SIGNED_DOWNLOAD_URL = "https://cdn.example.test/download-signed-CANARY-b419";
+const RESOURCE_DRIVE_ID = "resource-drive-CANARY-918e";
+const REMOTE_RAW_RESPONSE = "remote-raw-response-CANARY-f133";
+const SAFE_FILE_ID = "safe-file-id-1";
 const NOW = Date.parse("2026-08-01T00:00:00.000Z");
 const MAP_FOR_EACH_INTRINSIC = Map.prototype.forEach;
 const SET_FOR_EACH_INTRINSIC = Set.prototype.forEach;
@@ -45,6 +54,9 @@ type RejectionKind = "none" | "protected" | "unexpected" | "unsafe";
 const cleanups: Array<() => Promise<void>> = [];
 const runningServers: SetupServer[] = [];
 const aliyunServers: FakeAliyunServer[] = [];
+type CapturedReadTool = ReturnType<
+  Parameters<PanSyncReadToolApi["registerTool"]>[0]
+>;
 
 function record(
   refreshState: CredentialRecord["refreshState"] = { status: "ready" },
@@ -86,6 +98,36 @@ function toolFor(orchestrator: UploadOrchestrator, workspaceDir: string) {
   }, orchestrator);
   if (factory === undefined) throw new Error("tool registration missing");
   return factory({ workspaceDir });
+}
+
+function readToolsFor(
+  orchestrator: Pick<ReadOrchestrator, "list" | "download">,
+  workspaceDir?: string,
+) {
+  const factories = new Map<
+    string,
+    Parameters<PanSyncReadToolApi["registerTool"]>[0]
+  >();
+  registerPanSyncReadTools({
+    registerTool(candidate, options) {
+      factories.set(options?.name ?? "", candidate);
+    },
+  }, orchestrator);
+  return new Map(
+    [...factories].map(([name, factory]) => [
+      name,
+      factory(workspaceDir === undefined ? {} : { workspaceDir }),
+    ]),
+  );
+}
+
+function requiredReadTool<Name extends CapturedReadTool["name"]>(
+  tools: Map<string, CapturedReadTool>,
+  name: Name,
+): Extract<CapturedReadTool, { name: Name }> {
+  const tool = tools.get(name);
+  if (tool === undefined) throw new Error(`${name} registration missing`);
+  return tool as Extract<CapturedReadTool, { name: Name }>;
 }
 
 function orchestratorFor(
@@ -192,6 +234,9 @@ function containsProtectedValue(values: readonly unknown[]): boolean {
         || value.includes(REFRESH_API_URL_PATH)
         || value.includes(OPENLIST_ERROR_TEXT)
         || value.includes(ABSOLUTE_PATH)
+        || value.includes(SIGNED_DOWNLOAD_URL)
+        || value.includes(RESOURCE_DRIVE_ID)
+        || value.includes(REMOTE_RAW_RESPONSE)
       ) {
         return true;
       }
@@ -353,7 +398,7 @@ async function exercisePluginLoggerBoundary(
     async (_key, run) => run({ assertOwned: async () => undefined }),
   );
   await seedStore.replace(record());
-  let toolFactory: OpenClawPluginToolFactory | undefined;
+  const toolFactories = new Map<string, OpenClawPluginToolFactory>();
   let service: OpenClawPluginService | undefined;
   try {
     const entry = createPanSyncPluginEntry({
@@ -368,8 +413,11 @@ async function exercisePluginLoggerBoundary(
     pluginConfig: {},
     logger,
     runtime: { state: { resolveStateDir: () => stateDir } },
-    registerTool(candidate: OpenClawPluginToolFactory) {
-      toolFactory = candidate;
+    registerTool(
+      candidate: OpenClawPluginToolFactory,
+      options?: { name?: string },
+    ) {
+      toolFactories.set(options?.name ?? "", candidate);
     },
     registerCli() {},
     registerHttpRoute() {},
@@ -382,21 +430,26 @@ async function exercisePluginLoggerBoundary(
     } as unknown as OpenClawPluginApi;
     if (entry.register === undefined) throw new Error("plugin register missing");
     entry.register(api);
-    if (toolFactory === undefined || service === undefined) {
+    if (toolFactories.size !== 3 || service === undefined) {
       throw new Error("plugin runtime registration missing");
     }
 
     const context = { config: {}, stateDir, logger } as never;
     await service.start(context);
-    const tool = toolFactory({ workspaceDir } as never);
-    if (tool === null || tool === undefined || Array.isArray(tool)) {
-      throw new Error("plugin registered an invalid Tool boundary");
+    const cases = [
+      ["pan_sync_upload", { paths: ["report.txt"] }],
+      ["pan_sync_list", {}],
+      ["pan_sync_download", { fileId: SAFE_FILE_ID }],
+    ] as const;
+    for (const [name, params] of cases) {
+      const tool = toolFactories.get(name)?.({ workspaceDir } as never);
+      if (tool === null || tool === undefined || Array.isArray(tool)) {
+        throw new Error("plugin registered an invalid Tool boundary");
+      }
+      const result = await tool.execute(`plugin-logger-boundary-${name}`, params);
+      assertNoProtectedArguments([result]);
+      expect(result.details).toEqual({ code: "TOKEN_ENDPOINT_UNAVAILABLE" });
     }
-    const result = await tool.execute("plugin-logger-boundary", {
-      paths: ["report.txt"],
-    });
-    assertNoProtectedArguments([result]);
-    expect(result.details).toEqual({ code: "TOKEN_ENDPOINT_UNAVAILABLE" });
   } finally {
     if (service !== undefined) {
       await service.stop?.({ config: {}, stateDir, logger } as never);
@@ -412,6 +465,97 @@ afterEach(async () => {
 });
 
 describe("release leakage canaries", () => {
+  it("projects read Tool results and errors without protected runtime values", async () => {
+    const tools = readToolsFor({
+      list: async () => ({
+        provider: "aliyun",
+        remoteDirectory: "/",
+        entries: [{
+          fileId: SAFE_FILE_ID,
+          name: "report.pdf",
+          type: "file",
+          size: 42,
+          remotePath: "/report.pdf",
+          providerState: {
+            accessToken: ACCESS_TOKEN,
+            signedUrl: SIGNED_DOWNLOAD_URL,
+            driveId: RESOURCE_DRIVE_ID,
+            rawResponse: REMOTE_RAW_RESPONSE,
+          },
+        }],
+        accessToken: ACCESS_TOKEN,
+        signedUrl: SIGNED_DOWNLOAD_URL,
+        driveId: RESOURCE_DRIVE_ID,
+        rawResponse: REMOTE_RAW_RESPONSE,
+      } as never),
+      download: async () => ({
+        provider: "aliyun",
+        remoteName: "report.pdf",
+        localPath: "report.pdf",
+        size: 42,
+        status: "downloaded",
+        absolutePath: ABSOLUTE_PATH,
+        accessToken: ACCESS_TOKEN,
+        signedUrl: SIGNED_DOWNLOAD_URL,
+        driveId: RESOURCE_DRIVE_ID,
+        rawResponse: REMOTE_RAW_RESPONSE,
+      } as never),
+    }, "/srv/private/openclaw/workspace");
+    const listTool = requiredReadTool(tools, "pan_sync_list");
+    const downloadTool = requiredReadTool(tools, "pan_sync_download");
+
+    const listResult = await listTool.execute("leak-list", {});
+    const downloadResult = await downloadTool.execute("leak-download", {
+      fileId: SAFE_FILE_ID,
+    });
+
+    assertNoProtectedArguments([listResult, downloadResult]);
+    expect(listResult.details).toEqual({
+      provider: "aliyun",
+      remoteDirectory: "/",
+      entries: [{
+        fileId: SAFE_FILE_ID,
+        name: "report.pdf",
+        type: "file",
+        size: 42,
+        remotePath: "/report.pdf",
+      }],
+    });
+    expect(downloadResult.details).toEqual({
+      provider: "aliyun",
+      remoteName: "report.pdf",
+      localPath: "report.pdf",
+      size: 42,
+      status: "downloaded",
+    });
+
+    const failingTools = readToolsFor({
+      list: async () => {
+        throw new Error(`${ACCESS_TOKEN} ${SIGNED_DOWNLOAD_URL} ${REMOTE_RAW_RESPONSE}`);
+      },
+      download: async () => {
+        throw new Error(`${RESOURCE_DRIVE_ID} ${ABSOLUTE_PATH}`);
+      },
+    }, "/srv/private/openclaw/workspace");
+    const listFailure = await requiredReadTool(
+      failingTools,
+      "pan_sync_list",
+    ).execute(
+      "leak-list-failure",
+      {},
+    );
+    const downloadFailure = await requiredReadTool(
+      failingTools,
+      "pan_sync_download",
+    ).execute(
+      "leak-download-failure",
+      { fileId: SAFE_FILE_ID },
+    );
+    assertNoProtectedArguments([listFailure, downloadFailure]);
+    expect(listFailure.details).toEqual({ code: "REMOTE_DIRECTORY_FAILED" });
+    expect(downloadFailure.details).toEqual({ code: "DOWNLOAD_FAILED" });
+  });
+
   it.each([
     ["Error message", () => new Error(ACCESS_TOKEN)],
     ["Error stack", () => {

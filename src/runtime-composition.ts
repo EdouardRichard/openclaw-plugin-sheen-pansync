@@ -12,6 +12,7 @@ import {
 import { ProviderRegistry } from "./provider-registry.js";
 import { OpenListTokenService } from "./providers/aliyun/openlist-token-service.js";
 import { AliyunProvider } from "./providers/aliyun/provider.js";
+import { ReadOrchestrator } from "./read/orchestrator.js";
 import { UploadOrchestrator } from "./upload/orchestrator.js";
 
 const PLUGIN_DATA_DIRECTORY = "pan-sync-helper";
@@ -25,6 +26,7 @@ export type PanSyncRuntime = {
   provider: AliyunProvider;
   providerRegistry: ProviderRegistry;
   orchestrator: UploadOrchestrator;
+  readOrchestrator: ReadOrchestrator;
 };
 
 export type CreatePanSyncRuntimeOptions = {
@@ -57,6 +59,10 @@ export function createPanSyncRuntime(
     tokenManager,
     config,
   });
+  const readOrchestrator = new ReadOrchestrator({
+    providerRegistry,
+    tokenManager,
+  });
 
   return {
     config,
@@ -67,5 +73,6 @@ export function createPanSyncRuntime(
     provider,
     providerRegistry,
     orchestrator,
+    readOrchestrator,
   };
 }

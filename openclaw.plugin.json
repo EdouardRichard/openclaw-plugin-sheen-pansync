@@ -1,10 +1,10 @@
 {
   "id": "pan-sync-helper",
   "name": "Pan Sync Helper",
-  "description": "Upload OpenClaw workspace files to a configured cloud drive",
+  "description": "Upload workspace files to and list or download files from an Aliyun Drive resource drive",
   "version": "0.1.0",
   "contracts": {
-    "tools": ["pan_sync_upload"]
+    "tools": ["pan_sync_upload", "pan_sync_list", "pan_sync_download"]
   },
   "skills": ["skills/pan-sync-upload"],
   "configSchema": {

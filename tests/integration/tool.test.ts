@@ -5,8 +5,17 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { Value } from "typebox/value";
 import { describe, expect, it, vi } from "vitest";
-import type { PanSyncUploadResult } from "../../src/contracts.js";
+import type {
+  PanSyncDownloadResult,
+  PanSyncListResult,
+  PanSyncUploadResult,
+} from "../../src/contracts.js";
 import { PanSyncError } from "../../src/errors.js";
+import {
+  registerPanSyncReadTools,
+  type PanSyncReadToolApi,
+} from "../../src/read/tool.js";
+import type { ReadOrchestrator } from "../../src/read/orchestrator.js";
 import {
   registerPanSyncUploadTool,
   type PanSyncUploadToolApi,
@@ -16,6 +25,8 @@ import { withOpenClawInstallLease } from "../helpers/openclaw-install-lease.mjs"
 
 type ToolRegistration = Parameters<PanSyncUploadToolApi["registerTool"]>[0];
 type CapturedTool = ReturnType<ToolRegistration>;
+type ReadToolRegistration = Parameters<PanSyncReadToolApi["registerTool"]>[0];
+type CapturedReadTool = ReturnType<ReadToolRegistration>;
 
 const require = createRequire(import.meta.url);
 
@@ -70,6 +81,36 @@ function captureTool(
     throw new Error("expected a Tool factory registration");
   }
   return registration(workspaceDir === undefined ? {} : { workspaceDir });
+}
+
+function captureReadTools(
+  orchestrator: Pick<ReadOrchestrator, "list" | "download">,
+  workspaceDir?: string,
+): Map<string, CapturedReadTool> {
+  const registrations = new Map<string, ReadToolRegistration>();
+  const api: PanSyncReadToolApi = {
+    registerTool(candidate, options) {
+      registrations.set(options?.name ?? "", candidate);
+    },
+  };
+
+  registerPanSyncReadTools(api, orchestrator);
+
+  return new Map(
+    [...registrations].map(([name, factory]) => [
+      name,
+      factory(workspaceDir === undefined ? {} : { workspaceDir }),
+    ]),
+  );
+}
+
+function requiredReadTool<Name extends CapturedReadTool["name"]>(
+  tools: Map<string, CapturedReadTool>,
+  name: Name,
+): Extract<CapturedReadTool, { name: Name }> {
+  const tool = tools.get(name);
+  if (tool === undefined) throw new Error(`expected ${name} registration`);
+  return tool as Extract<CapturedReadTool, { name: Name }>;
 }
 
 describe("pan_sync_upload Tool", () => {
@@ -258,6 +299,299 @@ describe("pan_sync_upload Tool", () => {
   });
 });
 
+describe("resource drive read Tools", () => {
+  function inertReadOrchestrator(): Pick<ReadOrchestrator, "list" | "download"> {
+    return {
+      list: vi.fn(async () => {
+        throw new Error("not executed");
+      }),
+      download: vi.fn(async () => {
+        throw new Error("not executed");
+      }),
+    };
+  }
+
+  it("registers only the list and download Tools with their exact bounded schemas", () => {
+    const tools = captureReadTools(inertReadOrchestrator());
+
+    expect([...tools.keys()]).toEqual(["pan_sync_list", "pan_sync_download"]);
+    const listTool = requiredReadTool(tools, "pan_sync_list");
+    expect(listTool.name).toBe("pan_sync_list");
+    expect(listTool.parameters).toEqual({
+      type: "object",
+      properties: {
+        provider: { const: "aliyun", type: "string" },
+        remoteDirectory: { type: "string", minLength: 1 },
+        query: { type: "string", minLength: 1 },
+        limit: { type: "integer", minimum: 1, maximum: 100 },
+        cursor: { type: "string", minLength: 1, maxLength: 65_536 },
+      },
+      additionalProperties: false,
+    });
+
+    const downloadTool = requiredReadTool(tools, "pan_sync_download");
+    expect(downloadTool.name).toBe("pan_sync_download");
+    expect(downloadTool.parameters).toEqual({
+      anyOf: [
+        {
+          type: "object",
+          properties: {
+            provider: { const: "aliyun", type: "string" },
+            fileId: { type: "string", minLength: 1 },
+            localDirectory: { type: "string", minLength: 1 },
+            confirmedLargeDownload: { type: "boolean" },
+          },
+          required: ["fileId"],
+          additionalProperties: false,
+        },
+        {
+          type: "object",
+          properties: {
+            provider: { const: "aliyun", type: "string" },
+            remotePath: { type: "string", minLength: 1 },
+            localDirectory: { type: "string", minLength: 1 },
+            confirmedLargeDownload: { type: "boolean" },
+          },
+          required: ["remotePath"],
+          additionalProperties: false,
+        },
+      ],
+    });
+  });
+
+  it("rejects out-of-bounds list input and undeclared authority or secret fields", () => {
+    const tool = requiredReadTool(
+      captureReadTools(inertReadOrchestrator()),
+      "pan_sync_list",
+    );
+
+    expect(Value.Check(tool.parameters, {})).toBe(true);
+    expect(Value.Check(tool.parameters, { limit: 1 })).toBe(true);
+    expect(Value.Check(tool.parameters, { limit: 100 })).toBe(true);
+    expect(Value.Check(tool.parameters, { limit: 0 })).toBe(false);
+    expect(Value.Check(tool.parameters, { limit: 101 })).toBe(false);
+    expect(Value.Check(tool.parameters, { limit: 1.5 })).toBe(false);
+    expect(Value.Check(tool.parameters, { cursor: "" })).toBe(false);
+    expect(Value.Check(tool.parameters, { cursor: "x".repeat(65_537) })).toBe(false);
+    for (const forged of [
+      { workspaceDir: "C:\\forged" },
+      { accessToken: "access-token-CANARY" },
+      { signedUrl: "https://cdn.example.test/signed-CANARY" },
+      { unknown: true },
+    ]) {
+      expect(Value.Check(tool.parameters, forged)).toBe(false);
+    }
+  });
+
+  it("accepts exactly one download identity and rejects undeclared fields", () => {
+    const tool = requiredReadTool(
+      captureReadTools(inertReadOrchestrator()),
+      "pan_sync_download",
+    );
+
+    expect(Value.Check(tool.parameters, { fileId: "file-1" })).toBe(true);
+    expect(Value.Check(tool.parameters, { remotePath: "/report.pdf" })).toBe(true);
+    expect(Value.Check(tool.parameters, {})).toBe(false);
+    expect(
+      Value.Check(tool.parameters, {
+        fileId: "file-1",
+        remotePath: "/report.pdf",
+      }),
+    ).toBe(false);
+    expect(Value.Check(tool.parameters, { fileId: "" })).toBe(false);
+    for (const forged of [
+      { fileId: "file-1", workspaceDir: "C:\\forged" },
+      { fileId: "file-1", accessToken: "access-token-CANARY" },
+      { fileId: "file-1", signedUrl: "https://cdn.example.test/signed-CANARY" },
+      { fileId: "file-1", unknown: true },
+    ]) {
+      expect(Value.Check(tool.parameters, forged)).toBe(false);
+    }
+  });
+
+  it("projects list results into the approved DTO without runtime canaries", async () => {
+    const safeResult: PanSyncListResult = {
+      provider: "aliyun",
+      remoteDirectory: "/reports",
+      query: "quarterly",
+      entries: [{
+        fileId: "safe-file-1",
+        name: "quarterly.pdf",
+        type: "file",
+        size: 42,
+        updatedAt: "2026-08-02T00:00:00.000Z",
+        remotePath: "/reports/quarterly.pdf",
+      }],
+      nextCursor: "safe-cursor",
+    };
+    const runtimeResult = {
+      ...safeResult,
+      accessToken: "access-token-CANARY",
+      signedUrl: "https://cdn.example.test/signed-CANARY",
+      driveId: "drive-CANARY",
+      rawResponse: { secret: "raw-response-CANARY" },
+      entries: safeResult.entries.map((entry) => ({
+        ...entry,
+        providerState: { signedUrl: "https://cdn.example.test/signed-CANARY" },
+      })),
+    } as unknown as PanSyncListResult;
+    let receivedInput: unknown;
+    const tool = requiredReadTool(
+      captureReadTools({
+        list: vi.fn(async (input) => {
+          receivedInput = input;
+          return runtimeResult;
+        }),
+        download: vi.fn(async () => {
+          throw new Error("not executed");
+        }),
+      }),
+      "pan_sync_list",
+    );
+
+    const result = await tool.execute("list-1", {
+      provider: "aliyun",
+      remoteDirectory: "/reports",
+      query: "quarterly",
+      limit: 10,
+    });
+
+    expect(receivedInput).toEqual({
+      provider: "aliyun",
+      remoteDirectory: "/reports",
+      query: "quarterly",
+      limit: 10,
+    });
+    expect(result.details).toEqual(safeResult);
+    expect(JSON.stringify(result)).not.toContain("CANARY");
+  });
+
+  it("projects downloaded and confirmation results without absolute paths or runtime canaries", async () => {
+    const workspaceDir = "C:\\private\\openclaw\\workspace";
+    const downloaded: PanSyncDownloadResult = {
+      provider: "aliyun",
+      remoteName: "report.pdf",
+      localPath: "downloads/report.pdf",
+      size: 42,
+      status: "downloaded",
+    };
+    const confirmation: PanSyncDownloadResult = {
+      provider: "aliyun",
+      remoteName: "large.bin",
+      fileId: "safe-file-large",
+      size: 104_857_601,
+      status: "confirmation_required",
+      code: "DOWNLOAD_CONFIRMATION_REQUIRED",
+    };
+    let nextResult: PanSyncDownloadResult = {
+      ...downloaded,
+      absolutePath: `${workspaceDir}\\downloads\\report.pdf`,
+      signedUrl: "https://cdn.example.test/signed-CANARY",
+      driveId: "drive-CANARY",
+      rawResponse: { accessToken: "access-token-CANARY" },
+    } as unknown as PanSyncDownloadResult;
+    const tool = requiredReadTool(
+      captureReadTools({
+        list: vi.fn(async () => {
+          throw new Error("not executed");
+        }),
+        download: vi.fn(async () => nextResult),
+      }, workspaceDir),
+      "pan_sync_download",
+    );
+
+    const downloadedResult = await tool.execute("download-1", { fileId: "file-1" });
+    expect(downloadedResult.details).toEqual(downloaded);
+    expect(JSON.stringify(downloadedResult)).not.toContain(workspaceDir);
+    expect(JSON.stringify(downloadedResult)).not.toContain("CANARY");
+
+    nextResult = {
+      ...confirmation,
+      accessToken: "access-token-CANARY",
+      signedUrl: "https://cdn.example.test/signed-CANARY",
+      absolutePath: `${workspaceDir}\\large.bin`,
+    } as unknown as PanSyncDownloadResult;
+    const confirmationResult = await tool.execute("download-2", {
+      fileId: "safe-file-large",
+    });
+    expect(confirmationResult.details).toEqual(confirmation);
+    expect(JSON.stringify(confirmationResult)).not.toContain(workspaceDir);
+    expect(JSON.stringify(confirmationResult)).not.toContain("CANARY");
+  });
+
+  it("keeps listing available but rejects downloading without workspace authority", async () => {
+    let downloadCalled = false;
+    const tools = captureReadTools({
+      list: vi.fn(async () => ({
+        provider: "aliyun" as const,
+        remoteDirectory: "/",
+        entries: [],
+      })),
+      download: vi.fn(async () => {
+        downloadCalled = true;
+        throw new Error("must not execute");
+      }),
+    });
+
+    const listResult = await requiredReadTool(tools, "pan_sync_list").execute(
+      "list-no-workspace",
+      {},
+    );
+    const downloadResult = await requiredReadTool(
+      tools,
+      "pan_sync_download",
+    ).execute("download-no-workspace", { fileId: "file-1" });
+
+    expect(listResult.details).toEqual({
+      provider: "aliyun",
+      remoteDirectory: "/",
+      entries: [],
+    });
+    expect(downloadCalled).toBe(false);
+    expect(downloadResult.details).toEqual({ code: "WORKSPACE_PATH_REJECTED" });
+  });
+
+  it("uses operation-specific fallback errors while preserving stable domain errors", async () => {
+    const workspaceDir = "C:\\private\\openclaw\\workspace";
+    const unknownFailure = captureReadTools({
+      list: vi.fn(async () => {
+        throw new Error(`raw list failure access-token-CANARY ${workspaceDir}`);
+      }),
+      download: vi.fn(async () => {
+        throw new Error(`raw download failure signed-url-CANARY ${workspaceDir}`);
+      }),
+    }, workspaceDir);
+
+    expect(
+      (await requiredReadTool(unknownFailure, "pan_sync_list").execute("list-error", {})).details,
+    ).toEqual({ code: "REMOTE_DIRECTORY_FAILED" });
+    expect(
+      (await requiredReadTool(unknownFailure, "pan_sync_download").execute(
+        "download-error",
+        { fileId: "file-1" },
+      )).details,
+    ).toEqual({ code: "DOWNLOAD_FAILED" });
+
+    const domainFailure = captureReadTools({
+      list: vi.fn(async () => {
+        throw new PanSyncError("CREDENTIALS_REQUIRED");
+      }),
+      download: vi.fn(async () => {
+        throw new PanSyncError("REMOTE_ENTRY_NOT_FILE");
+      }),
+    }, workspaceDir);
+    expect(
+      (await requiredReadTool(domainFailure, "pan_sync_list").execute("list-domain", {})).details,
+    ).toEqual({ code: "CREDENTIALS_REQUIRED" });
+    expect(
+      (await requiredReadTool(domainFailure, "pan_sync_download").execute(
+        "download-domain",
+        { fileId: "folder-1" },
+      )).details,
+    ).toEqual({ code: "REMOTE_ENTRY_NOT_FILE" });
+  });
+});
+
 describe("OpenClaw manifest ownership", () => {
   it("resolves the CLI only through the public openclaw/cli-entry export", () => {
     const requestedSpecifiers: string[] = [];
@@ -274,7 +608,7 @@ describe("OpenClaw manifest ownership", () => {
   });
 
   it(
-    "loads the declared pan_sync_upload contract through the installed OpenClaw registry",
+    "loads all three declared Tool contracts through the installed OpenClaw registry",
     async () => {
       const root = await mkdtemp(join(tmpdir(), "pan-sync-tool-manifest-"));
       const pluginDir = join(root, "plugin");
@@ -308,16 +642,18 @@ describe("OpenClaw manifest ownership", () => {
   id: "pan-sync-helper",
   name: "Pan Sync Helper",
   register(api) {
-    api.registerTool(
-      () => ({
-        name: "pan_sync_upload",
-        label: "Pan Sync Upload",
-        description: "Manifest ownership probe",
-        parameters: { type: "object", properties: {}, additionalProperties: false },
-        async execute() { return { content: [], details: {} }; },
-      }),
-      { name: "pan_sync_upload" },
-    );
+    for (const name of ["pan_sync_upload", "pan_sync_list", "pan_sync_download"]) {
+      api.registerTool(
+        () => ({
+          name,
+          label: name,
+          description: "Manifest ownership probe",
+          parameters: { type: "object", properties: {}, additionalProperties: false },
+          async execute() { return { content: [], details: {} }; },
+        }),
+        { name },
+      );
+    }
   },
 };
 `,
@@ -350,9 +686,16 @@ describe("OpenClaw manifest ownership", () => {
             message?.includes("contracts.tools"),
           ),
         ).toEqual([]);
-        expect(result.plugin?.toolNames).toContain("pan_sync_upload");
-        expect(result.tools?.flatMap(({ names }) => names ?? [])).toContain(
+        const declaredTools = [
           "pan_sync_upload",
+          "pan_sync_list",
+          "pan_sync_download",
+        ];
+        expect(result.plugin?.toolNames).toEqual(
+          expect.arrayContaining(declaredTools),
+        );
+        expect(result.tools?.flatMap(({ names }) => names ?? [])).toEqual(
+          expect.arrayContaining(declaredTools),
         );
       } finally {
         await rm(root, { recursive: true, force: true });
