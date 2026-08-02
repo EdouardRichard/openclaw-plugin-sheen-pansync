@@ -13,21 +13,22 @@ Release decision: BLOCKED
 
 ## Versions and artifact
 
-- Node.js: `24.18.1`
-- npm: `11.8.0`
+- Node.js current gate: `24.18.1`
+- Node.js lower-bound gate: `22.23.1` via Volta
+- npm: `11.18.0`
 - TypeScript: `5.9.3`
 - Vitest: `3.2.7`
 - OpenClaw: `2026.7.1-2`
 - Package: `openclaw-pan-sync-helper@0.1.0`
-- Exact packed artifact SHA-256: `554b10d293043196aeb773778da23c6f179e8c3c96e13c9597c2ce2328775824`
+- Exact packed artifact SHA-256: `9a706590407deb4f73b3c09e398eaf67090cd50c227e83447ce8bfa188a3bc49`
 
 ## Automated gate
 
-Two fresh `npm run verify` runs were used as the release gate. Each run completed TypeScript type checking, unit tests, integration tests, a production build, and `npm pack --dry-run`.
+Two fresh full verification runs were used as the release gate: `npm run verify` on Node `24.18.1`, then `volta run --node 22.23.1 npm run verify` at the supported Node 22 lower bound. Each run completed TypeScript type checking, unit tests, integration tests, a production build, and `npm pack --dry-run`.
 
 Fresh counts per run:
 
-- Unit: 19 files passed; 305 tests passed; 1 test skipped.
+- Unit: 19 files passed; 327 tests passed; 1 test skipped.
 - Integration: 10 files passed; 113 tests passed.
 - TypeScript typecheck: PASS.
 - Build: PASS.
@@ -58,7 +59,7 @@ Absent:
 
 The exact tarball was installed into a fresh isolated OpenClaw state. Runtime inspection reported the plugin loaded, enabled, and activated with no error diagnostics. It exposed exactly `pan_sync_upload`, `pan_sync_list`, and `pan_sync_download`. The installed CLI recognized `pan-sync configure`.
 
-The installed runtime reported one registered plugin HTTP route. However, a foreground token-authenticated local Gateway returned HTTP 404 for the exact status route both without authentication and with the supported Bearer authentication. Neither response contained plugin or status-page content. This proves no unauthenticated status disclosure in that probe, but the authenticated status route was not reachable. The OpenClaw integration gate is therefore FAIL; no plugin or Gateway code was changed during verification.
+After setting `gateway.mode=local` only inside that otherwise fresh temporary state, the installed runtime reported one registered plugin HTTP route. However, a foreground token-authenticated local Gateway returned HTTP 404 for the exact status route both without authentication and with the supported Bearer authentication. Neither response contained plugin or status-page content. This proves no unauthenticated status disclosure in that probe, but the authenticated status route was not reachable. The OpenClaw integration gate is therefore FAIL; no plugin or Gateway code was changed during verification.
 
 ## Real Aliyun observations and missing rows
 
