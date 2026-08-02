@@ -100,11 +100,13 @@ describe("AliyunProvider read primitives", () => {
     const provider = makeProvider(fetch);
     const root = await provider.getReadRoot("access-old");
 
-    await expect(provider.listEntries({
+    const page = await provider.listEntries({
       accessToken: "access-old",
       directory: root,
       limit: 20,
-    })).resolves.toEqual({
+    });
+
+    expect(page).toEqual({
       entries: [expect.objectContaining({
         id: "folder-demo",
         name: "demo",
@@ -112,6 +114,7 @@ describe("AliyunProvider read primitives", () => {
         remotePath: "/demo",
       })],
     });
+    expect(page.entries[0]).not.toHaveProperty("size");
   });
 
   it("resolves an exact resource-drive path", async () => {
