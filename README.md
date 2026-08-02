@@ -74,7 +74,13 @@ openclaw plugins list
 
 ### 6. 第一次上传
 
-在 OpenClaw 会话中用明确的上传方向和工作区相对路径，例如：
+先确保当前工作区中有演示文件。可以请 OpenClaw 创建它：
+
+```text
+在当前工作区创建 pan-sync-demo-en.txt，内容为：Pan Sync Helper demo file.
+```
+
+也可以改用工作区中已有的普通文件；后续上传、搜索和下载示例中的文件名与路径要一并替换。然后用明确的上传方向和工作区相对路径请求上传，例如：
 
 ```text
 把 pan-sync-demo-en.txt 上传到阿里云盘。
@@ -113,7 +119,7 @@ OpenClaw 应调用 `pan_sync_upload`。省略远端目录时上传到 `/openClaw
 有精确网盘路径时，可直接请求：
 
 ```text
-下载 /pan-sync-demo-en.txt 到工作区并读取内容。
+下载 /openClawShare/pan-sync-demo-en.txt 到工作区并读取内容。
 ```
 
 只有文件名时，先搜索再选择：
@@ -145,6 +151,43 @@ OpenClaw 会先用 `pan_sync_list` 消除歧义，再用 `pan_sync_download` 下
 - `degraded` 或 `rate_limited`：等待页面显示的冷却期结束；不要重复提交或循环重试。
 - `RESOURCE_DRIVE_UNAVAILABLE`：该账号没有可用资源盘；插件不会改用备份盘。
 - 下载中断或失败：未完成的临时文件会被清理；重新请求前先确认网络和状态已恢复。
+
+#### 插件已启用，但当前会话找不到 Tool
+
+插件注册/加载和当前 Agent 的有效 Tool 权限是两个独立环节。`openclaw plugins list` 显示 `enabled` 并列出三个 Tool，只能确认插件已经注册；如果当前会话仍提示 `pan_sync_list` 或 `pan_sync_download` 不可用，还需要把它们加入有效的全局或 Agent 级 Tool 策略。
+
+若当前 Agent 没有显式的 Agent 级 `allow` 列表，可在 PowerShell 中运行以下命令。它会读取并保留现有的全局 `tools.alsoAllow`，再合并两个读取 Tool；不要用仅包含插件 Tool 的固定数组直接执行 `config set` 或 `config patch`，因为数组会被整体替换。
+
+```powershell
+$currentJson = openclaw config get tools.alsoAllow --json 2>$null
+$current = if ($LASTEXITCODE -eq 0) {
+  @($currentJson | ConvertFrom-Json)
+} else {
+  @()
+}
+$merged = @((
+  $current + @("pan_sync_list", "pan_sync_download")
+) | Sort-Object -Unique)
+@{ tools = @{ alsoAllow = $merged } } |
+  ConvertTo-Json -Compress -Depth 3 |
+  openclaw config patch --stdin
+```
+
+如果当前 Agent 已配置显式 `allow`，全局 `alsoAllow` 可能不会成为它的有效权限。此时在 OpenClaw Control UI 中打开 **Settings → Agents → 当前 Agent → Tools**，把 `pan_sync_list` 和 `pan_sync_download` 加入 `allow`；没有显式 `allow` 时也可加入 Agent 级 `alsoAllow`。同时确认这两个名称不在 `deny` 中，然后保存。不要删除或替换原有授权。
+
+修改任一作用域后，安全重启 Gateway：
+
+```bash
+openclaw gateway restart --safe
+```
+
+若使用了上面的全局方式，可确认合并结果：
+
+```bash
+openclaw config get tools.alsoAllow --json
+```
+
+最后新建一个 OpenClaw 会话，分别明确请求列出资源盘根目录和下载读取一个测试文件；旧会话不能代替这次有效权限复验。若使用 Agent 级方式，还应重新打开该 Agent 的 Tools 设置，确认保存的条目仍在。
 
 方向明确时才执行：`同步到网盘` 表示上传，`从网盘同步下来` 表示下载。`同步网盘` 含义不明确，OpenClaw 必须先问你是“上传到网盘”还是“从网盘下载”，不能先调用 Tool。
 
@@ -235,7 +278,13 @@ If the state is not `ready`, follow the recovery section before retrying file op
 
 ### 6. Make the first upload
 
-In an OpenClaw chat, state the upload direction and a workspace-relative file name:
+First make sure the demo file exists in the current workspace. You can ask OpenClaw to create it:
+
+```text
+Create pan-sync-demo-en.txt in the current workspace with this content: Pan Sync Helper demo file.
+```
+
+Alternatively, use an existing ordinary workspace file and replace the file name and path consistently in the upload, search, and download examples below. Then state the upload direction and workspace-relative file name:
 
 ```text
 Upload pan-sync-demo-en.txt to Aliyun Drive.
@@ -274,7 +323,7 @@ Name a remote directory in the request to narrow the scope. OpenClaw uses `pan_s
 With an exact remote path, ask directly:
 
 ```text
-Download /pan-sync-demo-en.txt into the workspace and read it.
+Download /openClawShare/pan-sync-demo-en.txt into the workspace and read it.
 ```
 
 With only a file name, let OpenClaw search first:
@@ -306,6 +355,43 @@ Only after your explicit confirmation for that exact file may OpenClaw retry onc
 - `degraded` or `rate_limited`: wait for the displayed cooldown; do not submit or retry in a loop.
 - `RESOURCE_DRIVE_UNAVAILABLE`: the account has no usable resource drive; the plugin will not switch to backup storage.
 - Interrupted or failed download: incomplete temporary output is cleaned up; verify the network and status before retrying.
+
+#### The plugin is enabled, but the current session cannot find a Tool
+
+Plugin registration/loading and the active Agent's effective Tool policy are separate gates. Seeing `enabled` and all three Tools in `openclaw plugins list` confirms registration only. If the current session still reports that `pan_sync_list` or `pan_sync_download` is unavailable, add them at the effective global or Agent scope.
+
+If the active Agent has no explicit Agent-level `allow` list, run the following in PowerShell. It reads and preserves the current global `tools.alsoAllow`, then merges in the two read Tools. Do not run `config set` or `config patch` with a fixed array containing only the plugin Tools: arrays are replaced as a whole.
+
+```powershell
+$currentJson = openclaw config get tools.alsoAllow --json 2>$null
+$current = if ($LASTEXITCODE -eq 0) {
+  @($currentJson | ConvertFrom-Json)
+} else {
+  @()
+}
+$merged = @((
+  $current + @("pan_sync_list", "pan_sync_download")
+) | Sort-Object -Unique)
+@{ tools = @{ alsoAllow = $merged } } |
+  ConvertTo-Json -Compress -Depth 3 |
+  openclaw config patch --stdin
+```
+
+If the active Agent already has an explicit `allow`, the global `alsoAllow` might not become effective for that Agent. In the OpenClaw Control UI, open **Settings → Agents → active Agent → Tools** and add `pan_sync_list` and `pan_sync_download` to `allow`. With no explicit `allow`, you may instead add them to the Agent-level `alsoAllow`. Ensure neither name is in `deny`, save, and preserve every existing grant.
+
+After changing either scope, restart the Gateway safely:
+
+```bash
+openclaw gateway restart --safe
+```
+
+For the global method above, inspect the merged result:
+
+```bash
+openclaw config get tools.alsoAllow --json
+```
+
+Finally, start a fresh OpenClaw session and explicitly request a resource-drive root listing and a test-file download/read. An old session does not replace this effective-policy check. For the Agent-level method, also reopen that Agent's Tools settings and confirm that the saved entries remain present.
 
 Directional sync is explicit: `sync to cloud drive` means upload, while `sync from cloud drive` means download. `sync cloud drive` is ambiguous, so OpenClaw must ask whether you mean upload or download before it calls a Tool.
 
