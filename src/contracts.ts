@@ -25,6 +25,29 @@ export type PanSyncUploadResult = {
   files: FileUploadResult[];
 };
 
+export type PanSyncListInput = {
+  provider?: ProviderId;
+  remoteDirectory?: string;
+  query?: string;
+  limit?: number;
+  cursor?: string;
+};
+
+export type PanSyncListResult = {
+  provider: ProviderId;
+  remoteDirectory: string;
+  query?: string;
+  entries: Array<{
+    fileId: string;
+    name: string;
+    type: "file" | "folder";
+    size?: number;
+    updatedAt?: string;
+    remotePath?: string;
+  }>;
+  nextCursor?: string;
+};
+
 export type CredentialInput = {
   authorizationPageUrl: string;
   refreshApiUrl: string;
