@@ -485,6 +485,26 @@ describe("OpenClaw plugin entry", () => {
     let leaseFactoryCalls = 0;
     const leaseKeys: string[] = [];
     const writes: string[] = [];
+    const nativeFetch = globalThis.fetch;
+    vi.stubGlobal("fetch", vi.fn(async (
+      input: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      const url = String(input);
+      if (url.startsWith("http://127.0.0.1:")) {
+        return nativeFetch(input, init);
+      }
+      if (url.startsWith("http://refresh.example.test/custom/renew")) {
+        return new Response(JSON.stringify({ error: "upstream-body-CANARY" }), {
+          status: 503,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ code: "AccessTokenExpired" }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      });
+    }));
     const entry = createPanSyncPluginEntry({
       credentialLeaseFactory(databasePath) {
         leaseFactoryCalls += 1;
@@ -566,19 +586,6 @@ describe("OpenClaw plugin entry", () => {
     );
     expect(ready.body).toContain("ready");
 
-    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
-      const url = String(input);
-      if (url.startsWith("http://refresh.example.test/custom/renew")) {
-        return new Response(JSON.stringify({ error: "upstream-body-CANARY" }), {
-          status: 503,
-          headers: { "content-type": "application/json" },
-        });
-      }
-      return new Response(JSON.stringify({ code: "AccessTokenExpired" }), {
-        status: 401,
-        headers: { "content-type": "application/json" },
-      });
-    }));
     const tool = registeredToolFactory(registrations)({
       workspaceDir: path.join(state.dataDir, "workspace"),
     } as never) as {
@@ -588,7 +595,6 @@ describe("OpenClaw plugin entry", () => {
     };
     const failed = await tool.execute("call-1", { paths: ["report.pdf"] });
     expect(failed.details).toEqual({ code: "TOKEN_ENDPOINT_UNAVAILABLE" });
-    vi.unstubAllGlobals();
     const afterProviderFailure = await invokeRoute(
       registeredStatusRoute(registrations),
       "GET",
