@@ -230,7 +230,7 @@ afterEach(async () => {
 });
 
 describe("one-time setup server", () => {
-  it("binds only to IPv4 loopback and expires the 32-byte fragment key", async () => {
+  it("binds to all IPv4 interfaces and expires the 32-byte fragment key", async () => {
     const harness = await createHarness({ record: savedRecord });
     cleanups.push(harness.cleanup);
     let listenHost: string | undefined;
@@ -257,7 +257,7 @@ describe("one-time setup server", () => {
     });
     runningServers.push(result);
 
-    expect(listenHost).toBe("127.0.0.1");
+    expect(listenHost).toBe("0.0.0.0");
     expect(result.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/#[-A-Za-z0-9_]{43}$/);
     expect(result.url).not.toContain("?");
 
@@ -317,7 +317,7 @@ describe("one-time setup server", () => {
     }
     expect(await responses[0]?.text()).not.toContain(savedRecord.refreshToken);
 
-    const rejectedHost = await requestWithHost(baseUrl, "/api/config", "attacker.example");
+    const rejectedHost = await requestWithHost(baseUrl, "/api/config", `attacker.example:${result.port + 1}`);
     expect(rejectedHost.status).toBe(400);
     for (const [name, value] of Object.entries(SECURITY_HEADERS)) {
       expect(rejectedHost.headers[name]).toBe(value);
@@ -380,18 +380,26 @@ describe("one-time setup server", () => {
     expect(await response.text()).not.toContain(savedRecord.refreshToken);
   });
 
-  it("accepts only the exact selected IPv4 loopback Host with its port", async () => {
+  it("accepts valid IPv4 and hostname Hosts only on the selected port", async () => {
     const harness = await createHarness({ record: savedRecord });
     cleanups.push(harness.cleanup);
     const result = await startSetupServer(harness.deps);
     runningServers.push(result);
     const baseUrl = result.url.split("/#")[0] ?? "";
 
-    expect((await requestWithHost(baseUrl, "/", `127.0.0.1:${result.port}`)).status).toBe(200);
+    for (const host of [
+      `127.0.0.1:${result.port}`,
+      `192.0.2.10:${result.port}`,
+      `setup.example.test:${result.port}`,
+    ]) {
+      expect((await requestWithHost(baseUrl, "/", host)).status).toBe(200);
+    }
     for (const host of [
       "127.0.0.1",
       `127.0.0.1:${result.port + 1}`,
-      `localhost:${result.port}`,
+      `bad host:${result.port}`,
+      `user@setup.example.test:${result.port}`,
+      `setup.example.test:${result.port}/path`,
       `[::1]:${result.port}`,
     ]) {
       expect((await requestWithHost(baseUrl, "/", host)).status).toBe(400);

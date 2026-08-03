@@ -14,7 +14,7 @@ import type { CredentialStore } from "../credentials/store.js";
 import type { CredentialRecord } from "../credentials/types.js";
 import { PanSyncError, safeErrorDetails } from "../errors.js";
 import {
-  bindFetchSafeLoopbackServer,
+  bindFetchSafeServer,
   isFetchSafePort,
 } from "../net/fetch-safe-loopback.js";
 import {
@@ -34,6 +34,7 @@ const REQUEST_LIFETIME_MS = 15 * 1_000;
 const RESULT_DISPLAY_MS = 60 * 1_000;
 const DEFAULT_REMOTE_DIRECTORY = "/openClawShare";
 const LOOPBACK_HOST = "127.0.0.1";
+const SETUP_BIND_HOST = "0.0.0.0";
 
 export const SETUP_SECURITY_HEADERS = {
   "Cache-Control": "no-store",
@@ -133,7 +134,30 @@ function hasForwardingHeaders(request: IncomingMessage): boolean {
 }
 
 function isAllowedHost(host: string | undefined, port: number | undefined): boolean {
-  return port !== undefined && host === `${LOOPBACK_HOST}:${port}`;
+  if (
+    host === undefined
+    || port === undefined
+    || /[\s@/?#]/u.test(host)
+  ) return false;
+
+  const separator = host.lastIndexOf(":");
+  if (separator <= 0) return false;
+  const hostname = host.slice(0, separator);
+  const explicitPort = host.slice(separator + 1);
+  if (!/^\d+$/u.test(explicitPort) || Number(explicitPort) !== port) return false;
+  if (hostname.startsWith("[") || hostname.endsWith("]")) return false;
+
+  try {
+    const parsed = new URL(`http://${host}/`);
+    return parsed.hostname.length > 0
+      && parsed.username.length === 0
+      && parsed.password.length === 0
+      && parsed.pathname === "/"
+      && parsed.search.length === 0
+      && parsed.hash.length === 0;
+  } catch {
+    return false;
+  }
 }
 
 function parsePathname(request: IncomingMessage): string | undefined {
@@ -606,7 +630,8 @@ export async function startSetupServer(
   };
 
   try {
-    const binding = await bindFetchSafeLoopbackServer({
+    const binding = await bindFetchSafeServer({
+      host: SETUP_BIND_HOST,
       createServer: () => createServer(requestListener),
       ...(runtime.port === undefined ? {} : { port: runtime.port }),
       isPortSafe: runtime.isBrowserSafePort ?? isFetchSafePort,
