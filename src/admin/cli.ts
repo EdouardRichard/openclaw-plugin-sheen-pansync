@@ -1,3 +1,4 @@
+import { networkInterfaces } from "node:os";
 import {
   startSetupServer,
   type SetupServerDependencies,
@@ -34,7 +35,40 @@ export type ConfigureCliOptions = {
   startServer?: (dependencies: SetupServerDependencies) => Promise<SetupServer>;
   writeLine?: (line: string) => void;
   processEvents?: ProcessEvents;
+  networkInterfaces?: () => NetworkInterfaceSnapshot;
 };
+
+export type NetworkAddressSnapshot = {
+  address: string;
+  family: string | number;
+  internal: boolean;
+};
+
+export type NetworkInterfaceSnapshot = Record<
+  string,
+  readonly NetworkAddressSnapshot[] | undefined
+>;
+
+export function remoteSetupUrls(
+  localUrl: string,
+  interfaces: NetworkInterfaceSnapshot,
+): string[] {
+  const addresses = new Set<string>();
+  for (const entries of Object.values(interfaces)) {
+    for (const entry of entries ?? []) {
+      if (!entry.internal && (entry.family === "IPv4" || entry.family === 4)) {
+        addresses.add(entry.address);
+      }
+    }
+  }
+  return [...addresses]
+    .sort((left, right) => left.localeCompare(right, "en"))
+    .map((address) => {
+      const remote = new URL(localUrl);
+      remote.hostname = address;
+      return remote.toString();
+    });
+}
 
 export function registerPanSyncConfigureCli(
   api: PanSyncConfigureCliApi,
@@ -61,6 +95,7 @@ export function registerPanSyncConfigureCommand(
   const writeLine = options.writeLine
     ?? ((line: string) => process.stdout.write(`${line}\n`));
   const processEvents = options.processEvents ?? process;
+  const readNetworkInterfaces = options.networkInterfaces ?? networkInterfaces;
 
   const panSync = program
     .command("pan-sync")
@@ -86,8 +121,21 @@ export function registerPanSyncConfigureCommand(
       });
 
       writeLine("Sheen PanSync configuration page is ready for 10 minutes.");
-      writeLine(`Remote URL: ${server.url}`);
-      writeLine(`SSH example: ssh -L ${server.port}:127.0.0.1:${server.port} user@linux.example.com`);
-      writeLine("Then open the Remote URL in your local browser.");
+      writeLine(`Local URL: ${server.url}`);
+      const remoteUrls = remoteSetupUrls(server.url, readNetworkInterfaces());
+      if (remoteUrls.length === 0) {
+        writeLine("Remote URL: no non-loopback IPv4 address detected.");
+      } else {
+        for (const remoteUrl of remoteUrls) {
+          writeLine(`Remote URL: ${remoteUrl}`);
+        }
+      }
+      writeLine(
+        "Cloud/NAT note: if this address is private, replace only the host with the server public IP; keep port 43891 and the same fragment.",
+      );
+      writeLine(
+        `Temporarily allow TCP port ${server.port} in the host firewall and cloud security group when required.`,
+      );
+      writeLine("After configuration, remove only the temporary access rules created for this session.");
     });
 }
