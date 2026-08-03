@@ -1,6 +1,6 @@
 {
   "name": "openclaw-plugin-sheen-pansync",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Sheen PanSync, an OpenClaw plugin for secure Aliyun Drive resource-drive upload, search, listing, and workspace download.",
   "keywords": [
     "openclaw",
