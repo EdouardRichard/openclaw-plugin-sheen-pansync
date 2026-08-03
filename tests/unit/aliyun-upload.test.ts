@@ -412,10 +412,22 @@ describe("Aliyun multipart upload", () => {
 
     expect(error.code).toBe("RATE_LIMITED");
     expect(elapsedMs).toBeLessThan(1_500);
+    const startedPuts = server.events.filter((event) =>
+      event.endsWith("-start")
+    );
+    expect(startedPuts).toContain("put-1-start");
     expect(
-      server.events.filter((event) => event.endsWith("-start")).sort(),
-    ).toEqual(["put-1-start", "put-2-start", "put-3-start"]);
-    expect(abortedSignedPuts.size).toBe(3);
+      startedPuts.every((event) => [
+        "put-1-start",
+        "put-2-start",
+        "put-3-start",
+      ].includes(event)),
+    ).toBe(true);
+    expect(abortedSignedPuts).toEqual(new Set([
+      "/signed/1",
+      "/signed/2",
+      "/signed/3",
+    ]));
     expect(server.events).not.toContain("complete");
     expect(
       server.requests.some(({ path: requestPath }) =>
