@@ -1034,7 +1034,7 @@ describe("one-time setup server", () => {
       expect(status).toBe(413);
     }
 
-    const rejectedHostStatus = await new Promise<number>((resolve, reject) => {
+    const oversizedBodyStatus = await new Promise<number>((resolve, reject) => {
       const request = nodeRequest({
         hostname: target.hostname,
         port: target.port,
@@ -1051,7 +1051,7 @@ describe("one-time setup server", () => {
       request.once("error", reject);
       request.end();
     });
-    expect(rejectedHostStatus).toBe(413);
+    expect(oversizedBodyStatus).toBe(413);
   });
 
   it("requires JSON media type for JSON routes and empty bodies for POST actions", async () => {
