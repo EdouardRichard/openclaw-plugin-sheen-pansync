@@ -46,7 +46,7 @@ export function registerPanSyncConfigureCli(
   }, {
     descriptors: [{
       name: "pan-sync",
-      description: "Configure Pan Sync Helper",
+      description: "Configure Sheen PanSync",
       hasSubcommands: true,
     }],
   });
@@ -64,7 +64,7 @@ export function registerPanSyncConfigureCommand(
 
   const panSync = program
     .command("pan-sync")
-    .description("Configure and inspect Pan Sync Helper");
+    .description("Configure and inspect Sheen PanSync");
   panSync
     .command("configure")
     .description("Open the one-time credential configuration page")
@@ -85,7 +85,7 @@ export function registerPanSyncConfigureCommand(
         processEvents.off("SIGTERM", stop);
       });
 
-      writeLine("Pan Sync Helper configuration page is ready for 10 minutes.");
+      writeLine("Sheen PanSync configuration page is ready for 10 minutes.");
       writeLine(`Remote URL: ${server.url}`);
       writeLine(`SSH example: ssh -L ${server.port}:127.0.0.1:${server.port} user@linux.example.com`);
       writeLine("Then open the Remote URL in your local browser.");

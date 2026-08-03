@@ -625,7 +625,7 @@ describe("OpenClaw manifest ownership", () => {
           join(pluginDir, "package.json"),
           JSON.stringify(
             {
-              name: "openclaw-pan-sync-helper",
+              name: "openclaw-plugin-sheen-pansync",
               version: "0.1.0",
               type: "module",
               openclaw: { extensions: ["./index.js"] },
@@ -639,8 +639,8 @@ describe("OpenClaw manifest ownership", () => {
         await writeFile(
           join(pluginDir, "index.js"),
           `export default {
-  id: "pan-sync-helper",
-  name: "Pan Sync Helper",
+  id: "sheen-pansync",
+  name: "Sheen PanSync",
   register(api) {
     for (const name of ["pan_sync_upload", "pan_sync_list", "pan_sync_download"]) {
       api.registerTool(
@@ -667,7 +667,7 @@ describe("OpenClaw manifest ownership", () => {
         expect(install.status, install.stderr).toBe(0);
 
         const inspect = runOpenClaw(
-          ["plugins", "inspect", "pan-sync-helper", "--runtime", "--json"],
+          ["plugins", "inspect", "sheen-pansync", "--runtime", "--json"],
           stateDir,
         );
         expect(inspect.error).toBeUndefined();
@@ -781,7 +781,7 @@ describe("pan-sync-upload Skill discovery contract", () => {
       /discuss[\s\S]*(?:do not|must not) call|(?:do not|must not) call[\s\S]*discuss/iu,
     );
     expect(contents).toContain("CREDENTIALS_REQUIRED");
-    expect(contents).toContain("Pan Sync Helper");
+    expect(contents).toContain("Sheen PanSync");
     expect(contents).toContain("openclaw pan-sync configure");
     expect(contents).toContain("OpenList");
     expect(contents).toContain("refresh token");

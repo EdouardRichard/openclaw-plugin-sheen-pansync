@@ -37,6 +37,7 @@ import {
 import type { CredentialRecord } from "../../src/credentials/types.js";
 import { createTempState, octalMode } from "../helpers/temp-state.js";
 import { createBuiltPackageFixture } from "../helpers/package-fixture.js";
+import { materializedNpmArtifactEnvironment } from "../helpers/npm-artifact-environment.js";
 import { withOpenClawInstallLease } from "../helpers/openclaw-install-lease.mjs";
 
 type ToolFactory = OpenClawPluginToolFactory;
@@ -152,8 +153,8 @@ function fakeApi(
     throw new Error(`privileged state call: ${name}`);
   };
   const api = {
-    id: "pan-sync-helper",
-    name: "Pan Sync Helper",
+    id: "sheen-pansync",
+    name: "Sheen PanSync",
     source: "integration-test",
     registrationMode: "full",
     config: {
@@ -241,7 +242,7 @@ async function invokeRoute(
 function registeredStatusRoute(registrations: Registrations) {
   const route = registrations.httpRoutes.find(
     ({ path: registeredPath }) =>
-      registeredPath === "/plugins/pan-sync-helper/status",
+      registeredPath === "/plugins/sheen-pansync/status",
   );
   if (route === undefined) throw new Error("status route not registered");
   return route.handler;
@@ -433,20 +434,20 @@ describe("OpenClaw plugin entry", () => {
     expect(registrations.cliCommands).toContain("pan-sync");
     expect(registrations.httpRoutes).toContainEqual(
       expect.objectContaining({
-        path: "/plugins/pan-sync-helper/status",
+        path: "/plugins/sheen-pansync/status",
         auth: "gateway",
         match: "exact",
       }),
     );
     expect(registrations.controlUi).toEqual([{
       surface: "tab",
-      id: "pan-sync-helper",
-      label: "Pan Sync Helper",
+      id: "sheen-pansync",
+      label: "Sheen PanSync",
       requiredScopes: ["operator.write"],
-      path: "/plugins/pan-sync-helper/status",
+      path: "/plugins/sheen-pansync/status",
     }]);
     expect(registrations.services.map(({ id }) => id)).toEqual([
-      "pan-sync-helper",
+      "sheen-pansync",
     ]);
     expect(registrations.gatewayMethods).toEqual([]);
     expect(registrations.privilegedStateCalls).toEqual([]);
@@ -555,7 +556,7 @@ describe("OpenClaw plugin entry", () => {
     if (setup === undefined) throw new Error("setup dependencies not captured");
     expect(setup.dataDir).toBe(dataDir);
     expect(writes).toContain(
-      "Pan Sync Helper configuration page is ready for 10 minutes.",
+      "Sheen PanSync configuration page is ready for 10 minutes.",
     );
 
     await setup.store.replaceIfVersion(undefined, credentialRecord());
@@ -661,6 +662,7 @@ describe("OpenClaw plugin entry", () => {
       ], {
         cwd: packageFixture.root,
         encoding: "utf8",
+        env: materializedNpmArtifactEnvironment(),
         timeout: 45_000,
       });
       const pack = runNpm([
@@ -720,7 +722,7 @@ describe("OpenClaw plugin entry", () => {
       const inspect = runOpenClaw([
         "plugins",
         "inspect",
-        "pan-sync-helper",
+        "sheen-pansync",
         "--runtime",
         "--json",
       ]);

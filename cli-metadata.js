@@ -1,8 +1,8 @@
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
 const cliMetadataEntry = definePluginEntry({
-  id: "pan-sync-helper",
-  name: "Pan Sync Helper",
+  id: "sheen-pansync",
+  name: "Sheen PanSync",
   description: "Upload OpenClaw workspace files to a configured cloud drive",
   register(api) {
     api.registerCli(async ({ program }) => {
@@ -14,7 +14,7 @@ const cliMetadataEntry = definePluginEntry({
     }, {
       descriptors: [{
         name: "pan-sync",
-        description: "Configure Pan Sync Helper",
+        description: "Configure Sheen PanSync",
         hasSubcommands: true,
       }],
     });

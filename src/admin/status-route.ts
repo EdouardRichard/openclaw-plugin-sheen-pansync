@@ -65,7 +65,7 @@ function renderStatusPage(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Pan Sync Helper</title>
+  <title>Sheen PanSync</title>
   <style>
     :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
     body { margin: 0; padding: 2rem; background: Canvas; color: CanvasText; }
@@ -78,7 +78,7 @@ function renderStatusPage(
 </head>
 <body>
   <main>
-    <h1>Pan Sync Helper</h1>
+    <h1>Sheen PanSync</h1>
     <p>Read-only connection status. Credential changes are available only from the local configuration command.</p>
     <dl>
       <dt>Provider</dt><dd>aliyun</dd>

@@ -51,6 +51,6 @@ Capability questions and hypothetical discussion are not execution requests. For
 
 ## Credential recovery / 凭据恢复
 
-If any Tool returns `CREDENTIALS_REQUIRED`, do not keep retrying. Ask the user to open the Pan Sync Helper status tab and run `openclaw pan-sync configure`.
+If any Tool returns `CREDENTIALS_REQUIRED`, do not keep retrying. Ask the user to open the Sheen PanSync status tab and run `openclaw pan-sync configure`.
 
 Authorization uses OpenList. On the local setup page, use the default mainland-China page `https://api.oplist.org.cn`, select Aliyun Drive App Login, and paste only the resulting refresh token. The complete refresh API URL is independently editable; a custom URL receives that refresh token and has no automatic fallback. OpenList is only for authorization and token refresh; uploads go directly to Aliyun's resource drive and downloads come directly from it.

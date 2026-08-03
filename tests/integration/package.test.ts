@@ -11,6 +11,7 @@ import {
   createBuiltPackageFixture,
   type BuiltPackageFixture,
 } from "../helpers/package-fixture.js";
+import { materializedNpmArtifactEnvironment } from "../helpers/npm-artifact-environment.js";
 import { withOpenClawInstallLease } from "../helpers/openclaw-install-lease.mjs";
 
 type PackResult = Array<{
@@ -89,6 +90,7 @@ function runNpm(args: readonly string[]) {
   return spawnSync(process.execPath, [npmCli, ...args], {
     cwd: packageFixtureRoot(),
     encoding: "utf8",
+    env: materializedNpmArtifactEnvironment(),
     timeout: 60_000,
   });
 }
@@ -193,6 +195,37 @@ afterAll(async () => {
 });
 
 describe("published package", () => {
+  it("materializes a tarball when the parent npm lifecycle is a dry run", async () => {
+    const packDirectory = await mkdtemp(
+      path.join(tmpdir(), "pan-sync-parent-dry-run-"),
+    );
+    temporaryDirectories.push(packDirectory);
+    const previousDryRun = process.env.npm_config_dry_run;
+    process.env.npm_config_dry_run = "true";
+
+    try {
+      const packed = runNpm([
+        "pack",
+        "--json",
+        "--pack-destination",
+        packDirectory,
+      ]);
+      expect(packed.error).toBeUndefined();
+      expect(packed.status, `${packed.stdout}\n${packed.stderr}`).toBe(0);
+      const report = JSON.parse(packed.stdout) as PackResult;
+      const filename = report[0]?.filename;
+      expect(filename).toBeTypeOf("string");
+      const tarball = path.join(packDirectory, path.basename(filename ?? ""));
+      await expect(readFile(tarball)).resolves.toBeInstanceOf(Buffer);
+    } finally {
+      if (previousDryRun === undefined) {
+        delete process.env.npm_config_dry_run;
+      } else {
+        process.env.npm_config_dry_run = previousDryRun;
+      }
+    }
+  });
+
   it("ships the runtime contract without tests or private state", () => {
     const packed = runNpm(["pack", "--json", "--dry-run"]);
     expect(packed.error).toBeUndefined();
@@ -212,6 +245,7 @@ describe("published package", () => {
       "ui/setup.css",
       "skills/pan-sync-upload/SKILL.md",
       "openclaw.plugin.json",
+      "LICENSE",
       "README.md",
       "docs/guides/aliyun-token.md",
       ...allowedReadmeImages,
@@ -248,6 +282,12 @@ describe("published package", () => {
     expect(readme).toContain("[English](#english-quick-start)");
     expect(readme).toContain("## 中文快速上手");
     expect(readme).toContain("## English quick start");
+    expect(readme).toContain("# OpenClaw Sheen PanSync");
+    expect(readme).toContain("npm:openclaw-plugin-sheen-pansync");
+    expect(readme).toContain("openclaw-plugin-sheen-pansync-0.1.0.tgz");
+    expect(readme).toContain("plugins inspect sheen-pansync --runtime --json");
+    expect(readme).toContain("MIT");
+    expect(readme).not.toContain("npm:openclaw-pan-sync-helper");
     expect(readme).toContain("pan_sync_upload");
     expect(readme).toContain("pan_sync_list");
     expect(readme).toContain("pan_sync_download");

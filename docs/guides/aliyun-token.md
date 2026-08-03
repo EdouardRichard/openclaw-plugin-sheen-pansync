@@ -1,6 +1,6 @@
 # OpenList authorization and refresh-token guide
 
-Pan Sync Helper uses OpenList to obtain and refresh Aliyun Drive tokens. It does not ask you to create or enter personal OAuth application credentials. You authorize in OpenList, then paste only the refresh token into the plugin's local setup page.
+Sheen PanSync uses OpenList to obtain and refresh Aliyun Drive tokens. It does not ask you to create or enter personal OAuth application credentials. You authorize in OpenList, then paste only the refresh token into the plugin's local setup page.
 
 ## Default mainland-China URLs
 

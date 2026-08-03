@@ -1,6 +1,6 @@
-# OpenClaw Pan Sync Helper
+# OpenClaw Sheen PanSync
 
-Pan Sync Helper lets OpenClaw upload workspace files to an Aliyun Drive resource drive, search or list that drive, and download one cloud file into the current workspace for normal OpenClaw file work. OpenList is used only to obtain and refresh authorization; file bytes move directly between the plugin and Aliyun Drive.
+Sheen PanSync lets OpenClaw upload workspace files to an Aliyun Drive resource drive, search or list that drive, and download one cloud file into the current workspace for normal OpenClaw file work. OpenList is used only to obtain and refresh authorization; file bytes move directly between the plugin and Aliyun Drive.
 
 [中文](#中文快速上手) · [English](#english-quick-start)
 
@@ -8,7 +8,7 @@ Pan Sync Helper lets OpenClaw upload workspace files to an Aliyun Drive resource
 
 ### 1. 插件价值与边界
 
-Pan Sync Helper 为 OpenClaw 提供三个明确的阿里云盘操作：
+Sheen PanSync 为 OpenClaw 提供三个明确的阿里云盘操作：
 
 - `pan_sync_upload`：把已存在的工作区文件上传到阿里云盘。
 - `pan_sync_list`：列出目录或按名称搜索文件。
@@ -28,7 +28,7 @@ Pan Sync Helper 为 OpenClaw 提供三个明确的阿里云盘操作：
 安装已发布的 npm 包：
 
 ```bash
-openclaw plugins install openclaw-pan-sync-helper
+openclaw plugins install npm:openclaw-plugin-sheen-pansync
 ```
 
 从本地源码安装时，先构建再安装当前目录：
@@ -45,7 +45,7 @@ openclaw plugins install .
 openclaw plugins list
 ```
 
-列表中应显示 `Pan Sync Helper` 为 `enabled`，并提供三个 Tool。
+列表中应显示 `Sheen PanSync` 为 `enabled`，并提供三个 Tool。
 
 ### 4. 通过 OpenList 配置 refresh token
 
@@ -68,7 +68,7 @@ openclaw plugins list
 
 保存成功后，本地配置页显示 `ready`，表示当前 Aliyun access token 可用于文件操作。普通状态和 Tool 结果不会显示 refresh token、access token 或完整配置 URL。
 
-![Pan Sync Helper 已安装并处于 ready 状态](docs/images/readme/01-plugin-ready.png)
+![Sheen PanSync 已安装并处于 ready 状态](docs/images/readme/01-plugin-ready.png)
 
 如果状态不是 `ready`，先按“恢复与安全”处理，不要连续重试文件操作。
 
@@ -77,7 +77,7 @@ openclaw plugins list
 先确保当前工作区中有演示文件。可以请 OpenClaw 创建它：
 
 ```text
-在当前工作区创建 pan-sync-demo-en.txt，内容为：Pan Sync Helper demo file.
+在当前工作区创建 pan-sync-demo-en.txt，内容为：Sheen PanSync demo file.
 ```
 
 也可以改用工作区中已有的普通文件；后续上传、搜索和下载示例中的文件名与路径要一并替换。然后用明确的上传方向和工作区相对路径请求上传，例如：
@@ -226,11 +226,42 @@ openclaw config get tools.deny --json
 - 下载需要当前 OpenClaw 会话提供工作区；没有工作区时仍可列出或搜索，但不能下载。
 - 大文件确认不会跨 Tool 调用或跨文件复用。
 
+### 12. 开发与发布校验
+
+提交或发布前运行完整校验；它会执行类型检查、单元测试、集成测试、构建和 npm tarball 内容检查。集成测试还会安装实际 tarball，并验证 OpenClaw 运行时注册和 CLI 启动：
+
+```bash
+npm ci
+npm run verify
+```
+
+发布前还应从生成的 tarball 安装并检查实际运行时，而不是只从源码目录加载插件：
+
+```bash
+npm pack
+openclaw plugins install npm-pack:./openclaw-plugin-sheen-pansync-0.1.0.tgz --force
+openclaw plugins inspect sheen-pansync --runtime --json
+```
+
+版本号变化后，请把示例中的 tarball 文件名替换为实际名称。首次发布前仍需确认 npm 包名可用、账号具备发布权限、版本号正确且打包内容符合预期。
+
+新包首次发布由已登录 npm 的维护者在本机执行：
+
+```bash
+npm publish --access public
+```
+
+首次发布后，在 npm 包设置中把 Trusted Publisher 绑定到 GitHub owner `EdouardRichard`、仓库 `openclaw-plugin-sheen-pansync`、workflow `npm-publish.yml`，并允许 `npm publish`。后续先更新 `package.json` 与 `package-lock.json` 的版本，再推送完全匹配的稳定 Tag（例如版本 `0.1.1` 对应 `v0.1.1`）；GitHub Actions 将通过 OIDC 发布，不需要 `NPM_TOKEN`。
+
+### 13. 许可证
+
+本项目使用 [MIT License](LICENSE)。
+
 ## English quick start
 
 ### 1. What the plugin does—and does not do
 
-Pan Sync Helper gives OpenClaw three explicit Aliyun Drive operations:
+Sheen PanSync gives OpenClaw three explicit Aliyun Drive operations:
 
 - `pan_sync_upload` uploads an existing workspace file.
 - `pan_sync_list` lists a directory or searches by file name.
@@ -250,7 +281,7 @@ Every file operation targets the Aliyun **resource drive** only; the plugin neve
 Install the published npm package:
 
 ```bash
-openclaw plugins install openclaw-pan-sync-helper
+openclaw plugins install npm:openclaw-plugin-sheen-pansync
 ```
 
 To install from a source checkout, build it first:
@@ -267,7 +298,7 @@ Confirm that the plugin is enabled:
 openclaw plugins list
 ```
 
-`Pan Sync Helper` should appear as `enabled` and expose all three Tools.
+`Sheen PanSync` should appear as `enabled` and expose all three Tools.
 
 ### 4. Configure a refresh token through OpenList
 
@@ -290,7 +321,7 @@ A custom refresh API receives the refresh token you paste, so use one only when 
 
 After a successful save, the local setup page shows `ready`, meaning the current Aliyun access token can be used for file operations. Normal status and Tool results never reveal refresh tokens, access tokens, or complete configured URLs.
 
-![Pan Sync Helper installed with a safe ready state](docs/images/readme/01-plugin-ready.png)
+![Sheen PanSync installed with a safe ready state](docs/images/readme/01-plugin-ready.png)
 
 If the state is not `ready`, follow the recovery section before retrying file operations.
 
@@ -299,7 +330,7 @@ If the state is not `ready`, follow the recovery section before retrying file op
 First make sure the demo file exists in the current workspace. You can ask OpenClaw to create it:
 
 ```text
-Create pan-sync-demo-en.txt in the current workspace with this content: Pan Sync Helper demo file.
+Create pan-sync-demo-en.txt in the current workspace with this content: Sheen PanSync demo file.
 ```
 
 Alternatively, use an existing ordinary workspace file and replace the file name and path consistently in the upload, search, and download examples below. Then state the upload direction and workspace-relative file name:
@@ -447,3 +478,34 @@ Never paste a refresh token, access token, one-time configuration URL, download 
 - Search is a bounded, resumable name search, not full-text search inside file contents.
 - Downloads require a workspace on the current OpenClaw session. Listing and search still work without one.
 - Large-file confirmation is never retained across Tool calls or reused for another file.
+
+### 12. Development and release checks
+
+Run the full verification before committing or publishing. It type-checks the project, runs unit and integration tests, builds the runtime, and checks the npm tarball contents. The integration suite also installs the actual tarball and verifies OpenClaw runtime registration and CLI startup:
+
+```bash
+npm ci
+npm run verify
+```
+
+Before publishing, also install and inspect the generated tarball so the test uses the same package shape as an npm install instead of loading the source checkout directly:
+
+```bash
+npm pack
+openclaw plugins install npm-pack:./openclaw-plugin-sheen-pansync-0.1.0.tgz --force
+openclaw plugins inspect sheen-pansync --runtime --json
+```
+
+Replace the example tarball name after changing the package version. Before the first publish, verify that the npm package name is available, the account can publish it, the release version is correct, and the packed contents match expectations.
+
+For the first release of the new package, an npm-authenticated maintainer publishes locally:
+
+```bash
+npm publish --access public
+```
+
+After the first publish, configure the npm Trusted Publisher with GitHub owner `EdouardRichard`, repository `openclaw-plugin-sheen-pansync`, workflow `npm-publish.yml`, and allowed action `npm publish`. For later releases, update the version in both `package.json` and `package-lock.json`, then push the exact matching stable Tag (for example, version `0.1.1` uses `v0.1.1`). GitHub Actions publishes through OIDC without an `NPM_TOKEN`.
+
+### 13. License
+
+This project is licensed under the [MIT License](LICENSE).

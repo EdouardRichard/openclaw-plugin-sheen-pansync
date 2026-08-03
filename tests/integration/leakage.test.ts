@@ -406,8 +406,8 @@ async function exercisePluginLoggerBoundary(
         run({ assertOwned: async () => undefined }),
     });
     const api = {
-    id: "pan-sync-helper",
-    name: "Pan Sync Helper",
+    id: "sheen-pansync",
+    name: "Sheen PanSync",
     source: "leakage-gate",
     registrationMode: "full",
     pluginConfig: {},

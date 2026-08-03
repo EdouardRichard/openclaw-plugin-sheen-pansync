@@ -1,19 +1,59 @@
 {
-  "name": "openclaw-pan-sync-helper",
+  "name": "openclaw-plugin-sheen-pansync",
   "version": "0.1.0",
+  "description": "Sheen PanSync, an OpenClaw plugin for secure Aliyun Drive resource-drive upload, search, listing, and workspace download.",
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "sheen-pansync",
+    "aliyun-drive",
+    "alicloud-drive",
+    "openlist",
+    "cloud-storage",
+    "file-sync"
+  ],
+  "homepage": "https://github.com/EdouardRichard/openclaw-plugin-sheen-pansync#readme",
+  "bugs": {
+    "url": "https://github.com/EdouardRichard/openclaw-plugin-sheen-pansync/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EdouardRichard/openclaw-plugin-sheen-pansync.git"
+  },
+  "license": "MIT",
   "type": "module",
   "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "exports": {
-    ".": "./dist/index.js"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
   },
   "openclaw": {
     "extensions": [
       "./dist/index.js"
-    ]
+    ],
+    "install": {
+      "npmSpec": "openclaw-plugin-sheen-pansync",
+      "defaultChoice": "npm",
+      "minHostVersion": ">=2026.7.1-2"
+    },
+    "compat": {
+      "pluginApi": ">=2026.7.1-2",
+      "minGatewayVersion": "2026.7.1-2"
+    },
+    "build": {
+      "openclawVersion": "2026.7.1-2",
+      "pluginSdkVersion": "2026.7.1-2"
+    }
   },
   "files": [
+    "LICENSE",
     "cli-metadata.js",
     "dist",
+    "scripts/prepack.mjs",
     "ui",
     "skills",
     "docs/guides/aliyun-token.md",
@@ -23,6 +63,9 @@
   ],
   "engines": {
     "node": ">=22.22.3"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "peerDependencies": {
     "openclaw": ">=2026.7.1-2"
@@ -45,11 +88,13 @@
   },
   "scripts": {
     "build": "node scripts/clean-dist.mjs && tsc -p tsconfig.build.json && node scripts/copy-assets.mjs",
+    "prepack": "node scripts/prepack.mjs",
+    "prepublishOnly": "npm run verify",
     "test": "vitest",
     "test:unit": "vitest run tests/unit",
     "test:integration": "vitest run tests/integration",
     "test:leakage": "vitest run tests/integration/leakage.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "verify": "npm run typecheck && npm run test:unit && npm run test:integration && npm run build && npm pack --dry-run"
+    "verify": "npm run typecheck && npm run test:unit && npm run test:integration && npm pack --dry-run"
   }
 }

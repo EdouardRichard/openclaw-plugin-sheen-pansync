@@ -16,9 +16,9 @@ import { registerPanSyncReadTools } from "./read/tool.js";
 import { createPanSyncRuntime } from "./runtime-composition.js";
 import { registerPanSyncUploadTool } from "./tool.js";
 
-const PLUGIN_ID = "pan-sync-helper";
-const PLUGIN_NAME = "Pan Sync Helper";
-const STATUS_PATH = "/plugins/pan-sync-helper/status";
+const PLUGIN_ID = "sheen-pansync";
+const PLUGIN_NAME = "Sheen PanSync";
+const STATUS_PATH = "/plugins/sheen-pansync/status";
 const ASSETS_DIR = fileURLToPath(new URL("../ui", import.meta.url));
 
 const configSchema: OpenClawPluginConfigSchema = {

@@ -21,6 +21,7 @@ const fixtureEntries = [
   "skills",
   "docs/guides/aliyun-token.md",
   "docs/images/readme",
+  "LICENSE",
   "package.json",
   "tsconfig.json",
   "tsconfig.build.json",

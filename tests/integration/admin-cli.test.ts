@@ -81,7 +81,7 @@ describe("OpenClaw configuration CLI", () => {
     expect(registrationOptions).toEqual({
       descriptors: [{
         name: "pan-sync",
-        description: "Configure Pan Sync Helper",
+        description: "Configure Sheen PanSync",
         hasSubcommands: true,
       }],
     });
@@ -94,7 +94,7 @@ describe("OpenClaw configuration CLI", () => {
       dataDir,
     }));
     expect(lines).toEqual([
-      "Pan Sync Helper configuration page is ready for 10 minutes.",
+      "Sheen PanSync configuration page is ready for 10 minutes.",
       "Remote URL: http://127.0.0.1:43891/#AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
       "SSH example: ssh -L 43891:127.0.0.1:43891 user@linux.example.com",
       "Then open the Remote URL in your local browser.",
