@@ -1,6 +1,7 @@
 import { createServer, type Server } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  bindFetchSafeServer,
   bindFetchSafeLoopbackServer,
   isFetchSafePort,
 } from "../../src/net/fetch-safe-loopback.js";
@@ -18,6 +19,32 @@ afterEach(async () => {
 });
 
 describe("bindFetchSafeLoopbackServer", () => {
+  it("binds the generic Fetch-safe server to the requested IPv4 host", async () => {
+    const binding = await bindFetchSafeServer({
+      host: "0.0.0.0",
+      createServer() {
+        const server = createServer();
+        servers.push(server);
+        return server;
+      },
+    });
+
+    expect(binding.address.address).toBe("0.0.0.0");
+    expect(binding.address.family).toBe("IPv4");
+  });
+
+  it("keeps the loopback wrapper on IPv4 loopback", async () => {
+    const binding = await bindFetchSafeLoopbackServer({
+      createServer() {
+        const server = createServer();
+        servers.push(server);
+        return server;
+      },
+    });
+
+    expect(binding.address.address).toBe("127.0.0.1");
+  });
+
   it("rejects ports that the Fetch standard blocks", () => {
     expect(isFetchSafePort(6000)).toBe(false);
     expect(isFetchSafePort(49_152)).toBe(true);

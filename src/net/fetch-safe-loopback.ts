@@ -14,12 +14,13 @@ export function isFetchSafePort(port: number): boolean {
   return port >= 1 && port <= 65_535 && !FETCH_FORBIDDEN_PORTS.has(port);
 }
 
-export type FetchSafeLoopbackBinding = {
+export type FetchSafeBinding = {
   server: Server;
   address: AddressInfo;
 };
 
-export type FetchSafeLoopbackOptions = {
+export type FetchSafeServerOptions = {
+  host: string;
   createServer(): Server;
   port?: number;
   isPortSafe?: (port: number) => boolean;
@@ -28,13 +29,19 @@ export type FetchSafeLoopbackOptions = {
   selectionExhaustedMessage?: string;
 };
 
+export type FetchSafeLoopbackOptions = Omit<FetchSafeServerOptions, "host">;
+
 function closeListeningServer(server: Server): Promise<void> {
   return new Promise((resolve, reject) => {
     server.close((error) => error ? reject(error) : resolve());
   });
 }
 
-function waitUntilListening(server: Server, port: number): Promise<void> {
+function waitUntilListening(
+  server: Server,
+  port: number,
+  host: string,
+): Promise<void> {
   return new Promise((resolve, reject) => {
     const onError = (error: Error): void => {
       server.off("listening", onListening);
@@ -46,18 +53,18 @@ function waitUntilListening(server: Server, port: number): Promise<void> {
     };
     server.once("error", onError);
     server.once("listening", onListening);
-    server.listen(port, "127.0.0.1");
+    server.listen(port, host);
   });
 }
 
-export async function bindFetchSafeLoopbackServer(
-  options: FetchSafeLoopbackOptions,
-): Promise<FetchSafeLoopbackBinding> {
+export async function bindFetchSafeServer(
+  options: FetchSafeServerOptions,
+): Promise<FetchSafeBinding> {
   const port = options.port ?? 0;
   const portIsSafe = options.isPortSafe ?? isFetchSafePort;
   for (let attempt = 0; attempt < 16; attempt += 1) {
     const server = options.createServer();
-    await waitUntilListening(server, port);
+    await waitUntilListening(server, port, options.host);
     const address = server.address();
     if (address === null || typeof address === "string") {
       await closeListeningServer(server);
@@ -90,4 +97,10 @@ export async function bindFetchSafeLoopbackServer(
     options.selectionExhaustedMessage
       ?? "loopback server could not select a Fetch-safe port",
   );
+}
+
+export function bindFetchSafeLoopbackServer(
+  options: FetchSafeLoopbackOptions,
+): Promise<FetchSafeBinding> {
+  return bindFetchSafeServer({ ...options, host: "127.0.0.1" });
 }
