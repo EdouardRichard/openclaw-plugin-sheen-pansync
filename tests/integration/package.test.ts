@@ -509,13 +509,10 @@ describe("published package", () => {
 
       child.kill("SIGTERM");
       const graceful = await settlesWithin(exitPromise, 5_000);
-      if (!graceful) {
-        child.kill("SIGKILL");
-        expect(
-          await settlesWithin(exitPromise, 5_000),
-          "official CLI did not exit after exact-child force termination",
-        ).toBe(true);
-      }
+      expect(
+        graceful,
+        "official CLI did not exit gracefully after SIGTERM",
+      ).toBe(true);
     } finally {
       if (child !== undefined && child.exitCode === null) {
         child.kill("SIGTERM");

@@ -186,4 +186,60 @@ describe("OpenClaw configuration CLI", () => {
     );
     expect(close).not.toHaveBeenCalled();
   });
+
+  it("continues serving with fallback output when network discovery throws", async () => {
+    const program = new FakeCommand();
+    const lines: string[] = [];
+    const close = vi.fn(async () => undefined);
+    const signalHandlers = new Map<string, () => void>();
+    const api = {
+      registerCli(registrar: (context: { program: FakeCommand }) => void) {
+        registrar({ program });
+      },
+    } as unknown as PanSyncConfigureCliApi;
+
+    registerPanSyncConfigureCli(api, {
+      store: {} as SetupServerDependencies["store"],
+      provider: {} as SetupServerDependencies["provider"],
+      orchestrator: {} as SetupServerDependencies["orchestrator"],
+      dataDir: "C:\\prepared-state\\pan-sync-helper",
+      assetsDir: "C:\\plugin\\ui",
+      clock: Date.now,
+      randomBytes: Buffer.alloc,
+    }, {
+      startServer: async () => ({
+        url: "http://127.0.0.1:47077/#key",
+        port: 47077,
+        close,
+        closed: new Promise<void>(() => undefined),
+        isAuthorized: () => true,
+        accessKeyBuffer: Buffer.alloc(32, 1),
+      }),
+      writeLine: (line) => lines.push(line),
+      processEvents: {
+        once(signal: string, handler: () => void) {
+          signalHandlers.set(signal, handler);
+          return process;
+        },
+        off(signal: string) {
+          signalHandlers.delete(signal);
+          return process;
+        },
+      },
+      networkInterfaces: () => {
+        throw new Error("injected interface enumeration failure");
+      },
+    });
+
+    const action = program.children.get("pan-sync")?.children.get("configure")?.actionHandler;
+    await expect(action?.()).resolves.toBeUndefined();
+
+    expect(lines).toContain("Remote URL: no non-loopback IPv4 address detected.");
+    expect(close).not.toHaveBeenCalled();
+    expect(signalHandlers.has("SIGINT")).toBe(true);
+    expect(signalHandlers.has("SIGTERM")).toBe(true);
+
+    signalHandlers.get("SIGTERM")?.();
+    await vi.waitFor(() => expect(close).toHaveBeenCalledTimes(1));
+  });
 });

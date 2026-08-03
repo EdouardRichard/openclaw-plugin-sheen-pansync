@@ -25,11 +25,11 @@ OpenList 只负责完成阿里云盘授权和刷新 Token；文件内容由插�
 ```text
 请帮我安装并配置 openclaw-plugin-sheen-pansync。先识别当前操作系统、Shell、OpenClaw 版本、插件状态、工作区和有效 Tool 策略；保留所有无关配置与用户改动。
 
-优先使用 npm 安装并启用插件。用 openclaw plugins list 只检查插件已安装且可见；再用 openclaw plugins inspect sheen-pansync --runtime --json 检查 runtime toolNames 包含 pan_sync_upload、pan_sync_list、pan_sync_download。需要修改 Tool 权限时，只把这三个 Tool 合并到当前有效的全局或 Agent 级策略，不要整体替换 allow、alsoAllow 或 deny。
+优先使用 npm 安装并启用插件。先确认我明确请求或授权了上传、列出/搜索、下载中的哪些能力，只把对应的 Tool 合并到当前有效的全局或 Agent 级策略；保留其他策略条目和策略层。若显式 deny 阻止某个所需 Tool，报告该精确冲突及影响，取得我确认后才能移除那一个精确 deny，不能静默放行全部三个 Tool，也不要整体替换 allow、alsoAllow 或 deny。本轮若安装、启用插件或修改了 Tool 策略，必须先让在线 Gateway 加载变更：OpenClaw 托管安装执行 openclaw gateway restart --safe；非托管或容器部署重启实际承载 Gateway 的进程或容器。然后用 openclaw plugins list 只检查插件已安装且可见，再用 openclaw plugins inspect sheen-pansync --runtime --json 检查 runtime toolNames 包含 pan_sync_upload、pan_sync_list、pan_sync_download；runtime inspect 本身不代表在线 Gateway 已加载变更。
 
 在后台启动 openclaw pan-sync configure，准确记录并持续跟踪你启动的配置进程 PID，读取命令实际输出的 Local URL、Remote URL 和端口。判断我是同机、局域网还是公网访问，并检查端口占用、主机防火墙、云安全组、NAT/端口映射及公网 IP。只能自动修改你能够确认和回滚的配置；若需要我操作云平台，请给出精确步骤并等待。云主机只有私网 Remote URL 时，使用实际公网 IP 替换 URL 主机部分，保留端口和 fragment。
 
-把可用的十分钟临时配置 URL 发给我。不要让我把 refresh_token 发到对话中；提醒我只在配置网页中粘贴 Token。等待我确认保存完成后，检查状态是否为 ready，再检查 runtime toolNames，并在新会话中通过 /tools 验证三个 Tool 的实际有效可用性。
+把可用的十分钟临时配置 URL 发给我。不要让我把 refresh_token 发到对话中；提醒我只在配置网页中粘贴 Token。初始页面显示 READY 只表示临时页成功读取配置；成功保存候选凭据后应显示 SAVED_AND_VERIFIED。随后只在已认证的 Sheen PanSync 只读 Control UI 状态标签页确认持久凭据状态为 ready，再检查 runtime toolNames，并在新会话中通过 /tools 验证本轮明确授权的 Tool 实际可用。
 
 最后只终止你在本轮亲自启动并持续跟踪了准确 PID 的临时配置进程；预先存在、PID 未跟踪或归属不确定的进程一律保留。只清理由本轮新增的主机防火墙、云安全组或端口映射规则，不要删除预先存在或来源不明的规则。报告自动化验证结果和仍需真实阿里云盘账号完成的验收，不要把两者混为一谈。
 ```
@@ -45,16 +45,17 @@ OpenList 只负责完成阿里云盘授权和刷新 Token；文件内容由插�
 ```powershell
 openclaw plugins install npm:openclaw-plugin-sheen-pansync
 openclaw plugins enable sheen-pansync
+openclaw gateway restart --safe
 openclaw plugins list
 ```
 
-`openclaw plugins list` 只能检查插件已经安装并且对 OpenClaw 可见；当前版本可能显示 `loaded`，它不证明三个 Tool 已完成 runtime 注册。继续检查 runtime 的 `toolNames`：
+上面的重启命令适用于 OpenClaw 托管的 Gateway。非托管或容器部署必须改为重启实际承载 Gateway 的进程或容器；不要用 runtime inspect 代替在线 Gateway 的加载门禁。`openclaw plugins list` 只能检查插件已经安装并且对 OpenClaw 可见；当前版本可能显示 `loaded`，它不证明三个 Tool 已完成 runtime 注册。继续检查 runtime 的 `toolNames`：
 
 ```powershell
 openclaw plugins inspect sheen-pansync --runtime --json
 ```
 
-输出的 `toolNames` 应包含 `pan_sync_upload`、`pan_sync_list` 和 `pan_sync_download`。最后新建一个 OpenClaw 会话并执行 `/tools`，确认这三个 Tool 在当前有效策略下实际可用。
+输出的 `toolNames` 应包含 `pan_sync_upload`、`pan_sync_list` 和 `pan_sync_download`。最后新建一个 OpenClaw 会话并执行 `/tools`，确认本轮明确授权的 Tool 在当前有效策略下实际可用。
 
 ### 拉取仓库并构建安装
 
@@ -67,9 +68,10 @@ npm ci
 npm run build
 openclaw plugins install .
 openclaw plugins enable sheen-pansync
+openclaw gateway restart --safe
 ```
 
-随后执行 `openclaw plugins list` 检查安装可见性，再执行 `openclaw plugins inspect sheen-pansync --runtime --json` 检查 runtime `toolNames`，最后在新会话中通过 `/tools` 检查实际有效可用性。源码测试通过不能代替这些实际安装检查。
+上面的重启命令适用于 OpenClaw 托管的 Gateway；非托管或容器部署必须重启实际承载 Gateway 的进程或容器。随后执行 `openclaw plugins list` 检查安装可见性，再执行 `openclaw plugins inspect sheen-pansync --runtime --json` 检查 runtime `toolNames`，最后在新会话中通过 `/tools` 检查本轮明确授权的 Tool 实际可用。runtime inspect 和源码测试都不能代替在线 Gateway 加载与新会话检查。
 
 ## 手动配置
 
@@ -89,10 +91,12 @@ openclaw plugins enable sheen-pansync
 4. 远程访问需要临时允许命令实际选择的 TCP 端口。检查主机防火墙，以及云环境中的安全组和 NAT/端口映射。只新增本轮所需、来源清楚且能够回滚的规则；不要关闭整套防火墙，也不要改动已有无关规则。配置服务拒绝转发请求头，因此不要把反向代理当作已支持的访问方式。
 5. 在十分钟内打开完整临时 URL。这个 URL 包含一次性 fragment：只交给当前操作者，不要放进截图、工单、长期文档或日志。页面使用临时 HTTP，安全边界是短时窗口、一次性 URL、配置 API 授权和端口及时回收；请只在可信网络路径上使用。
 6. 在页面中打开 OpenList 授权入口，完成阿里云盘授权并取得 Token。回到配置页，**只在网页中**粘贴 OpenList 显示的 `refresh_token`，核对刷新 API 后保存。自定义刷新 API 会收到该 Token，只能填写你信任的服务。详细信任与恢复说明见 [OpenList 授权与 Token 恢复指南](docs/guides/aliyun-token.md)。
-7. 页面显示 `ready` 后，说明当前访问凭据可供文件操作使用。不要把 Token 复制到聊天，也不要尝试通过普通 OpenClaw 插件配置写入它；该字段会被拒绝。插件不提供二维码登录。再运行 `openclaw plugins inspect sheen-pansync --runtime --json` 检查三个 runtime `toolNames`，并在新会话中通过 `/tools` 验证实际有效可用性。
+7. 初始配置页显示 `READY`，只表示临时页面已成功读取配置；成功保存并验证候选凭据后，页面显示 `SAVED_AND_VERIFIED`。持久凭据的 `ready` 状态只在已认证的 Sheen PanSync 只读 Control UI 状态标签页确认，不要把这三个状态混为一谈。不要把 Token 复制到聊天，也不要尝试通过普通 OpenClaw 插件配置写入它；该字段会被拒绝。插件不提供二维码登录。再运行 `openclaw plugins inspect sheen-pansync --runtime --json` 检查三个 runtime `toolNames`，并在新会话中通过 `/tools` 验证本轮明确授权的 Tool 实际可用。
 8. 配置成功后服务会短暂显示结果再关闭；十分钟到期也会关闭。如果命令仍残留，只终止你为本轮命令启动并准确记录了 PID 的配置进程，预先存在或归属不确定的进程保持不动。确认本轮端口不再监听，再只删除本轮新增的主机防火墙、云安全组和端口映射规则。
 
-![插件已安装并处于 ready 状态](docs/images/readme/01-plugin-ready.png)
+![OpenClaw 调用 Pan Sync List 并显示三个 Tool 已安装、资源盘可达](docs/images/readme/01-plugin-ready.png)
+
+截图展示的是新会话中的资源盘根目录探测与 Tool 可达性，不显示临时配置页状态或 Control UI 中的持久凭据状态。
 
 ## 插件用法
 
@@ -172,7 +176,7 @@ OpenClaw 应先用 `pan_sync_list` 确认目标，再用 `pan_sync_download` 下
 这个文件超过 100 MiB。请告诉我文件名和大小，并等我明确确认后再下载；不要把这次确认用于其他文件。
 ```
 
-只有用户对当前文件明确同意后，OpenClaw 才能以 `confirmedLargeDownload: true` 重试一次。确认不会持久保存，不能跨 Tool 调用或跨文件复用。
+只有用户对当前文件明确同意后，这次确认才授权**紧接着的一次** `pan_sync_download` 重试：必须使用与触发确认时完全相同的 `fileId`/`remotePath`，并设置 `confirmedLargeDownload: true`。该确认绝不能用于另一个文件或另一次调用；如果这次紧接的重试再次要求确认，立即停止并报告，不能循环重试。
 
 ## 常见问题与解决方法
 
@@ -204,15 +208,15 @@ OpenClaw 应先用 `pan_sync_list` 确认目标，再用 `pan_sync_download` 下
 openclaw plugins inspect sheen-pansync --runtime --json
 ```
 
-随后检查真正生效的全局或 Agent 级策略。已有显式 `allow` 时只把 `pan_sync_upload`、`pan_sync_list`、`pan_sync_download` 合并进去；没有显式 `allow` 时才合并到适用的 `alsoAllow`。只从 `deny` 中移除这三个精确名称，并保留其他条目，绝不能用固定数组整体覆盖已有策略。
+随后检查真正生效的全局或 Agent 级策略。先确认用户明确请求或授权了上传、列出/搜索、下载中的哪些能力，只把对应 Tool 合并到适用的 `allow` 或 `alsoAllow`；不要默认授予全部三个 Tool。若某个所需 Tool 被显式 `deny` 阻止，先报告该精确 deny、所在策略层及影响，取得用户确认后才能移除那一个精确条目。保留其他 deny、无关条目和策略层，绝不能用固定数组整体覆盖已有策略。
 
-修改策略后安全重启 Gateway：
+本轮确实修改策略后，必须让在线 Gateway 加载变更。OpenClaw 托管安装执行：
 
 ```powershell
 openclaw gateway restart --safe
 ```
 
-然后新建 OpenClaw 会话，先通过 `/tools` 确认三个 Tool 实际可用，再分别验证上传、列出和下载。旧会话不能证明新策略已经生效。若问题仍在，核对 OpenClaw 版本是否满足要求，以及修改的是不是当前 Agent 实际使用的策略层级。
+非托管或容器部署则重启实际承载 Gateway 的进程或容器。runtime inspect 不能替代这一步。然后新建 OpenClaw 会话，先通过 `/tools` 确认本轮明确授权的 Tool 实际可用，再验证相应能力。旧会话不能证明新策略已经生效。若问题仍在，核对 OpenClaw 版本是否满足要求，以及修改的是不是当前 Agent 实际使用的策略层级。
 
 ### 没有资源盘，或者资源盘 ID 缺失
 
@@ -224,16 +228,16 @@ openclaw gateway restart --safe
 
 ### 大文件确认后又要求确认
 
-超过 100 MiB 的批准只对一次调用中的同一个文件有效。换文件、换调用或未带 `confirmedLargeDownload: true` 的重试都需要重新确认，这是预期的安全行为。
+超过 100 MiB 的明确批准只授权紧接着的一次 `pan_sync_download` 重试；它必须沿用触发确认时完全相同的 `fileId`/`remotePath`，并带上 `confirmedLargeDownload: true`。不能把批准用于另一个文件或之后的调用；若这一次紧接的重试仍返回 `DOWNLOAD_CONFIRMATION_REQUIRED`，停止并报告，不要再次请求确认或循环重试。
 
 ### 可复制提示词：Token 应急重新配置
 
 ```text
 请帮我重新配置 Sheen PanSync 的 Token。不要默认重装插件，也不要要求我把 refresh_token 发到对话中。
 
-先用 openclaw plugins list 检查插件安装可见性，再用 openclaw plugins inspect sheen-pansync --runtime --json 检查 runtime toolNames，并在新会话中通过 /tools 检查三个 Tool 的实际权限状态；同时检查当前稳定状态码。在后台启动新的 openclaw pan-sync configure，准确记录并持续跟踪你启动的配置进程 PID，读取实际 Local URL、Remote URL 和端口；根据当前主机的防火墙、云安全组、NAT/端口映射和公网 IP 情况，只添加本轮需要且可回滚的临时访问规则。把十分钟临时配置 URL 发给我，让我只在网页中填写新 Token。
+先用 openclaw plugins list 检查插件安装可见性，再用 openclaw plugins inspect sheen-pansync --runtime --json 检查 runtime toolNames，并在新会话中通过 /tools 检查本轮明确授权的 Tool 实际权限；同时检查当前稳定状态码。在后台启动新的 openclaw pan-sync configure，准确记录并持续跟踪你启动的配置进程 PID，读取实际 Local URL、Remote URL 和端口；根据当前主机的防火墙、云安全组、NAT/端口映射和公网 IP 情况，只添加本轮需要且可回滚的临时访问规则。把十分钟临时配置 URL 发给我，让我只在网页中填写新 Token。
 
-等我确认保存后，验证状态为 ready，并执行一次不泄露账号、Token、网盘 ID 或完整配置 URL 的安全检查。随后只终止你在本轮启动并持续跟踪了准确 PID 的配置进程；预先存在、PID 未跟踪或归属不确定的进程一律保留。只清理由本轮新增的主机防火墙、云安全组或端口映射规则。若仍失败，请报告稳定错误码、确认过的原因和下一步，不要索取 Token 或原始敏感日志。
+等我确认保存后，区分检查配置页状态：初始读取成功为 READY，成功保存并验证为 SAVED_AND_VERIFIED；再只在已认证的 Sheen PanSync 只读 Control UI 状态标签页验证持久凭据状态为 ready，并执行一次不泄露账号、Token、网盘 ID 或完整配置 URL 的安全检查。随后只终止你在本轮启动并持续跟踪了准确 PID 的配置进程；预先存在、PID 未跟踪或归属不确定的进程一律保留。只清理由本轮新增的主机防火墙、云安全组或端口映射规则。若仍失败，请报告稳定错误码、确认过的原因和下一步，不要索取 Token 或原始敏感日志。
 ```
 
 ## 开发与发布校验
@@ -248,15 +252,35 @@ npm run verify
 发布前还应检查实际打包并安装后的运行时，而不是只从源码目录加载：
 
 ```powershell
-$panSyncTarball = (npm pack --json | ConvertFrom-Json)[0].filename
-if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($panSyncTarball)) {
-  throw "npm pack did not return a tarball filename"
+$panSyncVerificationRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("pan-sync-release-" + [Guid]::NewGuid().ToString("N"))
+$panSyncStateDir = Join-Path $panSyncVerificationRoot "openclaw-state"
+$previousPanSyncStateDir = $env:OPENCLAW_STATE_DIR
+$previousPanSyncConfigPath = $env:OPENCLAW_CONFIG_PATH
+New-Item -ItemType Directory -Path $panSyncStateDir | Out-Null
+try {
+  $env:OPENCLAW_STATE_DIR = $panSyncStateDir
+  Remove-Item Env:OPENCLAW_CONFIG_PATH -ErrorAction SilentlyContinue
+  $panSyncTarball = (npm pack --json | ConvertFrom-Json)[0].filename
+  if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($panSyncTarball)) {
+    throw "npm pack did not return a tarball filename"
+  }
+  openclaw plugins install "npm-pack:./$panSyncTarball" --force
+  openclaw plugins inspect sheen-pansync --runtime --json
+} finally {
+  if ($null -eq $previousPanSyncStateDir) { Remove-Item Env:OPENCLAW_STATE_DIR -ErrorAction SilentlyContinue } else { $env:OPENCLAW_STATE_DIR = $previousPanSyncStateDir }
+  if ($null -eq $previousPanSyncConfigPath) { Remove-Item Env:OPENCLAW_CONFIG_PATH -ErrorAction SilentlyContinue } else { $env:OPENCLAW_CONFIG_PATH = $previousPanSyncConfigPath }
+  $resolvedVerificationRoot = [System.IO.Path]::GetFullPath($panSyncVerificationRoot)
+  $resolvedTempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
+  if (-not $resolvedVerificationRoot.StartsWith($resolvedTempRoot, [StringComparison]::OrdinalIgnoreCase) -or -not (Split-Path $resolvedVerificationRoot -Leaf).StartsWith("pan-sync-release-")) {
+    throw "refusing unexpected verification-state cleanup"
+  }
+  Remove-Item -LiteralPath $resolvedVerificationRoot -Recurse -Force
 }
-openclaw plugins install "npm-pack:./$panSyncTarball" --force
-openclaw plugins inspect sheen-pansync --runtime --json
 ```
 
-自动化通过不等于真实环境验收。发布前仍需在实际远程环境中验证浏览器可达、OpenList Token 保存后为 `ready`、真实资源盘上传/列出/搜索/下载、配置端口关闭，以及本轮临时防火墙/安全组/NAT 规则已清理。验收记录不得包含 Token、完整一次性配置 URL、真实 IP、动态端口、账号标识、网盘 ID 或原始敏感日志。
+这段校验只使用任务专属的临时 `OPENCLAW_STATE_DIR`，并在受校验的临时路径内清理；不会安装到或删除当前使用中的 OpenClaw 状态。
+
+自动化通过不等于真实环境验收。发布前仍需在实际远程环境中验证浏览器可达、配置页成功保存后显示 `SAVED_AND_VERIFIED`、已认证的 Sheen PanSync 只读 Control UI 状态标签页显示持久凭据状态 `ready`、真实资源盘上传/列出/搜索/下载、配置端口关闭，以及本轮临时防火墙/安全组/NAT 规则已清理。验收记录不得包含 Token、完整一次性配置 URL、真实 IP、动态端口、账号标识、网盘 ID 或原始敏感日志。
 
 ## 许可证
 

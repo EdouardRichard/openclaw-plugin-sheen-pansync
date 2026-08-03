@@ -122,7 +122,12 @@ export function registerPanSyncConfigureCommand(
 
       writeLine("Sheen PanSync configuration page is ready for 10 minutes.");
       writeLine(`Local URL: ${server.url}`);
-      const remoteUrls = remoteSetupUrls(server.url, readNetworkInterfaces());
+      let remoteUrls: string[] = [];
+      try {
+        remoteUrls = remoteSetupUrls(server.url, readNetworkInterfaces());
+      } catch {
+        // Interface discovery is best effort; the local setup URL remains usable.
+      }
       if (remoteUrls.length === 0) {
         writeLine("Remote URL: no non-loopback IPv4 address detected.");
       } else {

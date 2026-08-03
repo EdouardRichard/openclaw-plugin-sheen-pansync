@@ -8,6 +8,7 @@ import {
 } from "node:http";
 import { chmod, type FileHandle, lstat, mkdir, mkdtemp, open, realpath, rm } from "node:fs/promises";
 import type { Stats } from "node:fs";
+import { isIP } from "node:net";
 import path from "node:path";
 import type { CredentialInput } from "../contracts.js";
 import type { CredentialStore } from "../credentials/store.js";
@@ -133,6 +134,20 @@ function hasForwardingHeaders(request: IncomingMessage): boolean {
   );
 }
 
+function isCanonicalIpv4OrDnsHostname(hostname: string): boolean {
+  if (isIP(hostname) === 4) return true;
+  if (
+    hostname.length === 0
+    || hostname.length > 253
+    || /^[0-9.]+$/u.test(hostname)
+    || /^(?:\d+|0[xX][0-9A-Fa-f]+)(?:\.(?:\d+|0[xX][0-9A-Fa-f]+))*$/u.test(hostname)
+  ) return false;
+
+  return hostname.split(".").every((label) =>
+    label.length <= 63
+    && /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/u.test(label));
+}
+
 function isAllowedHost(host: string | undefined, port: number | undefined): boolean {
   if (
     host === undefined
@@ -145,19 +160,7 @@ function isAllowedHost(host: string | undefined, port: number | undefined): bool
   const hostname = host.slice(0, separator);
   const explicitPort = host.slice(separator + 1);
   if (!/^\d+$/u.test(explicitPort) || Number(explicitPort) !== port) return false;
-  if (hostname.startsWith("[") || hostname.endsWith("]")) return false;
-
-  try {
-    const parsed = new URL(`http://${host}/`);
-    return parsed.hostname.length > 0
-      && parsed.username.length === 0
-      && parsed.password.length === 0
-      && parsed.pathname === "/"
-      && parsed.search.length === 0
-      && parsed.hash.length === 0;
-  } catch {
-    return false;
-  }
+  return isCanonicalIpv4OrDnsHostname(hostname);
 }
 
 function parsePathname(request: IncomingMessage): string | undefined {

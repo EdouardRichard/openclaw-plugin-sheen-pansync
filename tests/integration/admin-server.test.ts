@@ -4,6 +4,7 @@ import {
   type Server,
 } from "node:http";
 import { access, chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink } from "node:fs/promises";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { JSDOM } from "jsdom";
@@ -220,6 +221,26 @@ async function requestWithHost(baseUrl: string, route: string, host: string) {
   });
 }
 
+async function rawHttp10RequestWithoutHost(baseUrl: string): Promise<string> {
+  const target = new URL(baseUrl);
+  return new Promise((resolve, reject) => {
+    let response = "";
+    const socket = createConnection({
+      host: target.hostname,
+      port: Number(target.port),
+    });
+    socket.setEncoding("latin1");
+    socket.on("data", (chunk: string) => {
+      response += chunk;
+    });
+    socket.once("connect", () => {
+      socket.write("GET / HTTP/1.0\r\nConnection: close\r\n\r\n", "ascii");
+    });
+    socket.once("end", () => resolve(response));
+    socket.once("error", reject);
+  });
+}
+
 const runningServers: Array<{ close(): Promise<void> }> = [];
 const cleanups: Array<() => Promise<void>> = [];
 
@@ -380,7 +401,7 @@ describe("one-time setup server", () => {
     expect(await response.text()).not.toContain(savedRecord.refreshToken);
   });
 
-  it("accepts valid IPv4 and hostname Hosts only on the selected port", async () => {
+  it("accepts canonical IPv4 and ASCII DNS Hosts only on the selected port", async () => {
     const harness = await createHarness({ record: savedRecord });
     cleanups.push(harness.cleanup);
     const result = await startSetupServer(harness.deps);
@@ -404,6 +425,72 @@ describe("one-time setup server", () => {
     ]) {
       expect((await requestWithHost(baseUrl, "/", host)).status).toBe(400);
     }
+  });
+
+  it.each([
+    ["underscore", "setup_host.example.test"],
+    ["percent encoding", "setup%2ehost.example.test"],
+    ["non-ASCII character", "café.example.test"],
+    ["delimiter", "setup;host.example.test"],
+  ])("rejects a Host containing %s", async (_case, hostname) => {
+    const harness = await createHarness({ record: savedRecord });
+    cleanups.push(harness.cleanup);
+    const result = await startSetupServer(harness.deps);
+    runningServers.push(result);
+    const baseUrl = result.url.split("/#")[0] ?? "";
+
+    expect((await requestWithHost(baseUrl, "/", `${hostname}:${result.port}`)).status)
+      .toBe(400);
+  });
+
+  it.each([
+    ["empty label", "setup..example.test"],
+    ["leading hyphen", "-setup.example.test"],
+    ["trailing hyphen", "setup-.example.test"],
+    ["label longer than 63 characters", `${"a".repeat(64)}.example.test`],
+    [
+      "hostname longer than 253 characters",
+      `${"a".repeat(63)}.${"b".repeat(63)}.${"c".repeat(63)}.${"d".repeat(61)}.test`,
+    ],
+  ])("rejects a Host with an invalid DNS %s", async (_case, hostname) => {
+    const harness = await createHarness({ record: savedRecord });
+    cleanups.push(harness.cleanup);
+    const result = await startSetupServer(harness.deps);
+    runningServers.push(result);
+    const baseUrl = result.url.split("/#")[0] ?? "";
+
+    expect((await requestWithHost(baseUrl, "/", `${hostname}:${result.port}`)).status)
+      .toBe(400);
+  });
+
+  it.each([
+    ["short IPv4", "127.1"],
+    ["IPv4 with a leading zero", "127.0.0.01"],
+    ["hexadecimal IPv4 integer", "0x7f000001"],
+    ["dotted hexadecimal IPv4", "0x7f.0.0.1"],
+    ["out-of-range dotted address", "999.999.999.999"],
+    ["numeric hostname", "2130706433"],
+  ])("rejects a noncanonical numeric Host spelling: %s", async (_case, hostname) => {
+    const harness = await createHarness({ record: savedRecord });
+    cleanups.push(harness.cleanup);
+    const result = await startSetupServer(harness.deps);
+    runningServers.push(result);
+    const baseUrl = result.url.split("/#")[0] ?? "";
+
+    expect((await requestWithHost(baseUrl, "/", `${hostname}:${result.port}`)).status)
+      .toBe(400);
+  });
+
+  it("rejects an HTTP/1.0 request without Host", async () => {
+    const harness = await createHarness({ record: savedRecord });
+    cleanups.push(harness.cleanup);
+    const result = await startSetupServer(harness.deps);
+    runningServers.push(result);
+    const baseUrl = result.url.split("/#")[0] ?? "";
+
+    const response = await rawHttp10RequestWithoutHost(baseUrl);
+
+    expect(response).toMatch(/^HTTP\/1\.[01] 400 /u);
   });
 
   it("projects default OpenList URLs on the first authenticated setup", async () => {
