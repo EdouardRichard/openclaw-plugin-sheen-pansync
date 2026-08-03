@@ -144,7 +144,7 @@ describe("OpenClaw configuration CLI", () => {
     await vi.waitFor(() => expect(close).toHaveBeenCalledTimes(1));
   });
 
-  it("reports no remote URL while retaining remote-access guidance", async () => {
+  it("uses its selected port in Cloud/NAT guidance when remote IPv4 is unavailable", async () => {
     const program = new FakeCommand();
     const lines: string[] = [];
     const close = vi.fn(async () => undefined);
@@ -164,8 +164,8 @@ describe("OpenClaw configuration CLI", () => {
       randomBytes: Buffer.alloc,
     }, {
       startServer: async () => ({
-        url: "http://127.0.0.1:43891/#key",
-        port: 43891,
+        url: "http://127.0.0.1:47077/#key",
+        port: 47077,
         close,
         closed: new Promise<void>(() => undefined),
         isAuthorized: () => true,
@@ -182,7 +182,7 @@ describe("OpenClaw configuration CLI", () => {
 
     expect(lines).toContain("Remote URL: no non-loopback IPv4 address detected.");
     expect(lines).toContain(
-      "Cloud/NAT note: if this address is private, replace only the host with the server public IP; keep port 43891 and the same fragment.",
+      "Cloud/NAT note: if this address is private, replace only the host with the server public IP; keep port 47077 and the same fragment.",
     );
     expect(close).not.toHaveBeenCalled();
   });

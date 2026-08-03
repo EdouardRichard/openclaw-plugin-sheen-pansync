@@ -131,7 +131,7 @@ export function registerPanSyncConfigureCommand(
         }
       }
       writeLine(
-        "Cloud/NAT note: if this address is private, replace only the host with the server public IP; keep port 43891 and the same fragment.",
+        `Cloud/NAT note: if this address is private, replace only the host with the server public IP; keep port ${server.port} and the same fragment.`,
       );
       writeLine(
         `Temporarily allow TCP port ${server.port} in the host firewall and cloud security group when required.`,
