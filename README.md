@@ -1,511 +1,248 @@
 # OpenClaw Sheen PanSync
 
-Sheen PanSync lets OpenClaw upload workspace files to an Aliyun Drive resource drive, search or list that drive, and download one cloud file into the current workspace for normal OpenClaw file work. OpenList is used only to obtain and refresh authorization; file bytes move directly between the plugin and Aliyun Drive.
+Sheen PanSync 让 OpenClaw 安全地上传、查找和下载阿里云盘文件。本页先给出可以整段交给 OpenClaw 的提示词，也保留适合自己操作的安装、配置、排障和清理步骤。
 
-[中文](#中文快速上手) · [English](#english-quick-start)
+## 插件用途
 
-## 中文快速上手
+插件注册三个 Tool：
 
-### 1. 插件价值与边界
+- `pan_sync_upload`：把当前 OpenClaw 工作区中已经存在的文件上传到阿里云盘。
+- `pan_sync_list`：列出网盘目录，或按名称搜索文件。
+- `pan_sync_download`：把一个普通文件下载到当前工作区，再由 OpenClaw 的常规文件能力读取、总结或处理。
 
-Sheen PanSync 为 OpenClaw 提供三个明确的阿里云盘操作：
+所有文件操作都限定在阿里云盘**资源盘（resource drive）**，不会回退到备份盘。上传默认目录是 `/openClawShare`，列出和搜索默认从资源盘根目录 `/` 开始，下载默认写入当前工作区根目录。插件不递归下载文件夹，也不会把网盘文件正文直接塞进 Tool 返回值。
 
-- `pan_sync_upload`：把已存在的工作区文件上传到阿里云盘。
-- `pan_sync_list`：列出目录或按名称搜索文件。
-- `pan_sync_download`：把一个普通文件下载到当前工作区，再交给 OpenClaw 的常规文件工具读取、总结或处理。
+OpenList 只负责完成阿里云盘授权和刷新 Token；文件内容由插件直接与阿里云盘传输。Token 只能在十分钟临时配置页中提交并进入加密凭据存储，普通插件配置不接受 `refresh_token`。插件没有二维码登录或登录轮询功能。
 
-所有文件操作**只访问资源盘**，不会回退到备份盘。默认上传目录是 `/openClawShare`；列出和搜索默认从资源盘根目录 `/` 开始；下载默认保存到当前 OpenClaw 工作区根目录。插件不会递归下载文件夹，也不会把网盘文件内容直接放进 Tool 返回值。
+运行前需要 Node.js `22.22.3` 或更高版本、OpenClaw `2026.7.1-2` 或兼容的更高版本。下载还要求当前 OpenClaw 会话具有可写工作区。
 
-### 2. 环境要求
+## 依赖 OpenClaw 自动安装
 
-- Node.js `22.22.3` 或更高版本。
-- OpenClaw `2026.7.1-2` 或兼容的更高版本。
-- 一个可以在 OpenList 中获取阿里云盘 refresh token 的账号。
-- OpenClaw 当前会话必须有可写工作区，才能使用下载功能。
+如果 OpenClaw 可以操作部署主机，把下面整段提示词复制给它。执行期间仍需由你在浏览器中完成 Token 填写，并在涉及云平台权限时确认操作。
 
-### 3. 安装并启用
+### 可复制提示词：首次安装、配置与验证
 
-安装已发布的 npm 包：
+```text
+请帮我安装并配置 openclaw-plugin-sheen-pansync。先识别当前操作系统、Shell、OpenClaw 版本、插件状态、工作区和有效 Tool 策略；保留所有无关配置与用户改动。
 
-```bash
+优先使用 npm 安装并启用插件，确认 pan_sync_upload、pan_sync_list、pan_sync_download 已注册。需要修改 Tool 权限时，只把这三个 Tool 合并到当前有效的全局或 Agent 级策略，不要整体替换 allow、alsoAllow 或 deny。
+
+在后台启动 openclaw pan-sync configure，读取命令实际输出的 Local URL、Remote URL 和端口。判断我是同机、局域网还是公网访问，并检查端口占用、主机防火墙、云安全组、NAT/端口映射及公网 IP。只能自动修改你能够确认和回滚的配置；若需要我操作云平台，请给出精确步骤并等待。云主机只有私网 Remote URL 时，使用实际公网 IP 替换 URL 主机部分，保留端口和 fragment。
+
+把可用的十分钟临时配置 URL 发给我。不要让我把 refresh_token 发到对话中；提醒我只在配置网页中粘贴 Token。等待我确认保存完成后，检查状态是否为 ready，再验证插件注册与 Tool 可用性。
+
+最后终止残留的临时配置进程，并且只清理由本轮新增的主机防火墙、云安全组或端口映射规则；不要删除预先存在或来源不明的规则。报告自动化验证结果和仍需真实阿里云盘账号完成的验收，不要把两者混为一谈。
+```
+
+## 手动安装
+
+先在 OpenClaw 主机上确认 Node.js 与 OpenClaw 版本符合上面的要求。以下 PowerShell 命令应在你准备安装插件的用户环境中执行。
+
+### 使用 npm 安装
+
+安装已发布的包、启用插件并检查注册结果：
+
+```powershell
 openclaw plugins install npm:openclaw-plugin-sheen-pansync
-```
-
-从本地源码安装时，先构建再安装当前目录：
-
-```bash
-npm install
-npm run build
-openclaw plugins install .
-```
-
-检查插件是否已启用：
-
-```bash
+openclaw plugins enable sheen-pansync
 openclaw plugins list
 ```
 
-列表中应显示 `Sheen PanSync` 为 `enabled`，并提供三个 Tool。
+列表中应显示 `Sheen PanSync` 为 `enabled`，并列出 `pan_sync_upload`、`pan_sync_list` 和 `pan_sync_download`。
 
-### 4. 通过 OpenList 配置 refresh token
+### 拉取仓库并构建安装
 
-插件只接受手动粘贴的 `refresh_token`，不在插件内实现二维码登录或轮询。令牌获取保留在 OpenList 页面中完成。
+在一个准备存放源码的目录中执行：
 
-1. 在运行 OpenClaw 的主机上执行：
+```powershell
+git clone https://github.com/EdouardRichard/openclaw-plugin-sheen-pansync.git
+Set-Location openclaw-plugin-sheen-pansync
+npm ci
+npm run build
+openclaw plugins install .
+openclaw plugins enable sheen-pansync
+```
 
-   ```bash
+随后执行 `openclaw plugins list` 检查插件和三个 Tool。源码测试通过不能代替这一步实际安装检查。
+
+## 手动配置
+
+1. 在 OpenClaw 主机上启动十分钟临时配置服务：
+
+   ```powershell
    openclaw pan-sync configure
    ```
 
-2. 打开命令输出的完整一次性回环地址。该地址最多有效十分钟；不要转发、分享或截图。
-3. 在本地配置页中检查 OpenList 授权页地址。中国大陆默认值为 `https://api.oplist.org.cn`。
-4. 在 OpenList 中完成阿里云盘授权并复制它显示的 refresh token。
-5. 回到本地配置页，只粘贴 refresh token；检查完整的刷新 API 地址（默认 `https://api.oplist.org.cn/alicloud/renewapi`），然后保存。
+2. 阅读命令的**实际输出**。它会显示所选端口、一个 `Local URL`，以及一个或多个 `Remote URL`；没有非回环 IPv4 网卡时会明确提示未检测到远程地址。命令没有 `--remote-host` 参数，本机与远程 IPv4 访问默认同时启用。
+3. 按浏览器位置选择地址：
 
-自定义刷新 API 会接收到你粘贴的 refresh token，仅在你信任该服务时使用。插件不会替换主机、追加路径或静默切换备用服务。更完整的说明见 [OpenList 授权与令牌恢复指南](docs/guides/aliyun-token.md)。
+   - 浏览器和 OpenClaw 在同一台主机：使用 `Local URL`。
+   - 浏览器在同一局域网：使用能从浏览器到达的 `Remote URL`。
+   - OpenClaw 在云主机或 NAT 后：如果 CLI 只显示私网地址，用主机的**实际公网 IP**只替换 URL 的主机部分，端口与 `#` 后的 fragment 必须原样保留。不要把 `0.0.0.0` 当作浏览器地址。
 
-### 5. 确认 `ready` 状态
+4. 远程访问需要临时允许命令实际选择的 TCP 端口。检查主机防火墙，以及云环境中的安全组和 NAT/端口映射。只新增本轮所需、来源清楚且能够回滚的规则；不要关闭整套防火墙，也不要改动已有无关规则。配置服务拒绝转发请求头，因此不要把反向代理当作已支持的访问方式。
+5. 在十分钟内打开完整临时 URL。这个 URL 包含一次性 fragment：只交给当前操作者，不要放进截图、工单、长期文档或日志。页面使用临时 HTTP，安全边界是短时窗口、一次性 URL、配置 API 授权和端口及时回收；请只在可信网络路径上使用。
+6. 在页面中打开 OpenList 授权入口，完成阿里云盘授权并取得 Token。回到配置页，**只在网页中**粘贴 OpenList 显示的 `refresh_token`，核对刷新 API 后保存。自定义刷新 API 会收到该 Token，只能填写你信任的服务。详细信任与恢复说明见 [OpenList 授权与 Token 恢复指南](docs/guides/aliyun-token.md)。
+7. 页面显示 `ready` 后，说明当前访问凭据可供文件操作使用。不要把 Token 复制到聊天，也不要尝试通过普通 OpenClaw 插件配置写入它；该字段会被拒绝。插件不提供二维码登录。
+8. 配置成功后服务会短暂显示结果再关闭；十分钟到期也会关闭。如果命令仍残留，终止对应的本轮配置进程。确认端口不再监听，再只删除本轮新增的主机防火墙、云安全组和端口映射规则。
 
-保存成功后，本地配置页显示 `ready`，表示当前 Aliyun access token 可用于文件操作。普通状态和 Tool 结果不会显示 refresh token、access token 或完整配置 URL。
+![插件已安装并处于 ready 状态](docs/images/readme/01-plugin-ready.png)
 
-![Sheen PanSync 已安装并处于 ready 状态](docs/images/readme/01-plugin-ready.png)
+## 插件用法
 
-如果状态不是 `ready`，先按“恢复与安全”处理，不要连续重试文件操作。
+下面的文本都可以直接交给 OpenClaw。若 Tool 未获当前 Agent 的有效权限，先按常见问题中的方法修复权限，不要反复调用。
 
-### 6. 第一次上传
+### 上传文件
 
-先确保当前工作区中有演示文件。可以请 OpenClaw 创建它：
-
-```text
-在当前工作区创建 pan-sync-demo-en.txt，内容为：Sheen PanSync demo file.
-```
-
-也可以改用工作区中已有的普通文件；后续上传、搜索和下载示例中的文件名与路径要一并替换。然后用明确的上传方向和工作区相对路径请求上传，例如：
+上传工作区中已有文件：
 
 ```text
-把 pan-sync-demo-en.txt 上传到阿里云盘。
+把 reports/weekly.md 上传到阿里云盘。
 ```
+
+要求 OpenClaw 先创建再上传：
 
 ```text
-Upload pan-sync-demo-en.txt to Aliyun Drive.
+在当前工作区生成 summary.txt，写入本周工作摘要；确认文件已保存后，把它上传到阿里云盘。
 ```
 
-OpenClaw 应调用 `pan_sync_upload`。省略远端目录时上传到 `/openClawShare`；已存在的远端同名文件不会被覆盖。上传目标始终是资源盘。
+OpenClaw 应先确认本地文件存在，再调用 `pan_sync_upload`。未指定远端目录时上传到 `/openClawShare`；远端同名文件不会被覆盖，目标始终是资源盘。
 
-![上传成功且目标为资源盘](docs/images/readme/02-upload-resource-drive.png)
+![上传到阿里云盘资源盘](docs/images/readme/02-upload-resource-drive.png)
 
-如果请求还要求先生成文件，例如“生成报告并上传到网盘”，OpenClaw 应先创建并确认文件存在，再执行上传。
-
-### 7. 列出目录或搜索文件
+### 列出或搜索网盘文件
 
 列出资源盘根目录：
 
 ```text
-列出阿里云盘根目录里的文件。
+列出阿里云盘资源盘根目录里的文件。
 ```
 
 按名称搜索整个资源盘：
 
 ```text
-在阿里云盘里搜索 pan-sync-demo-en.txt。
+在阿里云盘里搜索 summary.txt。
 ```
 
-把范围限制到某个目录时，在请求中给出该网盘目录。OpenClaw 使用 `pan_sync_list`；未指定目录时从 `/` 开始。结果较多时，OpenClaw 只应使用 Tool 返回的 cursor 继续下一页。
+也可以在请求中给出网盘目录来缩小范围。OpenClaw 应调用 `pan_sync_list`；结果还有下一页时，只使用 Tool 返回的 cursor 继续。
 
-![在资源盘中列出或搜索安全演示文件](docs/images/readme/03-search-resource-drive.png)
-
-### 8. 下载并读取
-
-有精确网盘路径时，可直接请求：
+如果同名结果不止一个，应先消除歧义：
 
 ```text
-下载 /openClawShare/pan-sync-demo-en.txt 到工作区并读取内容。
+在网盘中搜索 report.pdf；如果有多个结果，列出各自的名称、类型、大小和网盘路径让我选择，不要自行下载。
 ```
 
-只有文件名时，先搜索再选择：
+![列出或搜索资源盘文件](docs/images/readme/03-search-resource-drive.png)
+
+### 下载并读取
+
+已有精确路径时：
 
 ```text
-找到网盘里的 网盘读取示例.txt，下载到工作区并总结。
+下载 /openClawShare/summary.txt 到当前工作区并读取内容。
 ```
 
-OpenClaw 会先用 `pan_sync_list` 消除歧义，再用 `pan_sync_download` 下载一个普通文件，最后用常规工作区文件工具读取返回的相对 `localPath`。如果有多个匹配项，它应先展示安全的名称、类型、大小和网盘路径并让你选择，不能自行下载。
-
-下载默认保存到当前工作区根目录。若本地已有同名文件，插件不会覆盖它，而是自动使用 `name (1).ext`、`name (2).ext` 等名称。
-
-![下载网盘文件后由 OpenClaw 读取工作区副本](docs/images/readme/04-download-and-read.png)
-
-### 9. 超过 100 MiB 的文件确认
-
-当文件大于 `100 * 1024 * 1024` 字节时，首次下载返回 `DOWNLOAD_CONFIRMATION_REQUIRED`，此时不会创建本地文件。OpenClaw 应显示所选文件的名称和大小，并向你确认：
+只有文件名时：
 
 ```text
-这个文件超过 100 MiB。确认下载 large-confirmation-demo.bin 吗？
+先在网盘中搜索 summary.txt；只有一个匹配项时下载到工作区并总结，有多个时先让我选择。
 ```
 
-只有你对这个文件明确确认后，OpenClaw 才会以 `confirmedLargeDownload: true` 重试一次。确认仅对这一次、这一个文件有效，不会保存，也不能用于另一个文件。
+OpenClaw 应先用 `pan_sync_list` 确认目标，再用 `pan_sync_download` 下载一个普通文件，最后通过常规工作区文件工具读取返回的相对 `localPath`。下载默认落到工作区根目录；本地同名文件会保留，新文件自动使用 `name (1).ext`、`name (2).ext` 等名称。文件夹不会被递归下载。
 
-### 10. 恢复、意图安全与凭据安全
+![下载后由 OpenClaw 读取工作区副本](docs/images/readme/04-download-and-read.png)
 
-- `CREDENTIALS_REQUIRED` 或 `unconfigured`：运行 `openclaw pan-sync configure` 并重新保存有效 refresh token。
-- `reauth_required`：在 OpenList 重新授权，取得新的 refresh token 后手动粘贴并保存。
-- `degraded` 或 `rate_limited`：等待页面显示的冷却期结束；不要重复提交或循环重试。
-- `RESOURCE_DRIVE_UNAVAILABLE`：该账号没有可用资源盘；插件不会改用备份盘。
-- 下载中断或失败：未完成的临时文件会被清理；重新请求前先确认网络和状态已恢复。
+“同步网盘”没有说明方向，OpenClaw 必须先问是“上传到网盘”还是“从网盘下载”，不能先调用 Tool。请直接使用下面的澄清请求：
 
-#### 插件已启用，但当前会话找不到 Tool
+```text
+同步网盘；如果方向不明确，先问我是要上传到网盘还是从网盘下载，不要先执行任何文件操作。
+```
 
-插件注册/加载和当前 Agent 的有效 Tool 权限是两个独立环节。`openclaw plugins list` 显示 `enabled` 并列出三个 Tool，只能确认插件已经注册；如果当前会话仍提示 `pan_sync_list` 或 `pan_sync_download` 不可用，还需要把它们加入有效的全局或 Agent 级 Tool 策略。
+### 大文件确认
 
-若要修复全局策略，可在 PowerShell 中运行以下命令。它优先读取全局 `tools.allow`：该路径存在时只合并到原 `allow`，不会设置 `alsoAllow`；否则合并到现有 `tools.alsoAllow`，或从空列表开始。若全局 `tools.deny` 存在，它只移除这两个 Tool 的精确名称并保留其他拒绝项；该路径不存在时不会创建它。最终只提交一个递归对象补丁，因此 `tools` 下的其他键也会保留。不要用仅包含插件 Tool 的固定数组直接执行 `config set` 或 `config patch`，因为数组会被整体替换。
+文件大于 `100 * 1024 * 1024` 字节时，第一次下载只返回 `DOWNLOAD_CONFIRMATION_REQUIRED`，不会创建本地文件。OpenClaw 应显示这一个文件的安全名称和大小并请求确认：
+
+```text
+这个文件超过 100 MiB。请告诉我文件名和大小，并等我明确确认后再下载；不要把这次确认用于其他文件。
+```
+
+只有用户对当前文件明确同意后，OpenClaw 才能以 `confirmedLargeDownload: true` 重试一次。确认不会持久保存，不能跨 Tool 调用或跨文件复用。
+
+## 常见问题与解决方法
+
+### 远端主机本地能访问，外部浏览器打不开
+
+先确认 `openclaw pan-sync configure` 仍在运行且十分钟未到，再检查浏览器到主机实际端口的网络路径。常见阻塞点是 Windows Firewall、`firewalld`、`ufw`、云安全组或 NAT/端口映射。只临时放行 CLI 实际选择的 TCP 端口；若云平台无法由当前操作者安全修改，记录所需协议、端口、来源范围和删除步骤，交给有权限的人处理。不要记录真实 IP、动态端口或完整配置 URL。
+
+### CLI 只显示私网 Remote URL，但云服务器有公网 IP
+
+插件不会调用第三方服务查询公网 IP。确认云主机的真实公网映射后，只替换 CLI 输出 URL 的主机部分，完整保留端口、路径和 fragment。若还存在 NAT，确保同一端口的映射和云安全组规则都生效。配置完成后撤销且只撤销本轮新增的规则。
+
+### 端口占用、十分钟过期或配置进程残留
+
+每次命令会选择一个浏览器安全的可用端口，请始终使用本次输出，不要沿用旧端口。页面过期、一次性 URL 泄漏或进程状态不明时，终止那一轮配置进程并启动新命令；旧 URL 不再使用。保存完成或到期后检查监听已关闭，残留时只终止可确认属于本轮的进程。
+
+### 临时配置页为什么是 HTTP？一次性 URL 泄漏怎么办？
+
+当前功能不负责 HTTPS 证书或反向代理。它依靠十分钟窗口、一次性 fragment、授权请求和及时关闭来缩短暴露时间，因此应使用可信路径并把临时 URL 当作短期敏感信息。URL 一旦误发、截图或进入日志，立即关闭当前配置进程，清理本轮临时网络规则，再启动新的一轮；不要继续使用泄漏的 URL。
+
+### OpenList 页面打不开、Token 被拒绝或状态不是 ready
+
+检查配置页中的 OpenList 授权入口和刷新 API 是否是你信任的完整地址。`unconfigured` 或 Tool 返回 `CREDENTIALS_REQUIRED` 时重新配置；`reauth_required` 表示需要在 OpenList 重新授权并取得新 Token；`degraded` 或 `rate_limited` 时等待页面显示的冷却期，不要循环重试。只在配置网页中提交 Token。进一步排查见 [OpenList 授权与 Token 恢复指南](docs/guides/aliyun-token.md)。
+
+### 插件是 enabled，但当前会话看不到 Tool
+
+插件注册和当前 Agent 的有效 Tool 策略是两道独立门禁。先用 `openclaw plugins list` 确认三个 Tool 已注册，再检查真正生效的全局或 Agent 级策略。已有显式 `allow` 时只把 `pan_sync_upload`、`pan_sync_list`、`pan_sync_download` 合并进去；没有显式 `allow` 时才合并到适用的 `alsoAllow`。只从 `deny` 中移除这三个精确名称，并保留其他条目，绝不能用固定数组整体覆盖已有策略。
+
+修改策略后安全重启 Gateway：
 
 ```powershell
-$targets = @("pan_sync_list", "pan_sync_download")
-$allowJson = openclaw config get tools.allow --json 2>$null
-$toolsPatch = @{}
-if ($LASTEXITCODE -eq 0) {
-  $allow = @((($allowJson -join [Environment]::NewLine) | ConvertFrom-Json))
-  $toolsPatch["allow"] = @((
-    $allow + $targets
-  ) | Sort-Object -Unique)
-} else {
-  $alsoAllowJson = openclaw config get tools.alsoAllow --json 2>$null
-  $alsoAllow = @()
-  if ($LASTEXITCODE -eq 0) {
-    $alsoAllow = @((($alsoAllowJson -join [Environment]::NewLine) | ConvertFrom-Json))
-  }
-  $toolsPatch["alsoAllow"] = @((
-    $alsoAllow + $targets
-  ) | Sort-Object -Unique)
-}
-$denyJson = openclaw config get tools.deny --json 2>$null
-if ($LASTEXITCODE -eq 0) {
-  $deny = @((($denyJson -join [Environment]::NewLine) | ConvertFrom-Json))
-  $toolsPatch["deny"] = @($deny | Where-Object {
-    $_ -ne "pan_sync_list" -and $_ -ne "pan_sync_download"
-  })
-}
-@{ tools = $toolsPatch } |
-  ConvertTo-Json -Compress -Depth 3 |
-  openclaw config patch --stdin
-```
-
-如果当前 Agent 已配置 Agent 级策略，全局授权可能不会成为它的有效权限。此时在 OpenClaw Control UI 中打开 **Settings → Agents → 当前 Agent → Tools**：已有显式 `allow` 时把 `pan_sync_list` 和 `pan_sync_download` 合并到 `allow`，不要再设置 `alsoAllow`；没有显式 `allow` 时可合并到 Agent 级 `alsoAllow`。同时只从 `deny` 中移除这两个精确名称，然后保存。不要删除或替换任何无关授权或拒绝项。
-
-修改任一作用域后，安全重启 Gateway：
-
-```bash
 openclaw gateway restart --safe
 ```
 
-若使用了上面的全局方式，先查询 `tools.allow`；它存在时确认两个 Tool 已加入，脚本不会改动或设置 `alsoAllow`。若 `tools.allow` 不存在，则查询 `tools.alsoAllow`。如果修改前存在 `tools.deny`，还要确认其中只移除了这两个名称：
+然后新建 OpenClaw 会话，分别验证上传、列出和下载 Tool。旧会话不能证明新策略已经生效。若问题仍在，核对 OpenClaw 版本是否满足要求，以及修改的是不是当前 Agent 实际使用的策略层级。
 
-```powershell
-openclaw config get tools.allow --json
-openclaw config get tools.alsoAllow --json
-openclaw config get tools.deny --json
-```
+### 没有资源盘，或者资源盘 ID 缺失
 
-最后新建一个 OpenClaw 会话，分别明确请求列出资源盘根目录和下载读取一个测试文件；旧会话不能代替这次有效权限复验。若使用 Agent 级方式，还应重新打开该 Agent 的 Tools 设置，确认保存的条目仍在。
+插件必须从账号摘要得到非空的 `resource_drive_id`。缺失时返回 `RESOURCE_DRIVE_UNAVAILABLE`，不会改用 `default_drive_id` 或 `backup_drive_id`，也不会向备份盘读写。请先确认账号确实具有可用资源盘。
 
-方向明确时才执行：`同步到网盘` 表示上传，`从网盘同步下来` 表示下载。`同步网盘` 含义不明确，OpenClaw 必须先问你是“上传到网盘”还是“从网盘下载”，不能先调用 Tool。
+### 下载没有可写工作区、发生同名冲突，或目标是文件夹
 
-以下是**仅讨论**的请求，不会上传、列出或下载：
+没有当前可写工作区时可以列出和搜索，但下载会返回安全错误；为会话提供工作区后重试。已存在的本地同名文件不会被覆盖，插件会自动改名。当前一次只下载一个普通文件，不支持递归下载文件夹。
+
+### 大文件确认后又要求确认
+
+超过 100 MiB 的批准只对一次调用中的同一个文件有效。换文件、换调用或未带 `confirmedLargeDownload: true` 的重试都需要重新确认，这是预期的安全行为。
+
+### 可复制提示词：Token 应急重新配置
 
 ```text
-讨论一下把资料放网盘的优缺点。
-这个插件能读取哪些网盘文件？
+请帮我重新配置 Sheen PanSync 的 Token。不要默认重装插件，也不要要求我把 refresh_token 发到对话中。
+
+先检查插件是否启用、当前稳定状态码和三个 Tool 的注册/权限状态。在后台启动新的 openclaw pan-sync configure，读取实际 Local URL、Remote URL 和端口；根据当前主机的防火墙、云安全组、NAT/端口映射和公网 IP 情况，只添加本轮需要且可回滚的临时访问规则。把十分钟临时配置 URL 发给我，让我只在网页中填写新 Token。
+
+等我确认保存后，验证状态为 ready，并执行一次不泄露账号、Token、网盘 ID 或完整配置 URL 的安全检查。随后终止残留配置进程，并且只清理由本轮新增的规则。若仍失败，请报告稳定错误码、确认过的原因和下一步，不要索取 Token 或原始敏感日志。
 ```
 
-不要在聊天、截图或问题报告中粘贴 refresh token、access token、一次性配置地址、下载 URL、drive ID 或 file ID。插件的正常 Tool 输出只返回安全字段和工作区相对路径。
+## 开发与发布校验
 
-### 11. 已知限制
+在仓库根目录运行完整门禁；它会执行类型检查、单元测试、集成测试、构建与 npm tarball 内容检查：
 
-- 当前只支持 Aliyun Drive 资源盘；不访问备份盘，也不支持其他网盘 Provider。
-- 一次只下载一个普通文件，不递归下载目录。
-- 搜索是有界、可续页的名称搜索，不是文件内容全文检索。
-- 下载需要当前 OpenClaw 会话提供工作区；没有工作区时仍可列出或搜索，但不能下载。
-- 大文件确认不会跨 Tool 调用或跨文件复用。
-
-### 12. 开发与发布校验
-
-提交或发布前运行完整校验；它会执行类型检查、单元测试、集成测试、构建和 npm tarball 内容检查。集成测试还会安装实际 tarball，并验证 OpenClaw 运行时注册和 CLI 启动：
-
-```bash
+```powershell
 npm ci
 npm run verify
 ```
 
-发布前还应从生成的 tarball 安装并检查实际运行时，而不是只从源码目录加载插件：
+发布前还应检查实际打包并安装后的运行时，而不是只从源码目录加载：
 
-```bash
+```powershell
 npm pack
-openclaw plugins install npm-pack:./openclaw-plugin-sheen-pansync-0.1.0.tgz --force
+openclaw plugins install npm-pack:./<npm-pack-输出的实际文件名>.tgz --force
 openclaw plugins inspect sheen-pansync --runtime --json
 ```
 
-版本号变化后，请把示例中的 tarball 文件名替换为实际名称。首次发布前仍需确认 npm 包名可用、账号具备发布权限、版本号正确且打包内容符合预期。
+自动化通过不等于真实环境验收。发布前仍需在实际远程环境中验证浏览器可达、OpenList Token 保存后为 `ready`、真实资源盘上传/列出/搜索/下载、配置端口关闭，以及本轮临时防火墙/安全组/NAT 规则已清理。验收记录不得包含 Token、完整一次性配置 URL、真实 IP、动态端口、账号标识、网盘 ID 或原始敏感日志。
 
-新包首次发布由已登录 npm 的维护者在本机执行：
-
-```bash
-npm publish --access public
-```
-
-首次发布后，在 npm 包设置中把 Trusted Publisher 绑定到 GitHub owner `EdouardRichard`、仓库 `openclaw-plugin-sheen-pansync`、workflow `npm-publish.yml`，并允许 `npm publish`。后续先更新 `package.json` 与 `package-lock.json` 的版本，再推送完全匹配的稳定 Tag（例如版本 `0.1.1` 对应 `v0.1.1`）；GitHub Actions 将通过 OIDC 发布，不需要 `NPM_TOKEN`。
-
-### 13. 许可证
+## 许可证
 
 本项目使用 [MIT License](LICENSE)。
-
-## English quick start
-
-### 1. What the plugin does—and does not do
-
-Sheen PanSync gives OpenClaw three explicit Aliyun Drive operations:
-
-- `pan_sync_upload` uploads an existing workspace file.
-- `pan_sync_list` lists a directory or searches by file name.
-- `pan_sync_download` downloads one ordinary cloud file into the current workspace so OpenClaw can read, summarize, or process it with its normal file tools.
-
-Every file operation targets the Aliyun **resource drive** only; the plugin never falls back to the backup drive. Uploads default to `/openClawShare`, listing and search start at the resource-drive root `/`, and downloads default to the current OpenClaw workspace root. The plugin does not recursively download folders or return cloud file contents in Tool output.
-
-### 2. Requirements
-
-- Node.js `22.22.3` or newer.
-- OpenClaw `2026.7.1-2` or a compatible newer release.
-- An account that can obtain an Aliyun Drive refresh token through OpenList.
-- A writable workspace on the current OpenClaw session for downloads.
-
-### 3. Install and enable
-
-Install the published npm package:
-
-```bash
-openclaw plugins install npm:openclaw-plugin-sheen-pansync
-```
-
-To install from a source checkout, build it first:
-
-```bash
-npm install
-npm run build
-openclaw plugins install .
-```
-
-Confirm that the plugin is enabled:
-
-```bash
-openclaw plugins list
-```
-
-`Sheen PanSync` should appear as `enabled` and expose all three Tools.
-
-### 4. Configure a refresh token through OpenList
-
-The plugin accepts a manually pasted `refresh_token`. It does not implement QR login or login polling inside the plugin; token acquisition stays on the OpenList page.
-
-1. On the OpenClaw host, run:
-
-   ```bash
-   openclaw pan-sync configure
-   ```
-
-2. Open the complete one-time loopback URL printed by the command. It expires within ten minutes; never forward, share, or screenshot it.
-3. Check the OpenList authorization-page URL on the local setup page. The mainland-China default is `https://api.oplist.org.cn`.
-4. Complete Aliyun Drive authorization in OpenList and copy the refresh token it displays.
-5. Return to the local setup page, paste only the refresh token, review the complete refresh API URL (default `https://api.oplist.org.cn/alicloud/renewapi`), and save.
-
-A custom refresh API receives the refresh token you paste, so use one only when you trust it. The plugin never rewrites the host, appends a path, or silently selects a fallback service. See the [OpenList authorization and token recovery guide](docs/guides/aliyun-token.md) for the complete trust and recovery model.
-
-### 5. Confirm the `ready` state
-
-After a successful save, the local setup page shows `ready`, meaning the current Aliyun access token can be used for file operations. Normal status and Tool results never reveal refresh tokens, access tokens, or complete configured URLs.
-
-![Sheen PanSync installed with a safe ready state](docs/images/readme/01-plugin-ready.png)
-
-If the state is not `ready`, follow the recovery section before retrying file operations.
-
-### 6. Make the first upload
-
-First make sure the demo file exists in the current workspace. You can ask OpenClaw to create it:
-
-```text
-Create pan-sync-demo-en.txt in the current workspace with this content: Sheen PanSync demo file.
-```
-
-Alternatively, use an existing ordinary workspace file and replace the file name and path consistently in the upload, search, and download examples below. Then state the upload direction and workspace-relative file name:
-
-```text
-Upload pan-sync-demo-en.txt to Aliyun Drive.
-```
-
-```text
-把 pan-sync-demo-en.txt 上传到阿里云盘。
-```
-
-OpenClaw should call `pan_sync_upload`. With no remote directory specified, the file goes to `/openClawShare`; an existing remote file is never overwritten. The destination is always the resource drive.
-
-![Successful upload to the resource drive](docs/images/readme/02-upload-resource-drive.png)
-
-For a request such as “create a report and upload it,” OpenClaw should create and verify the file before it starts the upload.
-
-### 7. List or search the drive
-
-List the resource-drive root:
-
-```text
-List the files in the root of my Aliyun Drive.
-```
-
-Search the whole resource drive by name:
-
-```text
-Search Aliyun Drive for pan-sync-demo-en.txt.
-```
-
-Name a remote directory in the request to narrow the scope. OpenClaw uses `pan_sync_list` and starts at `/` when no directory is given. If there are more results, it should continue only with the cursor returned by the Tool.
-
-![Listing or searching safe demo files in the resource drive](docs/images/readme/03-search-resource-drive.png)
-
-### 8. Download and read a file
-
-With an exact remote path, ask directly:
-
-```text
-Download /openClawShare/pan-sync-demo-en.txt into the workspace and read it.
-```
-
-With only a file name, let OpenClaw search first:
-
-```text
-Find 网盘读取示例.txt in my drive, download it, and summarize it.
-```
-
-OpenClaw uses `pan_sync_list` to resolve ambiguity, calls `pan_sync_download` for one ordinary file, and then reads the returned relative `localPath` with its normal workspace tools. When several files match, it must show safe distinguishing fields—name, type, size, and remote path—and ask you to choose before downloading.
-
-The download goes to the current workspace root by default. If that name already exists locally, the plugin preserves it and chooses `name (1).ext`, `name (2).ext`, and so on.
-
-![OpenClaw reading the downloaded workspace copy](docs/images/readme/04-download-and-read.png)
-
-### 9. Confirm files larger than 100 MiB
-
-For a file larger than `100 * 1024 * 1024` bytes, the first call returns `DOWNLOAD_CONFIRMATION_REQUIRED` and creates no local file. OpenClaw should show the selected name and size and ask:
-
-```text
-This file is larger than 100 MiB. Download large-confirmation-demo.bin?
-```
-
-Only after your explicit confirmation for that exact file may OpenClaw retry once with `confirmedLargeDownload: true`. The approval is neither saved nor reusable for another file or call.
-
-### 10. Recovery, intent safety, and credential safety
-
-- `CREDENTIALS_REQUIRED` or `unconfigured`: run `openclaw pan-sync configure` and save a valid refresh token again.
-- `reauth_required`: authorize again in OpenList, then manually paste and save the new refresh token.
-- `degraded` or `rate_limited`: wait for the displayed cooldown; do not submit or retry in a loop.
-- `RESOURCE_DRIVE_UNAVAILABLE`: the account has no usable resource drive; the plugin will not switch to backup storage.
-- Interrupted or failed download: incomplete temporary output is cleaned up; verify the network and status before retrying.
-
-#### The plugin is enabled, but the current session cannot find a Tool
-
-Plugin registration/loading and the active Agent's effective Tool policy are separate gates. Seeing `enabled` and all three Tools in `openclaw plugins list` confirms registration only. If the current session still reports that `pan_sync_list` or `pan_sync_download` is unavailable, add them at the effective global or Agent scope.
-
-To repair the global policy, run the following in PowerShell. It reads global `tools.allow` first. If that path exists, it merges into the existing `allow` only and does not set `alsoAllow`; otherwise, it merges into the existing `tools.alsoAllow` or starts with an empty list. When global `tools.deny` exists, it removes only the two exact Tool names and preserves every other denial; it does not create that path when absent. One recursive object patch preserves all sibling keys under `tools`. Do not run `config set` or `config patch` with a fixed array containing only the plugin Tools: arrays are replaced as a whole.
-
-```powershell
-$targets = @("pan_sync_list", "pan_sync_download")
-$allowJson = openclaw config get tools.allow --json 2>$null
-$toolsPatch = @{}
-if ($LASTEXITCODE -eq 0) {
-  $allow = @((($allowJson -join [Environment]::NewLine) | ConvertFrom-Json))
-  $toolsPatch["allow"] = @((
-    $allow + $targets
-  ) | Sort-Object -Unique)
-} else {
-  $alsoAllowJson = openclaw config get tools.alsoAllow --json 2>$null
-  $alsoAllow = @()
-  if ($LASTEXITCODE -eq 0) {
-    $alsoAllow = @((($alsoAllowJson -join [Environment]::NewLine) | ConvertFrom-Json))
-  }
-  $toolsPatch["alsoAllow"] = @((
-    $alsoAllow + $targets
-  ) | Sort-Object -Unique)
-}
-$denyJson = openclaw config get tools.deny --json 2>$null
-if ($LASTEXITCODE -eq 0) {
-  $deny = @((($denyJson -join [Environment]::NewLine) | ConvertFrom-Json))
-  $toolsPatch["deny"] = @($deny | Where-Object {
-    $_ -ne "pan_sync_list" -and $_ -ne "pan_sync_download"
-  })
-}
-@{ tools = $toolsPatch } |
-  ConvertTo-Json -Compress -Depth 3 |
-  openclaw config patch --stdin
-```
-
-If the active Agent has an Agent-level policy, the global grant might not become effective for that Agent. In the OpenClaw Control UI, open **Settings → Agents → active Agent → Tools**. With an explicit `allow`, merge `pan_sync_list` and `pan_sync_download` into `allow` and do not also set `alsoAllow`; without an explicit `allow`, merge them into the Agent-level `alsoAllow`. Remove only these two exact names from `deny`, then save. Preserve every unrelated grant and denial.
-
-After changing either scope, restart the Gateway safely:
-
-```bash
-openclaw gateway restart --safe
-```
-
-For the global method, query `tools.allow` first. If it exists, confirm the two Tools are present; the script does not change or set `alsoAllow`. If `tools.allow` is absent, query `tools.alsoAllow`. If `tools.deny` existed before the change, also confirm that only the two Tool names were removed:
-
-```powershell
-openclaw config get tools.allow --json
-openclaw config get tools.alsoAllow --json
-openclaw config get tools.deny --json
-```
-
-Finally, start a fresh OpenClaw session and explicitly request a resource-drive root listing and a test-file download/read. An old session does not replace this effective-policy check. For the Agent-level method, also reopen that Agent's Tools settings and confirm that the saved entries remain present.
-
-Directional sync is explicit: `sync to cloud drive` means upload, while `sync from cloud drive` means download. `sync cloud drive` is ambiguous, so OpenClaw must ask whether you mean upload or download before it calls a Tool.
-
-These are **discussion-only** requests and must not upload, list, or download anything:
-
-```text
-Let's discuss whether cloud storage is useful.
-What kinds of cloud files could this plugin read?
-```
-
-Never paste a refresh token, access token, one-time configuration URL, download URL, drive ID, or file ID into chat, screenshots, or issue reports. Normal Tool results expose only safe fields and workspace-relative paths.
-
-### 11. Known limitations
-
-- Only the Aliyun Drive resource drive is supported; the backup drive and other providers are out of scope.
-- Downloads handle one ordinary file at a time and never recurse through a folder.
-- Search is a bounded, resumable name search, not full-text search inside file contents.
-- Downloads require a workspace on the current OpenClaw session. Listing and search still work without one.
-- Large-file confirmation is never retained across Tool calls or reused for another file.
-
-### 12. Development and release checks
-
-Run the full verification before committing or publishing. It type-checks the project, runs unit and integration tests, builds the runtime, and checks the npm tarball contents. The integration suite also installs the actual tarball and verifies OpenClaw runtime registration and CLI startup:
-
-```bash
-npm ci
-npm run verify
-```
-
-Before publishing, also install and inspect the generated tarball so the test uses the same package shape as an npm install instead of loading the source checkout directly:
-
-```bash
-npm pack
-openclaw plugins install npm-pack:./openclaw-plugin-sheen-pansync-0.1.0.tgz --force
-openclaw plugins inspect sheen-pansync --runtime --json
-```
-
-Replace the example tarball name after changing the package version. Before the first publish, verify that the npm package name is available, the account can publish it, the release version is correct, and the packed contents match expectations.
-
-For the first release of the new package, an npm-authenticated maintainer publishes locally:
-
-```bash
-npm publish --access public
-```
-
-After the first publish, configure the npm Trusted Publisher with GitHub owner `EdouardRichard`, repository `openclaw-plugin-sheen-pansync`, workflow `npm-publish.yml`, and allowed action `npm publish`. For later releases, update the version in both `package.json` and `package-lock.json`, then push the exact matching stable Tag (for example, version `0.1.1` uses `v0.1.1`). GitHub Actions publishes through OIDC without an `NPM_TOKEN`.
-
-### 13. License
-
-This project is licensed under the [MIT License](LICENSE).

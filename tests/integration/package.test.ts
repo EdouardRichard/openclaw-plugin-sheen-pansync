@@ -258,7 +258,7 @@ describe("published package", () => {
     expect(paths.filter((entry) => /(?:canary|fixture|vault)/iu.test(entry))).toEqual([]);
   });
 
-  it("ships a bilingual quick start and four valid screenshots", async () => {
+  it("ships the beginner setup guide and four valid screenshots", async () => {
     const packDirectory = await mkdtemp(path.join(tmpdir(), "pan-sync-readme-images-"));
     temporaryDirectories.push(packDirectory);
     const packed = runNpm([
@@ -278,13 +278,10 @@ describe("published package", () => {
     const tarball = path.join(packDirectory, path.basename(filename ?? ""));
     const readme = readPackedText(tarball, "README.md");
 
-    expect(readme).toContain("[中文](#中文快速上手)");
-    expect(readme).toContain("[English](#english-quick-start)");
-    expect(readme).toContain("## 中文快速上手");
-    expect(readme).toContain("## English quick start");
     expect(readme).toContain("# OpenClaw Sheen PanSync");
-    expect(readme).toContain("npm:openclaw-plugin-sheen-pansync");
-    expect(readme).toContain("openclaw-plugin-sheen-pansync-0.1.0.tgz");
+    expect(readme).toContain(
+      "openclaw plugins install npm:openclaw-plugin-sheen-pansync",
+    );
     expect(readme).toContain("plugins inspect sheen-pansync --runtime --json");
     expect(readme).toContain("MIT");
     expect(readme).not.toContain("npm:openclaw-pan-sync-helper");
