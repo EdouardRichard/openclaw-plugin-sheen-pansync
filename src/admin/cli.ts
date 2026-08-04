@@ -142,5 +142,6 @@ export function registerPanSyncConfigureCommand(
         `Temporarily allow TCP port ${server.port} in the host firewall and cloud security group when required.`,
       );
       writeLine("After configuration, remove only the temporary access rules created for this session.");
+      await server.closed;//  exec 工具或前台 CLI 运行时保活
     });
 }
