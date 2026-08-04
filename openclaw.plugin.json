@@ -2,7 +2,7 @@
   "id": "sheen-pansync",
   "name": "Sheen PanSync",
   "description": "Upload workspace files to and list or download files from an Aliyun Drive resource drive",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "contracts": {
     "tools": ["pan_sync_upload", "pan_sync_list", "pan_sync_download"]
   },
