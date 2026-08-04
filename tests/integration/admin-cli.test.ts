@@ -30,6 +30,28 @@ class FakeCommand {
   }
 }
 
+function createControlledSetupServer(url: string, port: number) {
+  let resolveClosed!: () => void;
+  const closed = new Promise<void>((resolve) => {
+    resolveClosed = resolve;
+  });
+  const close = vi.fn(async () => {
+    resolveClosed();
+  });
+
+  return {
+    server: {
+      url,
+      port,
+      close,
+      closed,
+      isAuthorized: () => true,
+      accessKeyBuffer: Buffer.alloc(32, 1),
+    },
+    close,
+  };
+}
+
 describe("OpenClaw configuration CLI", () => {
   it("builds sorted unique remote URLs from non-internal IPv4 interfaces", () => {
     const localUrl = "http://127.0.0.1:43891/#AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -70,15 +92,11 @@ describe("OpenClaw configuration CLI", () => {
         registrationOptions = options;
       },
     } as unknown as PanSyncConfigureCliApi;
-    const close = vi.fn(async () => undefined);
-    const startServer = vi.fn(async (dependencies: SetupServerDependencies) => ({
-      url: "http://127.0.0.1:43891/#AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-      port: 43891,
-      close,
-      closed: new Promise<void>(() => undefined),
-      isAuthorized: () => true,
-      accessKeyBuffer: Buffer.alloc(32, 1),
-    }));
+    const { server, close } = createControlledSetupServer(
+      "http://127.0.0.1:43891/#AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      43891,
+    );
+    const startServer = vi.fn(async (_dependencies: SetupServerDependencies) => server);
     const lines: string[] = [];
     const signalHandlers = new Map<string, () => void>();
     const processEvents = {
@@ -123,7 +141,14 @@ describe("OpenClaw configuration CLI", () => {
     await registrar?.({ program });
     const configure = program.children.get("pan-sync")?.children.get("configure");
     expect(configure).toBeDefined();
-    await configure?.actionHandler?.();
+    const actionPromise = configure?.actionHandler?.();
+    let actionSettled = false;
+    void Promise.resolve(actionPromise).finally(() => {
+      actionSettled = true;
+    });
+
+    await vi.waitFor(() => expect(lines).toHaveLength(6));
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
     expect(startServer).toHaveBeenCalledWith(expect.objectContaining({
       dataDir,
@@ -139,15 +164,20 @@ describe("OpenClaw configuration CLI", () => {
     expect(lines.join("\n")).not.toContain(dataDir);
     expect(signalHandlers.has("SIGINT")).toBe(true);
     expect(signalHandlers.has("SIGTERM")).toBe(true);
+    expect(actionSettled).toBe(false);
 
     signalHandlers.get("SIGTERM")?.();
-    await vi.waitFor(() => expect(close).toHaveBeenCalledTimes(1));
+    await expect(actionPromise).resolves.toBeUndefined();
+    expect(close).toHaveBeenCalledTimes(1);
   });
 
   it("uses its selected port in Cloud/NAT guidance when remote IPv4 is unavailable", async () => {
     const program = new FakeCommand();
     const lines: string[] = [];
-    const close = vi.fn(async () => undefined);
+    const { server, close } = createControlledSetupServer(
+      "http://127.0.0.1:47077/#key",
+      47077,
+    );
     const api = {
       registerCli(registrar: (context: { program: FakeCommand }) => void) {
         registrar({ program });
@@ -163,14 +193,7 @@ describe("OpenClaw configuration CLI", () => {
       clock: Date.now,
       randomBytes: Buffer.alloc,
     }, {
-      startServer: async () => ({
-        url: "http://127.0.0.1:47077/#key",
-        port: 47077,
-        close,
-        closed: new Promise<void>(() => undefined),
-        isAuthorized: () => true,
-        accessKeyBuffer: Buffer.alloc(32, 1),
-      }),
+      startServer: async () => server,
       writeLine: (line) => lines.push(line),
       processEvents: { once: vi.fn(), off: vi.fn() },
       networkInterfaces: () => ({
@@ -178,19 +201,28 @@ describe("OpenClaw configuration CLI", () => {
       }),
     });
 
-    await program.children.get("pan-sync")?.children.get("configure")?.actionHandler?.();
+    const actionPromise = program.children.get("pan-sync")?.children
+      .get("configure")?.actionHandler?.();
+
+    await vi.waitFor(() => expect(lines).toHaveLength(6));
 
     expect(lines).toContain("Remote URL: no non-loopback IPv4 address detected.");
     expect(lines).toContain(
       "Cloud/NAT note: if this address is private, replace only the host with the server public IP; keep port 47077 and the same fragment.",
     );
     expect(close).not.toHaveBeenCalled();
+
+    await close();
+    await expect(actionPromise).resolves.toBeUndefined();
   });
 
   it("continues serving with fallback output when network discovery throws", async () => {
     const program = new FakeCommand();
     const lines: string[] = [];
-    const close = vi.fn(async () => undefined);
+    const { server, close } = createControlledSetupServer(
+      "http://127.0.0.1:47077/#key",
+      47077,
+    );
     const signalHandlers = new Map<string, () => void>();
     const api = {
       registerCli(registrar: (context: { program: FakeCommand }) => void) {
@@ -207,14 +239,7 @@ describe("OpenClaw configuration CLI", () => {
       clock: Date.now,
       randomBytes: Buffer.alloc,
     }, {
-      startServer: async () => ({
-        url: "http://127.0.0.1:47077/#key",
-        port: 47077,
-        close,
-        closed: new Promise<void>(() => undefined),
-        isAuthorized: () => true,
-        accessKeyBuffer: Buffer.alloc(32, 1),
-      }),
+      startServer: async () => server,
       writeLine: (line) => lines.push(line),
       processEvents: {
         once(signal: string, handler: () => void) {
@@ -232,7 +257,9 @@ describe("OpenClaw configuration CLI", () => {
     });
 
     const action = program.children.get("pan-sync")?.children.get("configure")?.actionHandler;
-    await expect(action?.()).resolves.toBeUndefined();
+    const actionPromise = action?.();
+
+    await vi.waitFor(() => expect(lines).toHaveLength(6));
 
     expect(lines).toContain("Remote URL: no non-loopback IPv4 address detected.");
     expect(close).not.toHaveBeenCalled();
@@ -240,6 +267,7 @@ describe("OpenClaw configuration CLI", () => {
     expect(signalHandlers.has("SIGTERM")).toBe(true);
 
     signalHandlers.get("SIGTERM")?.();
-    await vi.waitFor(() => expect(close).toHaveBeenCalledTimes(1));
+    await expect(actionPromise).resolves.toBeUndefined();
+    expect(close).toHaveBeenCalledTimes(1);
   });
 });
