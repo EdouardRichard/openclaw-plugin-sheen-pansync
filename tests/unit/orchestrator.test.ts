@@ -166,6 +166,67 @@ function harness(options: HarnessOptions = {}) {
 }
 
 describe("UploadOrchestrator", () => {
+  it("serializes separate upload calls before token, directory, and file access", async () => {
+    const firstUpload = deferred<void>();
+    const { orchestrator, events } = harness({
+      upload: async (input) => {
+        if (input.file.inputName === "first.txt") {
+          await firstUpload.promise;
+        }
+        return { remoteName: input.file.basename, size: input.file.size };
+      },
+    });
+
+    const first = orchestrator.upload({
+      workspaceDir: "workspace",
+      paths: ["first.txt"],
+    });
+    const second = orchestrator.upload({
+      workspaceDir: "workspace",
+      paths: ["second.txt"],
+    });
+
+    await vi.waitFor(() => expect(events).toContain("upload:first.txt"));
+    expect(events.filter((event) => event === "token")).toHaveLength(1);
+    expect(events).not.toContain("resolve:second.txt");
+    expect(events).not.toContain("upload:second.txt");
+
+    firstUpload.resolve();
+    await expect(first).resolves.toMatchObject({ status: "success" });
+    await expect(second).resolves.toMatchObject({ status: "success" });
+    expect(events.filter((event) => event === "token")).toHaveLength(2);
+  });
+
+  it("cancels a queued upload before token, directory, or file access", async () => {
+    const firstUpload = deferred<void>();
+    const { orchestrator, events } = harness({
+      upload: async (input) => {
+        if (input.file.inputName === "first.txt") {
+          await firstUpload.promise;
+        }
+        return { remoteName: input.file.basename, size: input.file.size };
+      },
+    });
+    const first = orchestrator.upload({
+      workspaceDir: "workspace",
+      paths: ["first.txt"],
+    });
+    const controller = new AbortController();
+    const queued = orchestrator.upload(
+      { workspaceDir: "workspace", paths: ["queued.txt"] },
+      { signal: controller.signal },
+    );
+
+    await vi.waitFor(() => expect(events).toContain("upload:first.txt"));
+    controller.abort();
+    await expect(queued).rejects.toMatchObject({ code: "UPLOAD_FAILED" });
+    expect(events.filter((event) => event === "token")).toHaveLength(1);
+    expect(events).not.toContain("resolve:queued.txt");
+
+    firstUpload.resolve();
+    await first;
+  });
+
   it("uploads files sequentially with the default provider and directory", async () => {
     const { orchestrator, events, opened } = harness({
       upload: async (input, call) => ({
@@ -602,7 +663,7 @@ describe("UploadOrchestrator", () => {
     });
   });
 
-  it("shares one refreshed token across concurrent upload paths", async () => {
+  it("reuses one refreshed token across serialized upload calls", async () => {
     let current: CredentialRecord = {
       formatVersion: 2,
       credentialVersion: 1,
@@ -639,19 +700,12 @@ describe("UploadOrchestrator", () => {
       },
       tokenService: { refresh },
     });
-    const bothStaleRequests = deferred<void>();
-    let staleRequestCount = 0;
     const authorizations: string[] = [];
     const fetch: AliyunFetch = async (_input, init) => {
       const authorization =
         new Headers(init?.headers).get("authorization") ?? "";
       authorizations.push(authorization);
       if (authorization === "Bearer access-old") {
-        staleRequestCount += 1;
-        if (staleRequestCount === 2) {
-          bothStaleRequests.resolve();
-        }
-        await bothStaleRequests.promise;
         return new Response(JSON.stringify({
           code: "AccessTokenExpired",
         }), {
@@ -724,10 +778,10 @@ describe("UploadOrchestrator", () => {
     ]);
     expect(refresh).toHaveBeenCalledOnce();
     expect(authorizations.filter((value) => value === "Bearer access-old"))
-      .toHaveLength(2);
+      .toHaveLength(1);
     expect(authorizations.filter((value) => value === "Bearer access-new"))
       .toHaveLength(2);
-    expect(authorizations).toHaveLength(4);
+    expect(authorizations).toHaveLength(3);
   });
 
   it("propagates CREDENTIALS_REQUIRED from an actual empty TokenManager vault", async () => {

@@ -20,6 +20,7 @@ import {
   resolveWorkspaceFile,
   type ResolvedWorkspaceFile,
 } from "../workspace/path-guard.js";
+import { FifoUploadGate } from "./upload-concurrency.js";
 
 export type UploadRequest = PanSyncUploadInput & {
   workspaceDir: string;
@@ -123,6 +124,7 @@ function aggregateStatus(
 
 export class UploadOrchestrator {
   readonly #pathGuard: UploadPathGuard;
+  readonly #uploadGate = new FifoUploadGate();
 
   constructor(private readonly dependencies: UploadOrchestratorDependencies) {
     this.#pathGuard = dependencies.pathGuard ?? defaultPathGuard;
@@ -136,10 +138,14 @@ export class UploadOrchestrator {
       throw new PanSyncError("UPLOAD_FAILED");
     }
 
+    let releaseUpload: (() => void) | undefined;
     try {
+      releaseUpload = await this.#uploadGate.acquire(options.signal);
       return await this.#upload(input, options);
     } catch (error) {
       throw stableError(error);
+    } finally {
+      releaseUpload?.();
     }
   }
 

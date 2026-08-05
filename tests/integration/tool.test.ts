@@ -818,21 +818,26 @@ describe("pan-sync-upload Skill discovery contract", () => {
     expect(contents).not.toMatch(/client[ _-]?(?:id|secret)/iu);
   });
 
-  it("requires root-default batched downloads without inferred local paths or tight retries", async () => {
+  it("requires serialized transfers, root-default downloads, and no tight retries", async () => {
     const contents = await readFile(
       new URL("../../skills/pan-sync-upload/SKILL.md", import.meta.url),
       "utf8",
     );
     const download = section(contents, "Download and read / 下载与读取");
+    const upload = section(contents, "Upload / 上传");
 
     expect(download).toMatch(/did not explicitly specify[\s\S]*omit `localDirectory`/iu);
     expect(download).toMatch(/never derive `localDirectory`[\s\S]*remotePath/iu);
-    expect(download).toMatch(/at most three[\s\S]*pan_sync_download[\s\S]*batch/iu);
-    expect(download).toMatch(/await[\s\S]*batch[\s\S]*next batch/iu);
+    expect(download).toMatch(/one at a time[\s\S]*pan_sync_download|pan_sync_download[\s\S]*one at a time/iu);
+    expect(download).toMatch(/await[\s\S]*before starting the next/iu);
+    expect(download).toMatch(/never[\s\S]*concurrent/iu);
+    expect(upload).toMatch(/combine[\s\S]*paths[\s\S]*one `pan_sync_upload`/iu);
+    expect(upload).toMatch(/never[\s\S]*concurrent[\s\S]*pan_sync_upload/iu);
+    expect(upload).toMatch(/await[\s\S]*before starting another/iu);
     for (const code of ["RATE_LIMITED", "DOWNLOAD_FAILED", "UPLOAD_FAILED"]) {
       expect(download).toContain(code);
     }
     expect(download).toMatch(/do not immediately retry|no tight retry loop/iu);
-    expect(download).toMatch(/continue the remaining planned batches/iu);
+    expect(download).toMatch(/continue the remaining planned files/iu);
   });
 });

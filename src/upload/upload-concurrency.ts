@@ -7,21 +7,13 @@ type Waiter = {
   abortListener?: () => void;
 };
 
-export class FifoDownloadGate {
-  readonly #capacity: number;
+export class FifoUploadGate {
   readonly #queue: Waiter[] = [];
-  #active = 0;
-
-  constructor(capacity = 1) {
-    if (!Number.isSafeInteger(capacity) || capacity < 1) {
-      throw new RangeError("Download gate capacity must be a positive integer");
-    }
-    this.#capacity = capacity;
-  }
+  #active = false;
 
   acquire(signal?: AbortSignal): Promise<() => void> {
     if (signal?.aborted === true) {
-      return Promise.reject(new PanSyncError("DOWNLOAD_FAILED"));
+      return Promise.reject(new PanSyncError("UPLOAD_FAILED"));
     }
     return new Promise<() => void>((resolve, reject) => {
       const waiter: Waiter = {
@@ -37,7 +29,7 @@ export class FifoDownloadGate {
           }
           this.#queue.splice(index, 1);
           signal.removeEventListener("abort", waiter.abortListener!);
-          reject(new PanSyncError("DOWNLOAD_FAILED"));
+          reject(new PanSyncError("UPLOAD_FAILED"));
           this.#drain();
         };
         signal.addEventListener("abort", waiter.abortListener, { once: true });
@@ -48,19 +40,20 @@ export class FifoDownloadGate {
   }
 
   #drain(): void {
-    while (this.#active < this.#capacity && this.#queue.length > 0) {
-      const waiter = this.#queue.shift()!;
-      waiter.signal?.removeEventListener("abort", waiter.abortListener!);
-      this.#active += 1;
-      let released = false;
-      waiter.resolve(() => {
-        if (released) {
-          return;
-        }
-        released = true;
-        this.#active -= 1;
-        this.#drain();
-      });
+    if (this.#active || this.#queue.length === 0) {
+      return;
     }
+    const waiter = this.#queue.shift()!;
+    waiter.signal?.removeEventListener("abort", waiter.abortListener!);
+    this.#active = true;
+    let released = false;
+    waiter.resolve(() => {
+      if (released) {
+        return;
+      }
+      released = true;
+      this.#active = false;
+      this.#drain();
+    });
   }
 }

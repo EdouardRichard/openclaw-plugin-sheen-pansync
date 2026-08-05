@@ -158,18 +158,29 @@ export class ReadOrchestrator {
       throw new PanSyncError("REMOTE_FILE_AMBIGUOUS");
     }
 
+    let releaseDownload: (() => void) | undefined;
+    try {
+      releaseDownload = await this.#downloadGate.acquire(options.signal);
+      return await this.#download(input, options);
+    } catch (error) {
+      throw stableDownloadError(error);
+    } finally {
+      releaseDownload?.();
+    }
+  }
+
+  async #download(
+    input: DownloadRequest,
+    options: ProviderOperationOptions,
+  ): Promise<PanSyncDownloadResult> {
     let provider: CloudDriveProvider;
     let accessToken: string;
     let entry: RemoteEntry;
-    try {
-      provider = this.dependencies.providerRegistry.resolve(input.provider);
-      accessToken = await this.dependencies.tokenManager.getValidAccessToken(options);
-      entry = input.fileId === undefined
-        ? await provider.resolveEntry(input.remotePath!, accessToken, options)
-        : await provider.getEntryById(input.fileId, accessToken, options);
-    } catch (error) {
-      throw stableDownloadError(error);
-    }
+    provider = this.dependencies.providerRegistry.resolve(input.provider);
+    accessToken = await this.dependencies.tokenManager.getValidAccessToken(options);
+    entry = input.fileId === undefined
+      ? await provider.resolveEntry(input.remotePath!, accessToken, options)
+      : await provider.getEntryById(input.fileId, accessToken, options);
 
     if (entry.type !== "file") {
       throw new PanSyncError("REMOTE_ENTRY_NOT_FILE");
@@ -196,9 +207,7 @@ export class ReadOrchestrator {
     }
 
     let target: WorkspaceDownloadTarget | undefined;
-    let releaseDownload: (() => void) | undefined;
     try {
-      releaseDownload = await this.#downloadGate.acquire(options.signal);
       target = await openWorkspaceDownloadTarget(
         input.workspaceDir,
         input.localDirectory,
@@ -243,9 +252,7 @@ export class ReadOrchestrator {
       } catch {
         // Cleanup errors are intentionally collapsed into the stable download error.
       }
-      throw stableDownloadError(error);
-    } finally {
-      releaseDownload?.();
+      throw error;
     }
   }
 

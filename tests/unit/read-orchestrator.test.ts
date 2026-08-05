@@ -488,7 +488,7 @@ describe("ReadOrchestrator download", () => {
     await rm(fixtureRoot, { recursive: true, force: true });
   });
 
-  it("limits five concurrent downloads to three complete stream lifecycles", async () => {
+  it("serializes five downloads before metadata through complete stream lifecycles", async () => {
     const entries = new Map(
       Array.from({ length: 5 }, (_unused, index) => {
         const id = `file-${index + 1}`;
@@ -513,6 +513,7 @@ describe("ReadOrchestrator download", () => {
         size: 1,
       };
     });
+    const getEntryById = vi.fn(async (fileId: string) => entries.get(fileId)!);
     const provider: CloudDriveProvider = {
       id: "aliyun",
       aliases: ["aliyun"],
@@ -520,7 +521,7 @@ describe("ReadOrchestrator download", () => {
       ensureDirectory: async () => unused(),
       getReadRoot: async () => unused(),
       resolveEntry: async () => unused(),
-      getEntryById: vi.fn(async (fileId) => entries.get(fileId)!),
+      getEntryById,
       listEntries: async () => unused(),
       openDownload,
       uploadFile: async () => unused(),
@@ -539,19 +540,23 @@ describe("ReadOrchestrator download", () => {
     const downloads = Array.from(entries.keys(), (fileId) =>
       orchestrator.download({ workspaceDir: workspace, fileId })
     );
-    await vi.waitFor(() => expect(openDownload).toHaveBeenCalledTimes(3));
-    expect(maximumActiveStreams).toBe(3);
+    await vi.waitFor(() => expect(openDownload).toHaveBeenCalledTimes(1));
+    expect(getEntryById.mock.calls.map(([fileId]) => fileId)).toEqual(["file-1"]);
+    expect(maximumActiveStreams).toBe(1);
 
-    finish("file-1");
-    await vi.waitFor(() => expect(openDownload).toHaveBeenCalledTimes(4));
-    expect(maximumActiveStreams).toBe(3);
-    finish("file-2");
-    await vi.waitFor(() => expect(openDownload).toHaveBeenCalledTimes(5));
-    expect(maximumActiveStreams).toBe(3);
-
-    finish("file-3");
-    finish("file-4");
-    finish("file-5");
+    for (let completed = 1; completed <= 5; completed += 1) {
+      finish(`file-${completed}`);
+      if (completed < 5) {
+        await vi.waitFor(() =>
+          expect(openDownload).toHaveBeenCalledTimes(completed + 1)
+        );
+        expect(getEntryById.mock.calls.map(([fileId]) => fileId)).toEqual(
+          Array.from({ length: completed + 1 },
+            (_unused, index) => `file-${index + 1}`),
+        );
+      }
+      expect(maximumActiveStreams).toBe(1);
+    }
     await expect(Promise.all(downloads)).resolves.toEqual(
       expect.arrayContaining(
         Array.from(entries.values(), (entry) => expect.objectContaining({
@@ -562,7 +567,7 @@ describe("ReadOrchestrator download", () => {
     );
   });
 
-  it("cancels a queued fourth download before opening a stream or local file", async () => {
+  it("cancels a queued download before token, metadata, stream, or local file access", async () => {
     const entries = new Map(
       Array.from({ length: 4 }, (_unused, index) => {
         const id = `queued-${index + 1}`;
@@ -581,6 +586,8 @@ describe("ReadOrchestrator download", () => {
       }),
       size: 1,
     }));
+    const getEntryById = vi.fn(async (fileId: string) => entries.get(fileId)!);
+    const getValidAccessToken = vi.fn(async () => "access-secret");
     const provider: CloudDriveProvider = {
       id: "aliyun",
       aliases: ["aliyun"],
@@ -588,38 +595,36 @@ describe("ReadOrchestrator download", () => {
       ensureDirectory: async () => unused(),
       getReadRoot: async () => unused(),
       resolveEntry: async () => unused(),
-      getEntryById: vi.fn(async (fileId) => entries.get(fileId)!),
+      getEntryById,
       listEntries: async () => unused(),
       openDownload,
       uploadFile: async () => unused(),
     };
     const orchestrator = new ReadOrchestrator({
       providerRegistry: { resolve: vi.fn(() => provider) },
-      tokenManager: { getValidAccessToken: vi.fn(async () => "access-secret") },
+      tokenManager: { getValidAccessToken },
     });
-    const active = ["queued-1", "queued-2", "queued-3"].map((fileId) =>
-      orchestrator.download({ workspaceDir: workspace, fileId })
-    );
+    const active = orchestrator.download({ workspaceDir: workspace, fileId: "queued-1" });
     const controller = new AbortController();
     const queued = orchestrator.download(
-      { workspaceDir: workspace, fileId: "queued-4" },
+      { workspaceDir: workspace, fileId: "queued-2" },
       { signal: controller.signal },
     );
-    await vi.waitFor(() => expect(openDownload).toHaveBeenCalledTimes(3));
+    await vi.waitFor(() => expect(openDownload).toHaveBeenCalledTimes(1));
 
     controller.abort();
     await expect(queued).rejects.toMatchObject({ code: "DOWNLOAD_FAILED" });
-    expect(openDownload).toHaveBeenCalledTimes(3);
-    await expect(stat(path.join(workspace, "queued-4.txt"))).rejects.toMatchObject({
+    expect(getValidAccessToken).toHaveBeenCalledTimes(1);
+    expect(getEntryById).toHaveBeenCalledTimes(1);
+    expect(openDownload).toHaveBeenCalledTimes(1);
+    await expect(stat(path.join(workspace, "queued-2.txt"))).rejects.toMatchObject({
       code: "ENOENT",
     });
 
-    for (const fileId of ["queued-1", "queued-2", "queued-3"]) {
-      const stream = streamControllers.get(fileId)!;
-      stream.enqueue(Uint8Array.of(0x61));
-      stream.close();
-    }
-    await Promise.all(active);
+    const stream = streamControllers.get("queued-1")!;
+    stream.enqueue(Uint8Array.of(0x61));
+    stream.close();
+    await active;
   });
 
   it("releases a download slot when an active provider open fails", async () => {
@@ -669,19 +674,19 @@ describe("ReadOrchestrator download", () => {
     const downloads = Array.from(entries.keys(), (fileId) =>
       orchestrator.download({ workspaceDir: workspace, fileId })
     );
-    const firstFailure = expect(downloads[0]).rejects.toMatchObject({
-      code: "DOWNLOAD_FAILED",
-    });
-    await vi.waitFor(() => expect(openDownload).toHaveBeenCalledTimes(3));
+    await vi.waitFor(() => expect(openDownload).toHaveBeenCalledTimes(1));
 
     rejectFirst(new Error("provider open failed"));
-    await firstFailure;
-    await vi.waitFor(() => expect(openDownload).toHaveBeenCalledTimes(4));
+    await expect(downloads[0]).rejects.toMatchObject({ code: "DOWNLOAD_FAILED" });
+    await vi.waitFor(() => expect(openDownload).toHaveBeenCalledTimes(2));
 
-    for (const fileId of ["failure-2", "failure-3", "failure-4"]) {
+    for (const [index, fileId] of ["failure-2", "failure-3", "failure-4"].entries()) {
       const stream = streamControllers.get(fileId)!;
       stream.enqueue(Uint8Array.of(0x61));
       stream.close();
+      if (fileId !== "failure-4") {
+        await vi.waitFor(() => expect(openDownload).toHaveBeenCalledTimes(index + 3));
+      }
     }
     await expect(Promise.all(downloads.slice(1))).resolves.toHaveLength(3);
     await expect(stat(path.join(workspace, "failure-1.txt"))).rejects.toMatchObject({
