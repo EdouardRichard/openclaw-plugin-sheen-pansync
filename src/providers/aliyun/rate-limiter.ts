@@ -16,6 +16,7 @@ export type AliyunOpenApiRateLimiterOptions = {
 };
 
 const GLOBAL_RULE: RateLimitRule = { limit: 15, windowMs: 1_000 };
+const GLOBAL_MIN_START_INTERVAL_MS = 350;
 const LIST_RULE: RateLimitRule = { limit: 40, windowMs: 10_000 };
 const DOWNLOAD_URL_RULE: RateLimitRule = { limit: 10, windowMs: 10_000 };
 const LIST_ENDPOINT = "/adrive/v1.0/openFile/list";
@@ -58,6 +59,7 @@ export class AliyunOpenApiRateLimiter {
   readonly #listStarts: number[] = [];
   readonly #downloadUrlStarts: number[] = [];
   readonly #queue: Waiter[] = [];
+  #lastGlobalStart: number | undefined;
   #timer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(options: AliyunOpenApiRateLimiterOptions = {}) {
@@ -101,7 +103,14 @@ export class AliyunOpenApiRateLimiter {
     while (this.#queue.length > 0) {
       const waiter = this.#queue[0]!;
       const now = this.#clock();
+      const globalIntervalWait = this.#lastGlobalStart === undefined
+        ? 0
+        : Math.max(
+          0,
+          this.#lastGlobalStart + GLOBAL_MIN_START_INTERVAL_MS - now,
+        );
       const waitMs = Math.max(
+        globalIntervalWait,
         requiredWait(this.#globalStarts, GLOBAL_RULE, now),
         waiter.endpointPath === LIST_ENDPOINT
           ? requiredWait(this.#listStarts, LIST_RULE, now)
@@ -120,6 +129,7 @@ export class AliyunOpenApiRateLimiter {
 
       this.#queue.shift();
       waiter.signal?.removeEventListener("abort", waiter.abortListener!);
+      this.#lastGlobalStart = now;
       this.#globalStarts.push(now);
       if (waiter.endpointPath === LIST_ENDPOINT) {
         this.#listStarts.push(now);

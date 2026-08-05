@@ -5,14 +5,12 @@ const LIST_ENDPOINT = "/adrive/v1.0/openFile/list";
 const DOWNLOAD_URL_ENDPOINT = "/adrive/v1.0/openFile/getDownloadUrl";
 const OTHER_ENDPOINT = "/adrive/v1.0/openFile/get";
 
-async function acquireMany(
+function acquireMany(
   limiter: AliyunOpenApiRateLimiter,
   count: number,
   endpoint = OTHER_ENDPOINT,
-): Promise<void> {
-  await Promise.all(
-    Array.from({ length: count }, () => limiter.acquire(endpoint)),
-  );
+): Promise<void>[] {
+  return Array.from({ length: count }, () => limiter.acquire(endpoint));
 }
 
 describe("AliyunOpenApiRateLimiter", () => {
@@ -27,13 +25,15 @@ describe("AliyunOpenApiRateLimiter", () => {
 
   it("holds the eleventh getDownloadUrl start until its rolling ten-second window opens", async () => {
     const limiter = new AliyunOpenApiRateLimiter();
-    await acquireMany(limiter, 10, DOWNLOAD_URL_ENDPOINT);
+    const firstTen = acquireMany(limiter, 10, DOWNLOAD_URL_ENDPOINT);
+    await vi.advanceTimersByTimeAsync(3_150);
+    await Promise.all(firstTen);
     let started = false;
     const eleventh = limiter.acquire(DOWNLOAD_URL_ENDPOINT).then(() => {
       started = true;
     });
 
-    await vi.advanceTimersByTimeAsync(9_999);
+    await vi.advanceTimersByTimeAsync(6_849);
     expect(started).toBe(false);
     await vi.advanceTimersByTimeAsync(1);
     await eleventh;
@@ -41,55 +41,48 @@ describe("AliyunOpenApiRateLimiter", () => {
     expect(started).toBe(true);
   });
 
-  it("holds the forty-first list start until its rolling ten-second window opens", async () => {
+  it("keeps list starts below forty per ten seconds through global pacing", async () => {
     const limiter = new AliyunOpenApiRateLimiter();
-    await acquireMany(limiter, 15, LIST_ENDPOINT);
-    await vi.advanceTimersByTimeAsync(1_000);
-    await acquireMany(limiter, 15, LIST_ENDPOINT);
-    await vi.advanceTimersByTimeAsync(1_000);
-    await acquireMany(limiter, 10, LIST_ENDPOINT);
-    let started = false;
-    const fortyFirst = limiter.acquire(LIST_ENDPOINT).then(() => {
-      started = true;
-    });
+    const starts: number[] = [];
+    const pending = acquireMany(limiter, 30, LIST_ENDPOINT).map((promise) =>
+      promise.then(() => starts.push(Date.now()))
+    );
 
-    await vi.advanceTimersByTimeAsync(7_999);
-    expect(started).toBe(false);
-    await vi.advanceTimersByTimeAsync(1);
-    await fortyFirst;
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(starts).toHaveLength(29);
+    expect(starts.at(-1)).toBe(9_800);
+    await vi.advanceTimersByTimeAsync(151);
+    await Promise.all(pending);
 
-    expect(started).toBe(true);
+    expect(starts.at(-1)).toBe(10_150);
   });
 
-  it("applies the conservative fifteen-per-second budget across mixed endpoints", async () => {
+  it("paces mixed OpenAPI starts at least 350 ms apart", async () => {
     const limiter = new AliyunOpenApiRateLimiter();
-    await Promise.all([
-      ...Array.from({ length: 5 }, () => limiter.acquire(LIST_ENDPOINT)),
-      ...Array.from({ length: 5 }, () => limiter.acquire(DOWNLOAD_URL_ENDPOINT)),
-      ...Array.from({ length: 5 }, () => limiter.acquire(OTHER_ENDPOINT)),
-    ]);
-    let started = false;
-    const sixteenth = limiter.acquire(LIST_ENDPOINT).then(() => {
-      started = true;
-    });
+    const starts: number[] = [];
+    const pending = [
+      limiter.acquire(LIST_ENDPOINT),
+      limiter.acquire(DOWNLOAD_URL_ENDPOINT),
+      limiter.acquire(OTHER_ENDPOINT),
+      limiter.acquire(OTHER_ENDPOINT),
+    ].map((promise) => promise.then(() => starts.push(Date.now())));
 
-    await vi.advanceTimersByTimeAsync(999);
-    expect(started).toBe(false);
+    await vi.advanceTimersByTimeAsync(1_049);
+    expect(starts).toEqual([0, 350, 700]);
     await vi.advanceTimersByTimeAsync(1);
-    await sixteenth;
+    await Promise.all(pending);
 
-    expect(started).toBe(true);
+    expect(starts).toEqual([0, 350, 700, 1_050]);
   });
 
   it("admits queued callers in FIFO order", async () => {
     const limiter = new AliyunOpenApiRateLimiter();
-    await acquireMany(limiter, 15);
     const order: number[] = [];
     const queued = [1, 2, 3].map((value) =>
       limiter.acquire(OTHER_ENDPOINT).then(() => order.push(value))
     );
 
-    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(700);
     await Promise.all(queued);
 
     expect(order).toEqual([1, 2, 3]);
@@ -97,7 +90,7 @@ describe("AliyunOpenApiRateLimiter", () => {
 
   it("removes an aborted queued caller without delaying the next caller", async () => {
     const limiter = new AliyunOpenApiRateLimiter();
-    await acquireMany(limiter, 15);
+    await limiter.acquire(OTHER_ENDPOINT);
     const controller = new AbortController();
     const aborted = limiter.acquire(OTHER_ENDPOINT, controller.signal);
     let nextStarted = false;
@@ -108,7 +101,9 @@ describe("AliyunOpenApiRateLimiter", () => {
     controller.abort();
     await expect(aborted).rejects.toMatchObject({ name: "AbortError" });
     expect(nextStarted).toBe(false);
-    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(349);
+    expect(nextStarted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
     await next;
 
     expect(nextStarted).toBe(true);
