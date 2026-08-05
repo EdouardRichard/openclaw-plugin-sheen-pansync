@@ -2,6 +2,8 @@
 
 Date: 2026-08-05
 
+Status: Superseded historical evidence. The `3 + 2` batching below predates the final two-start sliding window; current guidance is 2+1, with the third call waiting internally and resuming automatically. The observations remain unchanged as historical evidence and are not current instructions.
+
 The final wording was tested in five fresh, read-only contexts. Each sample read only the edited `skills/pan-sync-upload/SKILL.md` and did not modify the workspace.
 
 ## Results

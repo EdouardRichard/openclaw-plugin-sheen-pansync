@@ -899,6 +899,7 @@ describe("one-time setup server", () => {
       tokenService: new OpenListTokenService(),
       baseUrl: api.baseUrl,
       tokenManager: { async forceRefresh() { return "unused"; } },
+      downloadStartLimiter: { acquire: async () => undefined },
     });
     let expire: (() => void) | undefined;
     const result = await startSetupServer(harness.deps, {
@@ -946,6 +947,7 @@ describe("one-time setup server", () => {
       tokenService: { async refresh() { throw new Error("unused"); } },
       baseUrl: api.baseUrl,
       tokenManager: { async forceRefresh() { return savedRecord.accessToken; } },
+      downloadStartLimiter: { acquire: async () => undefined },
     });
     harness.deps.orchestrator = new UploadOrchestrator({
       providerRegistry: { resolve: () => provider },

@@ -34,6 +34,10 @@ Do not treat a directory as a downloadable file. Omit `localDirectory` to downlo
 - If the user did not explicitly specify a local workspace directory, omit `localDirectory` on every call; each file goes to the workspace root.
 - If the user explicitly specified a workspace-relative local directory, pass exactly that `localDirectory`; the Tool creates missing directories. Never derive `localDirectory` from `remoteDirectory`, `remotePath`, a resource-drive path, or a remote folder name.
 - For a folder or multiple files, use `pan_sync_list` to identify ordinary files. Issue `pan_sync_download` calls one at a time, await each call before starting the next file, and never start concurrent downloads.
+- All sessions on one host share a strict sliding window of two starts per 60 seconds / 一台主机上的所有会话共享严格滑动窗口：每 60 秒最多开始 2 次下载。
+- A pending `pan_sync_download` waits internally and resumes automatically when the window opens; internal waiting is not `RATE_LIMITED` and does not require another Tool call / 排队中的 `pan_sync_download` 会在工具内部等待，窗口打开后自动恢复；内部等待不是 `RATE_LIMITED`，不需要再次调用 Tool。
+- The AI must not issue a duplicate or automatic retry while `pan_sync_download` is pending, and must not start another session as a workaround / `pan_sync_download` 处于 pending 时，AI 不得重复调用或自动重试，也不得另开会话绕过等待。
+- `DOWNLOAD_FAILED` is final for that call and must not trigger a tight retry loop / `DOWNLOAD_FAILED` 对该次调用是最终结果，不得触发紧密重试循环。
 - If a call returns `RATE_LIMITED`, `DOWNLOAD_FAILED`, or `UPLOAD_FAILED`, do not immediately retry and do not create a tight retry loop. Continue the remaining planned files one at a time without retrying that failed call, and report the stable failure in the final summary.
 
 ## Exact path or query / 精确路径或搜索词

@@ -482,7 +482,9 @@ describe("OpenClaw plugin entry", () => {
     const dataDir = path.join(state.dataDir, "pan-sync-helper");
     let capturedSetupDependencies: import("../../src/admin/setup-server.js").SetupServerDependencies | undefined;
     let capturedLeaseDatabasePath: string | undefined;
+    let capturedDownloadDatabasePath: string | undefined;
     let leaseFactoryCalls = 0;
+    let downloadStoreFactoryCalls = 0;
     const leaseKeys: string[] = [];
     const writes: string[] = [];
     const nativeFetch = globalThis.fetch;
@@ -517,6 +519,11 @@ describe("OpenClaw plugin entry", () => {
           });
           return run({ assertOwned: async () => undefined });
         };
+      },
+      downloadStartStoreFactory(databasePath) {
+        downloadStoreFactoryCalls += 1;
+        capturedDownloadDatabasePath = databasePath;
+        return { reserve: async () => ({ status: "granted" as const }) };
       },
       configureCliOptions: {
         async startServer(dependencies) {
@@ -558,6 +565,11 @@ describe("OpenClaw plugin entry", () => {
       path.join(dataDir, "locks", "lease.sqlite"),
     );
     expect(leaseFactoryCalls).toBe(1);
+    expect(capturedDownloadDatabasePath).toBe(
+      path.join(dataDir, "locks", "download-rate-limit.sqlite"),
+    );
+    expect(capturedDownloadDatabasePath).not.toBe(capturedLeaseDatabasePath);
+    expect(downloadStoreFactoryCalls).toBe(1);
     if (process.platform !== "win32") {
       expect(await octalMode(dataDir)).toBe("700");
       expect(await octalMode(path.join(dataDir, "locks"))).toBe("700");

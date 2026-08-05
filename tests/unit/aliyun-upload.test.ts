@@ -287,6 +287,7 @@ function provider(
     },
     clock: options.clock ?? (() => NOW),
     delay: options.delay ?? (async () => undefined),
+    downloadStartLimiter: { acquire: async () => undefined },
     ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
   });
 }

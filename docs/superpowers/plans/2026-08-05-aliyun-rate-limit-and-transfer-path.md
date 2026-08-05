@@ -1,5 +1,7 @@
 # Aliyun Rate Limit and Transfer Path Implementation Plan
 
+> **Superseded:** The download-start pacing portions of this historical plan are replaced by `2026-08-05-aliyun-download-sliding-window.md`, whose final rule is a host-wide strict window of two starts per 60 seconds with the third call waiting internally.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Prevent Aliyun Drive throttling during multi-file downloads and multipart uploads while making the workspace root the default download destination unless the user explicitly supplies a local directory.

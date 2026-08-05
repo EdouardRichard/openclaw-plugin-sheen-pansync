@@ -148,6 +148,7 @@ function orchestratorFor(
     tokenManager,
     baseUrl: server.baseUrl,
     clock: () => NOW,
+    downloadStartLimiter: { acquire: async () => undefined },
   });
   return {
     tokenService,

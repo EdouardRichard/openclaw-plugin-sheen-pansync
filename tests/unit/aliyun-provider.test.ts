@@ -39,6 +39,7 @@ function provider(
     baseUrl: server.baseUrl,
     tokenManager: { forceRefresh },
     clock: () => NOW,
+    downloadStartLimiter: { acquire: async () => undefined },
   });
 }
 
