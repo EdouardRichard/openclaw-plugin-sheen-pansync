@@ -240,6 +240,8 @@ describe("published package", () => {
       "dist/index.js",
       "dist/admin/cli.js",
       "dist/cli-entry.js",
+      "dist/providers/aliyun/download-start-limiter.js",
+      "dist/providers/aliyun/sqlite-download-start-store.js",
       "ui/setup.html",
       "ui/setup.js",
       "ui/setup.css",
@@ -285,6 +287,18 @@ describe("published package", () => {
     expect(skill).toMatch(/never[\s\S]*concurrent[\s\S]*pan_sync_upload/iu);
     expect(skill).toMatch(/do not immediately retry|no tight retry loop/iu);
     expect(skill).toMatch(/continue the remaining planned files/iu);
+    expect(skill).toMatch(/一台主机[\s\S]*所有会话[\s\S]*严格滑动窗口[\s\S]*60 秒[\s\S]*2 次/u);
+    expect(skill).toMatch(/pending[\s\S]*pan_sync_download[\s\S]*自动恢复/u);
+    expect(skill).toMatch(/pending[\s\S]*不得[\s\S]*重复/u);
+    expect(skill).toMatch(/pending[\s\S]*不得[\s\S]*自动重试/u);
+    expect(skill).toMatch(/不得[\s\S]*另开会话[\s\S]*绕过/u);
+    expect(skill).toMatch(/DOWNLOAD_FAILED[\s\S]*(?:最终|final)[\s\S]*(?:紧密重试|tight retry)/u);
+    expect(skill).toMatch(/all sessions[\s\S]*one host[\s\S]*strict sliding window[\s\S]*two starts per 60 seconds/iu);
+    expect(skill).toMatch(/pending[\s\S]*pan_sync_download[\s\S]*resumes automatically/iu);
+    expect(skill).toMatch(/must not[\s\S]*duplicate[\s\S]*pending/iu);
+    expect(skill).toMatch(/must not[\s\S]*automatic retry[\s\S]*pending/iu);
+    expect(skill).toMatch(/must not start another session[\s\S]*workaround/iu);
+    expect(skill).toMatch(/DOWNLOAD_FAILED[\s\S]*final[\s\S]*tight retry/iu);
   });
 
   it("ships the beginner setup guide and four valid screenshots", async () => {
@@ -320,6 +334,12 @@ describe("published package", () => {
     expect(readme).toContain("资源盘");
     expect(readme).toContain("resource drive");
     expect(readme).toContain("DOWNLOAD_CONFIRMATION_REQUIRED");
+    expect(readme).toContain("2 次/60 秒");
+    expect(readme).toContain("two starts per 60 seconds");
+    expect(readme).toMatch(/保守策略[\s\S]*社区[\s\S]*观察[\s\S]*并非官方[\s\S]*保证/u);
+    expect(readme).toMatch(/第三次[\s\S]*(?:等待|挂起)[\s\S]*(?:窗口|60 秒)[\s\S]*自动继续/u);
+    expect(readme).toMatch(/conservative compatibility[\s\S]*community reports[\s\S]*observed behavior[\s\S]*not a published official guarantee/iu);
+    expect(readme).toMatch(/third[\s\S]*(?:wait|pending)[\s\S]*(?:window|60 seconds)[\s\S]*continues automatically/iu);
 
     expect(paths.filter((entry) => entry.startsWith("docs/images/readme/")))
       .toEqual([...allowedReadmeImages]);

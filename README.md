@@ -217,6 +217,8 @@ OpenClaw 应先确认本地文件存在，再调用 `pan_sync_upload`。未指�
 
 OpenClaw 应先用 `pan_sync_list` 确认目标，再用 `pan_sync_download` 下载一个普通文件，最后通过常规工作区文件工具读取返回的相对 `localPath`。下载默认落到工作区根目录；本地同名文件会保留，新文件自动使用 `name (1).ext`、`name (2).ext` 等名称。文件夹不会被递归下载。
 
+为兼容阿里云盘下载行为，插件采用保守策略：同一主机所有会话在严格滑动窗口中最多 `2 次/60 秒` 下载开始。这是根据社区信息和观察到的行为制定的兼容规则，并非官方公开保证。若快速发起第三次下载，它可能保持等待约 60 秒，直到窗口打开后会自动继续；不要将等待中的调用重复提交。
+
 ![下载后由 OpenClaw 读取工作区副本](docs/images/readme/04-download-and-read.png)
 
 “同步网盘”没有说明方向，OpenClaw 必须先问是“上传到网盘”还是“从网盘下载”，不能先调用 Tool。请直接使用下面的澄清请求：
@@ -548,6 +550,8 @@ Search the cloud drive for summary.txt first. Download it into the workspace and
 ```
 
 OpenClaw should use `pan_sync_list` to identify the target, `pan_sync_download` to download one regular file, and normal workspace file tools to read the returned relative `localPath`. Downloads go to the workspace root by default. Existing local files are preserved, and the new file is renamed to `name (1).ext`, `name (2).ext`, and so on. Directories are not downloaded recursively.
+
+As a conservative compatibility rule based on community reports and observed behavior—not a published official guarantee—the plugin shares a strict sliding window of two starts per 60 seconds across all sessions on one host. A third quick download can remain pending for about 60 seconds until the window opens, then it continues automatically; do not submit a duplicate pending call.
 
 ![Read the workspace copy after download](docs/images/readme/04-download-and-read.png)
 

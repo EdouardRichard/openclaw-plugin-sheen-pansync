@@ -25,11 +25,17 @@ function resourceDrive(): Record<string, unknown> {
   };
 }
 
-function makeProvider(fetch: AliyunFetch): AliyunProvider {
+function makeProvider(
+  fetch: AliyunFetch,
+  downloadStartLimiter: { acquire(signal?: AbortSignal): Promise<void> } = {
+    acquire: async () => undefined,
+  },
+): AliyunProvider {
   return new AliyunProvider({
     fetch,
     tokenService: { refresh: vi.fn() },
     tokenManager: { forceRefresh: vi.fn(async () => "access-new") },
+    downloadStartLimiter,
   });
 }
 
@@ -183,9 +189,11 @@ describe("AliyunProvider read primitives", () => {
     expect(requests.at(-1)?.path).toBe("/adrive/v1.0/openFile/get");
   });
 
-  it("opens a signed download stream without authorizing the CDN request", async () => {
+  it("acquires a download-start permit immediately before opening a signed stream", async () => {
     const signedUrl = "https://cdn.example.test/signed/download-secret-CANARY";
     const requests: RecordedRequest[] = [];
+    const contentRequests: Array<{ init: RequestInit | undefined }> = [];
+    const events: string[] = [];
     const fetch: AliyunFetch = async (input, init) => {
       const url = new URL(input instanceof Request ? input.url : input.toString());
       requests.push({
@@ -193,13 +201,23 @@ describe("AliyunProvider read primitives", () => {
         path: url.pathname,
         authorization: new Headers(init?.headers).get("authorization"),
       });
-      if (url.pathname.endsWith("/getDriveInfo")) return jsonResponse(resourceDrive());
+      if (url.pathname.endsWith("/getDriveInfo")) {
+        events.push("getDriveInfo");
+        return jsonResponse(resourceDrive());
+      }
       if (url.pathname.endsWith("/getDownloadUrl")) {
+        events.push("getDownloadUrl");
         return jsonResponse({ url: signedUrl });
       }
+      events.push("contentGET");
+      contentRequests.push({ init });
       return new Response(Uint8Array.from([1, 2, 3]));
     };
-    const provider = makeProvider(fetch);
+    const provider = makeProvider(fetch, {
+      acquire: async () => {
+        events.push("permit");
+      },
+    });
 
     const result = await provider.openDownload({
       accessToken: "access-old",
@@ -220,6 +238,51 @@ describe("AliyunProvider read primitives", () => {
       path: "/signed/download-secret-CANARY",
       authorization: null,
     });
+    const contentRequest = contentRequests[0]!;
+    expect(new Headers(contentRequest.init?.headers).get("range")).toBeNull();
+    expect(contentRequests).toHaveLength(1);
+    expect(events).toEqual([
+      "getDriveInfo",
+      "permit",
+      "getDownloadUrl",
+      "contentGET",
+    ]);
     expect(JSON.stringify(result)).not.toContain("download-secret-CANARY");
+  });
+
+  it("does not request a signed URL when the download-start permit is rejected", async () => {
+    const events: string[] = [];
+    const fetch: AliyunFetch = async (input) => {
+      const url = new URL(input instanceof Request ? input.url : input.toString());
+      if (url.pathname.endsWith("/getDriveInfo")) {
+        events.push("getDriveInfo");
+        return jsonResponse(resourceDrive());
+      }
+      if (url.pathname.endsWith("/getDownloadUrl")) events.push("getDownloadUrl");
+      else events.push("contentGET");
+      return jsonResponse({ url: "https://cdn.example.test/unreachable" });
+    };
+    const provider = makeProvider(fetch, {
+      acquire: async () => {
+        events.push("permit");
+        throw new Error("reservation unavailable");
+      },
+    });
+
+    await expect(provider.openDownload({
+      accessToken: "access-old",
+      entry: {
+        id: "file-report",
+        parentId: "root",
+        name: "report.pdf",
+        type: "file",
+        size: 3,
+        providerState: { driveId: "drive-resource" },
+      },
+    })).rejects.toMatchObject({ code: "DOWNLOAD_FAILED" });
+    expect(events).toContain("getDriveInfo");
+    expect(events).toContain("permit");
+    expect(events).not.toContain("getDownloadUrl");
+    expect(events).not.toContain("contentGET");
   });
 });

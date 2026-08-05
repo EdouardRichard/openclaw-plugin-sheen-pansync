@@ -15,6 +15,7 @@ import type { CredentialRecord } from "../../credentials/types.js";
 import { PanSyncError } from "../../errors.js";
 import { normalizeRemoteDirectory } from "../../workspace/path-guard.js";
 import { parseResourceDriveSummary } from "./resource-drive.js";
+import type { AliyunDownloadStartLimiter } from "./download-start-limiter.js";
 import {
   parseAliyunDownloadUrl,
   parseAliyunRemoteEntry,
@@ -34,6 +35,7 @@ import {
 export type AliyunProviderOptions = {
   tokenService: AliyunTokenService;
   tokenManager: AliyunTokenRefresher;
+  downloadStartLimiter: Pick<AliyunDownloadStartLimiter, "acquire">;
   baseUrl?: string;
   fetch?: AliyunFetch;
   clock?: () => number;
@@ -141,9 +143,11 @@ export class AliyunProvider implements CloudDriveProvider {
   readonly aliases = ["阿里网盘", "阿里云盘", "aliyun", "alipan"] as const;
   readonly #clock: () => number;
   readonly #api: AliyunAuthorizedClient;
+  readonly #downloadStartLimiter: Pick<AliyunDownloadStartLimiter, "acquire">;
 
   constructor(private readonly options: AliyunProviderOptions) {
     this.#clock = options.clock ?? Date.now;
+    this.#downloadStartLimiter = options.downloadStartLimiter;
     this.#api = new AliyunAuthorizedClient({
       tokenManager: options.tokenManager,
       ...(options.baseUrl === undefined ? {} : { baseUrl: options.baseUrl }),
@@ -404,6 +408,11 @@ export class AliyunProvider implements CloudDriveProvider {
       throw new PanSyncError("DOWNLOAD_FAILED");
     }
     const context = await this.#resourceDriveContext(input.accessToken, options);
+    try {
+      await this.#downloadStartLimiter.acquire(options.signal);
+    } catch {
+      throw new PanSyncError("DOWNLOAD_FAILED");
+    }
     const addressed = await this.#api.post(
       "/adrive/v1.0/openFile/getDownloadUrl",
       context.accessToken,

@@ -10,8 +10,13 @@ import {
   TokenManager,
 } from "./credentials/token-manager.js";
 import { ProviderRegistry } from "./provider-registry.js";
+import {
+  AliyunDownloadStartLimiter,
+  type DownloadStartReservationStore,
+} from "./providers/aliyun/download-start-limiter.js";
 import { OpenListTokenService } from "./providers/aliyun/openlist-token-service.js";
 import { AliyunProvider } from "./providers/aliyun/provider.js";
+import { createSqliteWorkerDownloadStartStore } from "./providers/aliyun/sqlite-download-start-store.js";
 import { ReadOrchestrator } from "./read/orchestrator.js";
 import { UploadOrchestrator } from "./upload/orchestrator.js";
 
@@ -33,6 +38,9 @@ export type CreatePanSyncRuntimeOptions = {
   stateDir: string;
   pluginConfig: unknown;
   credentialLeaseFactory?: (databasePath: string) => CredentialLeaseRunner;
+  downloadStartStoreFactory?: (
+    databasePath: string,
+  ) => DownloadStartReservationStore;
 };
 
 export function createPanSyncRuntime(
@@ -41,6 +49,11 @@ export function createPanSyncRuntime(
   const config = resolvePluginConfig(options.pluginConfig);
   const dataDir = path.join(options.stateDir, PLUGIN_DATA_DIRECTORY);
   const leaseDatabasePath = path.join(dataDir, "locks", "lease.sqlite");
+  const downloadLimitDatabasePath = path.join(
+    dataDir,
+    "locks",
+    "download-rate-limit.sqlite",
+  );
   const lease = makeReentrantCredentialLeaseRunner((
     options.credentialLeaseFactory
     ?? createSqliteWorkerCredentialLeaseRunner
@@ -52,7 +65,18 @@ export function createPanSyncRuntime(
     tokenService,
     runWithRefreshLease: lease,
   });
-  const provider = new AliyunProvider({ tokenService, tokenManager });
+  const downloadStartStore = (
+    options.downloadStartStoreFactory
+    ?? createSqliteWorkerDownloadStartStore
+  )(downloadLimitDatabasePath);
+  const downloadStartLimiter = new AliyunDownloadStartLimiter({
+    store: downloadStartStore,
+  });
+  const provider = new AliyunProvider({
+    tokenService,
+    tokenManager,
+    downloadStartLimiter,
+  });
   const providerRegistry = new ProviderRegistry([provider], "aliyun");
   const orchestrator = new UploadOrchestrator({
     providerRegistry,

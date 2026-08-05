@@ -2,6 +2,8 @@
 
 Date: 2026-08-05
 
+Status: Superseded historical evidence. The final operational rule is two immediate starts followed by one internally waiting third call (2+1); this baseline is retained only to document the earlier Skill behavior and must not be used as current guidance.
+
 The five fresh-context, read-only samples used the pre-change `skills/pan-sync-upload/SKILL.md`. No sample read the design or implementation plan.
 
 ## Scenarios and observed failures

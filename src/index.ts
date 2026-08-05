@@ -12,6 +12,7 @@ import {
 import { createPanSyncStatusRoute } from "./admin/status-route.js";
 import { resolvePluginConfig } from "./config.js";
 import type { CredentialLeaseRunner } from "./credentials/store.js";
+import type { DownloadStartReservationStore } from "./providers/aliyun/download-start-limiter.js";
 import { registerPanSyncReadTools } from "./read/tool.js";
 import { createPanSyncRuntime } from "./runtime-composition.js";
 import { registerPanSyncUploadTool } from "./tool.js";
@@ -55,6 +56,9 @@ const configSchema: OpenClawPluginConfigSchema = {
 export type PanSyncPluginEntryOptions = {
   configureCliOptions?: ConfigureCliOptions;
   credentialLeaseFactory?: (databasePath: string) => CredentialLeaseRunner;
+  downloadStartStoreFactory?: (
+    databasePath: string,
+  ) => DownloadStartReservationStore;
 };
 
 export function createPanSyncPluginEntry(
@@ -72,6 +76,9 @@ export function createPanSyncPluginEntry(
         ...(options.credentialLeaseFactory === undefined
           ? {}
           : { credentialLeaseFactory: options.credentialLeaseFactory }),
+        ...(options.downloadStartStoreFactory === undefined
+          ? {}
+          : { downloadStartStoreFactory: options.downloadStartStoreFactory }),
       });
 
       registerPanSyncUploadTool(api, runtime.orchestrator);

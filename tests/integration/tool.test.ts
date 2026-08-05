@@ -333,6 +333,8 @@ describe("resource drive read Tools", () => {
     expect(downloadTool.name).toBe("pan_sync_download");
     expect(downloadTool.description).toMatch(/workspace root/iu);
     expect(downloadTool.description).toMatch(/missing director(?:y|ies).*creat/iu);
+    expect(downloadTool.description).toMatch(/wait internally|internal queue/iu);
+    expect(downloadTool.description).toMatch(/do not.*duplicate|do not.*retry/iu);
     expect(downloadTool.parameters).toEqual({
       anyOf: [
         {

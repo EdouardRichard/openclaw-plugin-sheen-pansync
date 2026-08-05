@@ -121,7 +121,7 @@ function createPanSyncDownloadTool(
   return {
     name: "pan_sync_download" as const,
     label: "Pan Sync Download",
-    description: "Download one concrete resource-drive file without overwriting an existing file. Omit localDirectory to use the workspace root; user-supplied workspace-relative missing directories are created.",
+    description: "Download one concrete resource-drive file without overwriting an existing file. Omit localDirectory to use the workspace root; user-supplied workspace-relative missing directories are created. The call may wait internally for the shared Aliyun download window; do not duplicate or automatically retry a pending call.",
     parameters: PanSyncDownloadSchema,
     async execute(
       _toolCallId: string,
