@@ -121,7 +121,7 @@ function createPanSyncDownloadTool(
   return {
     name: "pan_sync_download" as const,
     label: "Pan Sync Download",
-    description: "Download one concrete resource-drive file into the current OpenClaw workspace without overwriting an existing file.",
+    description: "Download one concrete resource-drive file without overwriting an existing file. Omit localDirectory to use the workspace root; user-supplied workspace-relative missing directories are created.",
     parameters: PanSyncDownloadSchema,
     async execute(
       _toolCallId: string,

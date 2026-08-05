@@ -9,11 +9,13 @@ import type { PanSyncErrorCode } from "../../errors.js";
 import { PanSyncError } from "../../errors.js";
 import type { ResolvedWorkspaceFile } from "../../workspace/path-guard.js";
 import { ALIYUN_OPENAPI_BASE_URL } from "./constants.js";
+import { AliyunOpenApiRateLimiter } from "./rate-limiter.js";
 import type { AliyunFetch } from "./types.js";
 
 const MIN_PART_SIZE = 20 * 1024 * 1024;
+const MAX_PART_SIZE = 5 * 1024 * 1024 * 1024;
 const MAX_PARTS = 10_000;
-const MAX_CONCURRENT_PUTS = 3;
+const PUT_START_INTERVAL_MS = 350;
 const UPLOAD_URL_REFRESH_AGE_MS = 50 * 60 * 1_000;
 const READ_CHUNK_SIZE = 64 * 1024;
 const ACCESS_TOKEN_FAILURE_CODES = new Set([
@@ -43,7 +45,13 @@ export type AliyunAuthorizedClientOptions = {
   baseUrl?: string;
   fetch?: AliyunFetch;
   tokenManager: AliyunTokenRefresher;
+  rateLimiter?: Pick<AliyunOpenApiRateLimiter, "acquire">;
 };
+
+export type AliyunDelay = (
+  milliseconds: number,
+  signal: AbortSignal,
+) => Promise<void>;
 
 export type AliyunPostOptions = {
   failureCode: PanSyncErrorCode;
@@ -127,10 +135,12 @@ function mappedFailure(
 export class AliyunAuthorizedClient {
   readonly #baseUrl: string;
   readonly #fetch: AliyunFetch;
+  readonly #rateLimiter: Pick<AliyunOpenApiRateLimiter, "acquire">;
 
   constructor(private readonly options: AliyunAuthorizedClientOptions) {
     this.#baseUrl = options.baseUrl ?? ALIYUN_OPENAPI_BASE_URL;
     this.#fetch = options.fetch ?? globalThis.fetch;
+    this.#rateLimiter = options.rateLimiter ?? new AliyunOpenApiRateLimiter();
   }
 
   get fetch(): AliyunFetch {
@@ -150,6 +160,7 @@ export class AliyunAuthorizedClient {
       let response: Response;
       let body: unknown;
       try {
+        await this.#rateLimiter.acquire(endpointPath, options.signal);
         response = await this.#fetch(
           new URL(endpointPath, this.#baseUrl),
           {
@@ -356,6 +367,24 @@ function rangeStream(
   return Readable.from(chunks());
 }
 
+function delayUpload(milliseconds: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) {
+    return Promise.reject(new PanSyncError("UPLOAD_FAILED"));
+  }
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", abort);
+      resolve();
+    }, milliseconds);
+    const abort = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
+      reject(new PanSyncError("UPLOAD_FAILED"));
+    };
+    signal.addEventListener("abort", abort, { once: true });
+  });
+}
+
 async function uploadParts(
   client: AliyunAuthorizedClient,
   input: AliyunProviderUploadInput,
@@ -367,96 +396,60 @@ async function uploadParts(
   partSize: number,
   initialAccessToken: string,
   clock: () => number,
+  delay: AliyunDelay,
   externalSignal?: AbortSignal,
 ): Promise<string> {
-  let nextIndex = 0;
   let accessToken = initialAccessToken;
-  let failure: PanSyncError | undefined;
-  const cancellation = new AbortController();
-  const abortFromExternal = (): void => cancellation.abort(externalSignal?.reason);
-  if (externalSignal?.aborted === true) {
-    abortFromExternal();
-  } else {
-    externalSignal?.addEventListener("abort", abortFromExternal, { once: true });
-  }
+  const signal = externalSignal ?? new AbortController().signal;
+  let previousPutStartedAt: number | undefined;
 
-  const stopWith = (error: unknown): void => {
-    if (failure !== undefined) {
-      return;
+  for (const originalPart of upload.parts) {
+    if (signal.aborted) {
+      throw new PanSyncError("UPLOAD_FAILED");
     }
-    failure = error instanceof PanSyncError
-      ? error
-      : new PanSyncError("UPLOAD_FAILED");
-    cancellation.abort();
-  };
+    let part = originalPart;
+    if (clock() - part.acquiredAt >= UPLOAD_URL_REFRESH_AGE_MS) {
+      const refreshed = await client.post(
+        "/adrive/v1.0/openFile/getUploadUrl",
+        accessToken,
+        {
+          drive_id: input.remoteDirectory.providerState.driveId,
+          file_id: upload.fileId,
+          upload_id: upload.uploadId,
+          part_info_list: [{ part_number: part.partNumber }],
+        },
+        {
+          failureCode: "UPLOAD_FAILED",
+          signal,
+        },
+      );
+      accessToken = refreshed.accessToken;
+      part = parseRefreshedPartUrl(
+        refreshed.body,
+        part.partNumber,
+        clock(),
+      );
+    }
 
-  const worker = async (): Promise<void> => {
-    while (failure === undefined) {
-      const index = nextIndex;
-      nextIndex += 1;
-      const originalPart = upload.parts[index];
-      if (originalPart === undefined) {
-        return;
-      }
-
-      try {
-        let part = originalPart;
-        if (clock() - part.acquiredAt >= UPLOAD_URL_REFRESH_AGE_MS) {
-          const refreshed = await client.post(
-            "/adrive/v1.0/openFile/getUploadUrl",
-            accessToken,
-            {
-              drive_id: input.remoteDirectory.providerState.driveId,
-              file_id: upload.fileId,
-              upload_id: upload.uploadId,
-              part_info_list: [{ part_number: part.partNumber }],
-            },
-            {
-              failureCode: "UPLOAD_FAILED",
-              signal: cancellation.signal,
-            },
-          );
-          accessToken = refreshed.accessToken;
-          part = parseRefreshedPartUrl(
-            refreshed.body,
-            part.partNumber,
-            clock(),
-          );
-        }
-
-        if (failure !== undefined) {
-          return;
-        }
-        const start = (part.partNumber - 1) * partSize;
-        const length = Math.min(partSize, input.file.size - start);
-        if (length <= 0) {
-          throw new PanSyncError("UPLOAD_FAILED");
-        }
-        const stream = rangeStream(input.file, start, length);
-        await putPart(
-          client,
-          stream,
-          part.uploadUrl,
-          length,
-          cancellation.signal,
-        );
-      } catch (error) {
-        stopWith(error);
-        return;
+    if (previousPutStartedAt !== undefined) {
+      const waitMs = previousPutStartedAt + PUT_START_INTERVAL_MS - clock();
+      if (waitMs > 0) {
+        await delay(waitMs, signal);
       }
     }
-  };
-
-  const workerCount = Math.min(MAX_CONCURRENT_PUTS, upload.parts.length);
-  try {
-    await Promise.all(Array.from({ length: workerCount }, worker));
-    if (failure !== undefined) {
-      throw failure;
+    if (signal.aborted) {
+      throw new PanSyncError("UPLOAD_FAILED");
     }
-    return accessToken;
-  } finally {
-    externalSignal?.removeEventListener("abort", abortFromExternal);
+    const start = (part.partNumber - 1) * partSize;
+    const length = Math.min(partSize, input.file.size - start);
+    if (length <= 0) {
+      throw new PanSyncError("UPLOAD_FAILED");
+    }
+    const stream = rangeStream(input.file, start, length);
+    previousPutStartedAt = clock();
+    await putPart(client, stream, part.uploadUrl, length, signal);
   }
+  return accessToken;
 }
 
 export async function uploadAliyunFile(
@@ -464,6 +457,7 @@ export async function uploadAliyunFile(
   input: AliyunProviderUploadInput,
   clock: () => number,
   options: ProviderOperationOptions = {},
+  delay: AliyunDelay = delayUpload,
 ): Promise<ProviderUploadResult> {
   if (
     !Number.isSafeInteger(input.file.size)
@@ -477,6 +471,9 @@ export async function uploadAliyunFile(
     MIN_PART_SIZE,
     Math.ceil(input.file.size / MAX_PARTS),
   );
+  if (partSize > MAX_PART_SIZE) {
+    throw new PanSyncError("UPLOAD_FAILED");
+  }
   const totalParts = partCount(input.file.size, partSize);
   const create = await client.post(
     "/adrive/v1.0/openFile/create",
@@ -487,7 +484,7 @@ export async function uploadAliyunFile(
       name: input.remoteName ?? input.file.basename,
       type: "file",
       check_name_mode: "auto_rename",
-      parallel_upload: true,
+      parallel_upload: false,
       size: input.file.size,
       part_info_list: Array.from(
         { length: totalParts },
@@ -507,6 +504,7 @@ export async function uploadAliyunFile(
     partSize,
     create.accessToken,
     clock,
+    delay,
     options.signal,
   );
   const complete = await client.post(

@@ -1,4 +1,5 @@
 import {
+  mkdir,
   open,
   realpath,
   stat,
@@ -103,25 +104,39 @@ async function resolveTargetDirectory(
     throw rejectWorkspacePath();
   }
 
-  const lexicalDirectory = path.resolve(workspace.lexical, localDirectory);
-  if (!isContained(workspace.lexical, lexicalDirectory)) {
-    throw rejectWorkspacePath();
-  }
-  try {
-    const canonicalDirectory = await realpath(lexicalDirectory);
-    if (
-      !isContained(workspace.canonical, canonicalDirectory)
-      || !(await stat(canonicalDirectory)).isDirectory()
-    ) {
+  let lexicalDirectory = workspace.lexical;
+  let canonicalDirectory = workspace.canonical;
+  for (const segment of localDirectory.split(/[\\/]+/u)) {
+    if (segment.length === 0 || segment === ".") {
+      continue;
+    }
+    lexicalDirectory = path.join(lexicalDirectory, segment);
+    if (!isContained(workspace.lexical, lexicalDirectory)) {
       throw rejectWorkspacePath();
     }
-    return canonicalDirectory;
-  } catch (error) {
-    if (error instanceof PanSyncError) {
-      throw error;
+    try {
+      await mkdir(lexicalDirectory);
+    } catch (error) {
+      if (errorCode(error) !== "EEXIST") {
+        throw rejectWorkspacePath();
+      }
     }
-    throw rejectWorkspacePath();
+    try {
+      canonicalDirectory = await realpath(lexicalDirectory);
+      if (
+        !isContained(workspace.canonical, canonicalDirectory)
+        || !(await stat(canonicalDirectory)).isDirectory()
+      ) {
+        throw rejectWorkspacePath();
+      }
+    } catch (error) {
+      if (error instanceof PanSyncError) {
+        throw error;
+      }
+      throw rejectWorkspacePath();
+    }
   }
+  return canonicalDirectory;
 }
 
 export async function openWorkspaceDownloadTarget(

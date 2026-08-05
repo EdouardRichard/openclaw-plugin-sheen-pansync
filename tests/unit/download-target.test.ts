@@ -108,13 +108,47 @@ describe("openWorkspaceDownloadTarget", () => {
     }
   });
 
-  it("requires the local directory to already exist", async () => {
+  it("creates a missing user-specified nested local directory", async () => {
+    const target = await openWorkspaceDownloadTarget(
+      workspace,
+      "reports/2026",
+      "report.pdf",
+    );
+
+    try {
+      await target.handle.writeFile("report");
+      expect(target.relativePath).toBe("reports/2026/report.pdf");
+      await expect(
+        readFile(path.join(workspace, "reports", "2026", "report.pdf"), "utf8"),
+      ).resolves.toBe("report");
+    } finally {
+      await target.cleanup();
+    }
+    await expect(stat(path.join(workspace, "reports", "2026"))).resolves
+      .toMatchObject({ isDirectory: expect.any(Function) });
+  });
+
+  it("safely converges when concurrent calls create the same missing directory", async () => {
+    const targets = await Promise.all(
+      Array.from({ length: 3 }, () =>
+        openWorkspaceDownloadTarget(workspace, "shared/nested", "report.txt")),
+    );
+
+    try {
+      expect(targets.map(({ relativePath }) => relativePath).sort()).toEqual([
+        "shared/nested/report (1).txt",
+        "shared/nested/report (2).txt",
+        "shared/nested/report.txt",
+      ]);
+    } finally {
+      await Promise.all(targets.map((target) => target.cleanup()));
+    }
+  });
+
+  it("rejects control characters in a user-specified local directory", async () => {
     await expect(
-      openWorkspaceDownloadTarget(workspace, "missing", "report.pdf"),
+      openWorkspaceDownloadTarget(workspace, "bad\u0000directory", "report.pdf"),
     ).rejects.toMatchObject({ code: "WORKSPACE_PATH_REJECTED" });
-    await expect(stat(path.join(workspace, "missing"))).rejects.toMatchObject({
-      code: "ENOENT",
-    });
   });
 
   it.each(["../outside", path.join("nested", "..", "..", "outside")])(

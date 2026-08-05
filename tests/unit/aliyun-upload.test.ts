@@ -276,6 +276,7 @@ function provider(
     forceRefresh?: (token?: string) => Promise<string>;
     clock?: () => number;
     fetch?: AliyunFetch;
+    delay?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   } = {},
 ): AliyunProvider {
   return new AliyunProvider({
@@ -285,6 +286,7 @@ function provider(
       forceRefresh: options.forceRefresh ?? (async () => "access-new"),
     },
     clock: options.clock ?? (() => NOW),
+    delay: options.delay ?? (async () => undefined),
     ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
   });
 }
@@ -333,7 +335,7 @@ describe("Aliyun multipart upload", () => {
       name: "report.bin",
       type: "file",
       check_name_mode: "auto_rename",
-      parallel_upload: true,
+      parallel_upload: false,
       size: 45 * MIB,
       part_info_list: [
         { part_number: 1 },
@@ -362,7 +364,7 @@ describe("Aliyun multipart upload", () => {
     await expect(file.handle.stat()).resolves.toMatchObject({ size: 45 * MIB });
   });
 
-  it("limits concurrent part PUTs to three", async () => {
+  it("uploads multipart PUTs sequentially in ascending order", async () => {
     const server = await startUploadServer({ delayPuts: true });
     const file = await sparseFile(65 * MIB);
 
@@ -373,10 +375,20 @@ describe("Aliyun multipart upload", () => {
     });
 
     expect(server.putSizes.size).toBe(4);
-    expect(server.maxConcurrentPuts()).toBe(3);
+    expect(server.maxConcurrentPuts()).toBe(1);
+    expect(server.events.filter((event) => event.startsWith("put-"))).toEqual([
+      "put-1-start",
+      "put-1-end",
+      "put-2-start",
+      "put-2-end",
+      "put-3-start",
+      "put-3-end",
+      "put-4-start",
+      "put-4-end",
+    ]);
   });
 
-  it("cancels in-flight PUTs and schedules no new parts after the first failure", async () => {
+  it("schedules no later part after the first sequential PUT fails", async () => {
     const server = await startUploadServer({
       immediateFailPutPart: 1,
       immediateFailStatus: 429,
@@ -416,18 +428,8 @@ describe("Aliyun multipart upload", () => {
       event.endsWith("-start")
     );
     expect(startedPuts).toContain("put-1-start");
-    expect(
-      startedPuts.every((event) => [
-        "put-1-start",
-        "put-2-start",
-        "put-3-start",
-      ].includes(event)),
-    ).toBe(true);
-    expect(abortedSignedPuts).toEqual(new Set([
-      "/signed/1",
-      "/signed/2",
-      "/signed/3",
-    ]));
+    expect(startedPuts).toEqual(["put-1-start"]);
+    expect(abortedSignedPuts).toEqual(new Set());
     expect(server.events).not.toContain("complete");
     expect(
       server.requests.some(({ path: requestPath }) =>
@@ -495,6 +497,78 @@ describe("Aliyun multipart upload", () => {
     expect(body?.part_info_list).toHaveLength(10_000);
     expect(body?.part_info_list?.at(0)).toEqual({ part_number: 1 });
     expect(body?.part_info_list?.at(-1)).toEqual({ part_number: 10_000 });
+  });
+
+  it("starts adjacent fast PUTs at least 350 ms apart", async () => {
+    const server = await startUploadServer();
+    const file = await sparseFile(45 * MIB);
+    let now = 0;
+    const putStartedAt: number[] = [];
+    const delays: number[] = [];
+    const trackingFetch: AliyunFetch = async (input, init) => {
+      if (init?.method === "PUT") {
+        putStartedAt.push(now);
+      }
+      return globalThis.fetch(input, init);
+    };
+
+    await provider(server, {
+      clock: () => now,
+      fetch: trackingFetch,
+      delay: async (milliseconds) => {
+        delays.push(milliseconds);
+        now += milliseconds;
+      },
+    }).uploadFile({
+      accessToken: "access-old",
+      remoteDirectory: REMOTE_DIRECTORY,
+      file,
+    });
+
+    expect(putStartedAt).toEqual([0, 350, 700]);
+    expect(delays).toEqual([350, 350]);
+  });
+
+  it("adds no fixed wait when each PUT already takes at least 350 ms", async () => {
+    const server = await startUploadServer();
+    const file = await sparseFile(45 * MIB);
+    let now = 0;
+    const delay = vi.fn(async () => undefined);
+    const trackingFetch: AliyunFetch = async (input, init) => {
+      if (init?.method === "PUT") {
+        now += 350;
+      }
+      return globalThis.fetch(input, init);
+    };
+
+    await provider(server, {
+      clock: () => now,
+      fetch: trackingFetch,
+      delay,
+    }).uploadFile({
+      accessToken: "access-old",
+      remoteDirectory: REMOTE_DIRECTORY,
+      file,
+    });
+
+    expect(delay).not.toHaveBeenCalled();
+  });
+
+  it("rejects a represented file requiring parts above the 5 GB limit before create", async () => {
+    const server = await startUploadServer();
+    const file = await sparseFile(1);
+    const representedFile = {
+      ...file,
+      size: 5 * 1024 * 1024 * 1024 * 10_000 + 1,
+    };
+
+    await expect(provider(server).uploadFile({
+      accessToken: "access-old",
+      remoteDirectory: REMOTE_DIRECTORY,
+      file: representedFile,
+    })).rejects.toMatchObject({ code: "UPLOAD_FAILED" });
+
+    expect(server.requests).toEqual([]);
   });
 
   it("creates and completes a zero-byte upload without PUT requests", async () => {

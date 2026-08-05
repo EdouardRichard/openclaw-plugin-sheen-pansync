@@ -29,6 +29,11 @@ For “下载/获取网盘文件”, “从网盘取出并保存到工作区”,
 
 Do not treat a directory as a downloadable file. Omit `localDirectory` to download to the current workspace root. Existing local files are not overwritten; the Tool chooses a collision-safe name such as `name (1).ext`.
 
+- If the user did not explicitly specify a local workspace directory, omit `localDirectory` on every call; each file goes to the workspace root.
+- If the user explicitly specified a workspace-relative local directory, pass exactly that `localDirectory`; the Tool creates missing directories. Never derive `localDirectory` from `remoteDirectory`, `remotePath`, a resource-drive path, or a remote folder name.
+- For a folder or multiple files, use `pan_sync_list` to identify ordinary files. Issue at most three `pan_sync_download` calls in one batch and await the current batch before starting the next batch.
+- If a call returns `RATE_LIMITED`, `DOWNLOAD_FAILED`, or `UPLOAD_FAILED`, do not immediately retry and do not create a tight retry loop. Let the current batch settle, continue the remaining planned batches without retrying that failed call, and report the stable failure in the final summary.
+
 ## Exact path or query / 精确路径或搜索词
 
 - If the user supplies one exact remote path, call `pan_sync_download` with `remotePath`.

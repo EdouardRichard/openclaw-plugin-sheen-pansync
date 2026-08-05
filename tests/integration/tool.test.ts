@@ -331,6 +331,8 @@ describe("resource drive read Tools", () => {
 
     const downloadTool = requiredReadTool(tools, "pan_sync_download");
     expect(downloadTool.name).toBe("pan_sync_download");
+    expect(downloadTool.description).toMatch(/workspace root/iu);
+    expect(downloadTool.description).toMatch(/missing director(?:y|ies).*creat/iu);
     expect(downloadTool.parameters).toEqual({
       anyOf: [
         {
@@ -356,6 +358,32 @@ describe("resource drive read Tools", () => {
           additionalProperties: false,
         },
       ],
+    });
+  });
+
+  it("defaults to the workspace root without deriving a local directory from remotePath", async () => {
+    const workspaceDir = "C:\\private\\openclaw\\workspace";
+    const download = vi.fn(async () => ({
+      provider: "aliyun" as const,
+      remoteName: "report.pdf",
+      localPath: "report.pdf",
+      size: 1,
+      status: "downloaded" as const,
+    }));
+    const tool = requiredReadTool(captureReadTools({
+      list: vi.fn(async () => {
+        throw new Error("not executed");
+      }),
+      download,
+    }, workspaceDir), "pan_sync_download");
+
+    await tool.execute("download-root", {
+      remotePath: "/remote/folder/report.pdf",
+    });
+
+    expect(download).toHaveBeenCalledWith({
+      workspaceDir,
+      remotePath: "/remote/folder/report.pdf",
     });
   });
 
@@ -788,5 +816,23 @@ describe("pan-sync-upload Skill discovery contract", () => {
     expect(contents).toContain("api.oplist.org.cn");
     expect(contents).toContain("directly to Aliyun");
     expect(contents).not.toMatch(/client[ _-]?(?:id|secret)/iu);
+  });
+
+  it("requires root-default batched downloads without inferred local paths or tight retries", async () => {
+    const contents = await readFile(
+      new URL("../../skills/pan-sync-upload/SKILL.md", import.meta.url),
+      "utf8",
+    );
+    const download = section(contents, "Download and read / 下载与读取");
+
+    expect(download).toMatch(/did not explicitly specify[\s\S]*omit `localDirectory`/iu);
+    expect(download).toMatch(/never derive `localDirectory`[\s\S]*remotePath/iu);
+    expect(download).toMatch(/at most three[\s\S]*pan_sync_download[\s\S]*batch/iu);
+    expect(download).toMatch(/await[\s\S]*batch[\s\S]*next batch/iu);
+    for (const code of ["RATE_LIMITED", "DOWNLOAD_FAILED", "UPLOAD_FAILED"]) {
+      expect(download).toContain(code);
+    }
+    expect(download).toMatch(/do not immediately retry|no tight retry loop/iu);
+    expect(download).toMatch(/continue the remaining planned batches/iu);
   });
 });

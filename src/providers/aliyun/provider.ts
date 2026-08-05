@@ -23,6 +23,7 @@ import {
 import type { AliyunFetch, AliyunTokenService } from "./types.js";
 import {
   AliyunAuthorizedClient,
+  type AliyunDelay,
   type AliyunProviderUploadInput,
   type AliyunRemoteDirectory,
   type AliyunTokenRefresher,
@@ -36,6 +37,7 @@ export type AliyunProviderOptions = {
   baseUrl?: string;
   fetch?: AliyunFetch;
   clock?: () => number;
+  delay?: AliyunDelay;
 };
 
 const MAX_CREDENTIAL_FIELD_LENGTH = 4096;
@@ -434,7 +436,13 @@ export class AliyunProvider implements CloudDriveProvider {
     if (!isAliyunUploadInput(input)) {
       throw new PanSyncError("UPLOAD_FAILED");
     }
-    return uploadAliyunFile(this.#api, input, this.#clock, options);
+    return uploadAliyunFile(
+      this.#api,
+      input,
+      this.#clock,
+      options,
+      this.options.delay,
+    );
   }
 
   async #resourceDriveContext(

@@ -83,6 +83,68 @@ function authorizationHeader(
 }
 
 describe("AliyunAuthorizedClient token failure retry", () => {
+  it("acquires a fresh OpenAPI permit for the token-retry HTTP attempt", async () => {
+    const fetch = vi.fn<AliyunFetch>()
+      .mockResolvedValueOnce(jsonResponse(401, { code: "AccessTokenExpired" }))
+      .mockResolvedValueOnce(jsonResponse(200, { ok: true }));
+    const forceRefresh = vi.fn(async () => "access-new");
+    const rateLimiter = { acquire: vi.fn(async () => undefined) };
+    const client = new AliyunAuthorizedClient({
+      fetch,
+      tokenManager: { forceRefresh },
+      rateLimiter,
+    });
+
+    await client.post(
+      "/adrive/v1.0/example",
+      "access-old",
+      {},
+      { failureCode: "REMOTE_DIRECTORY_FAILED" },
+    );
+
+    expect(rateLimiter.acquire).toHaveBeenCalledTimes(2);
+    expect(rateLimiter.acquire).toHaveBeenNthCalledWith(
+      1,
+      "/adrive/v1.0/example",
+      undefined,
+    );
+    expect(rateLimiter.acquire).toHaveBeenNthCalledWith(
+      2,
+      "/adrive/v1.0/example",
+      undefined,
+    );
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not fetch when a queued OpenAPI request is aborted", async () => {
+    const fetch = vi.fn<AliyunFetch>();
+    const controller = new AbortController();
+    const rateLimiter = {
+      acquire: vi.fn(async (_endpointPath: string, signal?: AbortSignal) => {
+        expect(signal).toBe(controller.signal);
+        throw new DOMException("aborted", "AbortError");
+      }),
+    };
+    const client = new AliyunAuthorizedClient({
+      fetch,
+      tokenManager: { forceRefresh: vi.fn() },
+      rateLimiter,
+    });
+
+    await expect(client.post(
+      "/adrive/v1.0/example",
+      "access-old",
+      {},
+      {
+        failureCode: "REMOTE_DIRECTORY_FAILED",
+        signal: controller.signal,
+      },
+    )).rejects.toMatchObject({ code: "REMOTE_DIRECTORY_FAILED" });
+
+    expect(rateLimiter.acquire).toHaveBeenCalledOnce();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it.each([
     [401, { code: "AccessTokenInvalid" }],
     [401, { code: "AccessTokenExpired" }],

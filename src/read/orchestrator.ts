@@ -23,6 +23,7 @@ import {
   type SearchCursorState,
   type SearchIdentity,
 } from "./cursor.js";
+import { FifoDownloadGate } from "./download-concurrency.js";
 
 const DEFAULT_LIMIT = 20;
 const SEARCH_PAGE_LIMIT = 100;
@@ -145,6 +146,8 @@ async function resolveDirectory(
 }
 
 export class ReadOrchestrator {
+  readonly #downloadGate = new FifoDownloadGate();
+
   constructor(private readonly dependencies: ReadOrchestratorDependencies) {}
 
   async download(
@@ -193,7 +196,9 @@ export class ReadOrchestrator {
     }
 
     let target: WorkspaceDownloadTarget | undefined;
+    let releaseDownload: (() => void) | undefined;
     try {
+      releaseDownload = await this.#downloadGate.acquire(options.signal);
       target = await openWorkspaceDownloadTarget(
         input.workspaceDir,
         input.localDirectory,
@@ -239,6 +244,8 @@ export class ReadOrchestrator {
         // Cleanup errors are intentionally collapsed into the stable download error.
       }
       throw stableDownloadError(error);
+    } finally {
+      releaseDownload?.();
     }
   }
 

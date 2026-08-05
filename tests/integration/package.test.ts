@@ -258,6 +258,32 @@ describe("published package", () => {
     expect(paths.filter((entry) => /(?:canary|fixture|vault)/iu.test(entry))).toEqual([]);
   });
 
+  it("ships the guarded multi-file download Skill contract", async () => {
+    const packDirectory = await mkdtemp(path.join(tmpdir(), "pan-sync-packed-skill-"));
+    temporaryDirectories.push(packDirectory);
+    const packed = runNpm([
+      "pack",
+      "--json",
+      "--pack-destination",
+      packDirectory,
+    ]);
+    expect(packed.error).toBeUndefined();
+    expect(packed.status, `${packed.stdout}\n${packed.stderr}`).toBe(0);
+    const report = JSON.parse(packed.stdout) as PackResult;
+    const filename = report[0]?.filename;
+    expect(filename).toBeTypeOf("string");
+    const skill = readPackedText(
+      path.join(packDirectory, path.basename(filename ?? "")),
+      "skills/pan-sync-upload/SKILL.md",
+    );
+
+    expect(skill).toMatch(/did not explicitly specify[\s\S]*omit `localDirectory`/iu);
+    expect(skill).toMatch(/never derive `localDirectory`[\s\S]*remotePath/iu);
+    expect(skill).toMatch(/at most three[\s\S]*pan_sync_download[\s\S]*batch/iu);
+    expect(skill).toMatch(/do not immediately retry|no tight retry loop/iu);
+    expect(skill).toMatch(/continue the remaining planned batches/iu);
+  });
+
   it("ships the beginner setup guide and four valid screenshots", async () => {
     const packDirectory = await mkdtemp(path.join(tmpdir(), "pan-sync-readme-images-"));
     temporaryDirectories.push(packDirectory);
